@@ -36,12 +36,31 @@ type remote struct {
 	catalogSub   *session.Subscription
 	catalogFetch *session.FetchRequest
 
+	// applying serialises catalog application. Each catalog arrives on its
+	// own stream and the router reads streams concurrently, so two catalogs
+	// can be applied at once — and reconcile is check-then-act: both would
+	// see a track as unsubscribed and both would subscribe it, leaving a
+	// duplicate subscription and a duplicate decoder. Holding this for the
+	// whole apply makes the decisions sequential. It is held across the
+	// SUBSCRIBE round trip, which only delays further catalogs for this one
+	// participant; other remotes and all media reading are unaffected.
+	applying sync.Mutex
+
 	// mu guards everything below, which the catalog reader mutates as
 	// the remote's track list changes.
-	mu       sync.Mutex
-	nickname string
-	video    *remoteTrack
-	audio    *remoteTrack
+	mu sync.Mutex
+	// catalogGroup is the highest catalog group applied so far. Catalogs
+	// published in quick succession each land in their own group, so they
+	// each get their own stream, and the router reads streams concurrently —
+	// they can arrive in any order. Applying an older one over a newer one
+	// resubscribes to tracks that never changed, so anything not newer than
+	// this is dropped. Publisher group IDs are monotonic, which is what
+	// makes them usable as the sequence number here.
+	catalogGroup uint64
+	hasCatalog   bool
+	nickname     string
+	video        *remoteTrack
+	audio        *remoteTrack
 	// closed stops late catalog updates from resurrecting subscriptions
 	// after the participant has left.
 	closed bool
@@ -160,7 +179,7 @@ func (r *remote) readCatalogStream(s *session.IncomingSubgroupStream) {
 			}
 			return
 		}
-		r.onCatalog(obj.Payload)
+		r.onCatalog(obj.GroupID, obj.Payload)
 	}
 }
 
@@ -177,27 +196,36 @@ func (r *remote) readCatalogFetch(s *session.IncomingFetchStream) {
 		if obj.EndOfNonExistentRange || obj.EndOfUnknownRange {
 			continue
 		}
-		r.onCatalog(obj.Payload)
+		r.onCatalog(obj.GroupID, obj.Payload)
 	}
 }
 
 // onCatalog reconciles the remote's subscriptions against a freshly
 // received catalog: subscribe to tracks that appeared, drop tracks that
 // went away, and re-subscribe when a codec config changed.
-func (r *remote) onCatalog(payload []byte) {
+func (r *remote) onCatalog(group uint64, payload []byte) {
 	cat, err := parseCatalog(payload)
 	if err != nil {
 		r.log.Warn("catalog parse failed", "err", err)
 		return
 	}
 
+	r.applying.Lock()
+	defer r.applying.Unlock()
+
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
 		return
 	}
-	nicknameChanged := cat.Nickname != "" && cat.Nickname != r.nickname
-	if nicknameChanged {
+	if r.hasCatalog && group <= r.catalogGroup {
+		r.mu.Unlock()
+		r.log.Debug("ignoring superseded catalog",
+			"group", group, "applied", r.catalogGroup)
+		return
+	}
+	r.catalogGroup, r.hasCatalog = group, true
+	if cat.Nickname != "" {
 		r.nickname = cat.Nickname
 	}
 	r.mu.Unlock()

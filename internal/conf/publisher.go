@@ -167,6 +167,37 @@ func (p *publisher) declareConfig(cfg *bridge.TrackConfig) error {
 	return p.republishCatalog()
 }
 
+// undeclareConfig withdraws a local track and republishes the catalog
+// without it, which is what tells subscribers to retire their decoders
+// rather than sit on a frozen last frame.
+//
+// The publication itself stays open: turning the camera back on only has to
+// declare the track again, not re-PUBLISH it.
+func (p *publisher) undeclareConfig(kind string) error {
+	p.mu.Lock()
+	switch kind {
+	case "video":
+		if p.videoConfig == nil {
+			p.mu.Unlock()
+			return nil // already withdrawn
+		}
+		p.videoConfig = nil
+	case "audio":
+		if p.audioConfig == nil {
+			p.mu.Unlock()
+			return nil
+		}
+		p.audioConfig = nil
+	default:
+		p.mu.Unlock()
+		return fmt.Errorf("conf: unknown track kind %q", kind)
+	}
+	p.mu.Unlock()
+
+	p.log.Info("local track withdrawn", "kind", kind)
+	return p.republishCatalog()
+}
+
 // republishCatalog emits the current catalog as a fresh object in a new
 // group. §5 says a catalog object should be published only when track
 // availability changes, which is exactly when this is called.

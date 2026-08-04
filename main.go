@@ -53,7 +53,7 @@ func main() {
 	// sink owns the level so the panel can raise it at runtime.
 	sink := telemetry.NewLogSink(slog.LevelInfo)
 	logger := slog.New(telemetry.MultiHandler{
-		tint.NewHandler(os.Stderr, &tint.Options{
+		tint.NewTextHandler(os.Stderr, &tint.Options{
 			Level:      slog.LevelDebug,
 			TimeFormat: time.TimeOnly,
 		}),
@@ -104,6 +104,17 @@ func main() {
 		MinHeight:        600,
 		BackgroundColour: application.NewRGB(11, 13, 18),
 		URL:              startURL(*relayFlag, *roomFlag, *nickFlag, *autoJoin, *debugOpen, *debugTab),
+		// The window renders only this app's own bundled frontend, so a
+		// capture request can only have come from us — there is no
+		// third-party page whose request would need scrutiny. Granting
+		// up front is what Linux (WebKitGTK, no prompt mechanism) and
+		// Windows (WebView2) act on. macOS ignores this map entirely, which
+		// is why grantWebViewMediaCapture above exists; the OS still
+		// enforces its own TCC prompt there either way.
+		Permissions: map[application.PermissionType]application.Permission{
+			application.PermissionCamera:     application.PermissionAllow,
+			application.PermissionMicrophone: application.PermissionAllow,
+		},
 		Mac: application.MacWindow{
 			InvisibleTitleBarHeight: 42,
 			TitleBar:                application.MacTitleBarHiddenInset,

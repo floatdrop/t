@@ -1,0 +1,74 @@
+name: Set up the tlmst build environment
+description: >-
+  Checks out the moq-go dependency beside an already-checked-out tlmst, then
+  installs Go, Node, the wails3 CLI, and any platform build dependencies.
+  The caller must have checked tlmst out into a `tlmst` directory already —
+  that is how this action itself became reachable.
+
+inputs:
+  moq-go-ref:
+    description: Git ref of floatdrop/moq-go to build against.
+    required: false
+    default: draft-19
+
+runs:
+  using: composite
+  steps:
+    # go.mod resolves moq-go through `replace … => ../moq-go`, because the
+    # module has no published versions yet. The two repositories therefore
+    # have to sit side by side, which is why callers check tlmst out into a
+    # subdirectory instead of the workspace root.
+    - name: Check out moq-go
+      uses: actions/checkout@v4
+      with:
+        repository: floatdrop/moq-go
+        ref: ${{ inputs.moq-go-ref }}
+        path: moq-go
+
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        # Read from go.mod so the toolchain never drifts from what the module
+        # requires.
+        go-version-file: tlmst/go.mod
+        cache-dependency-path: tlmst/go.sum
+
+    - name: Install Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: 22
+        cache: npm
+        cache-dependency-path: tlmst/frontend/package-lock.json
+
+    # Wails' build orchestration lives in the Taskfiles and `wails3 task` is
+    # what runs them, so the CLI is needed even though nothing here invokes it
+    # interactively. Pinned to the version go.mod already depends on, so the
+    # CLI and the library cannot disagree.
+    - name: Install the wails3 CLI
+      shell: bash
+      working-directory: tlmst
+      run: |
+        set -euo pipefail
+        version=$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v3)
+        echo "installing wails3 $version"
+        go install "github.com/wailsapp/wails/v3/cmd/wails3@$version"
+        echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+    # Wails' Linux backend needs cgo and links against GTK4 and WebKitGTK 6.0
+    # — see the pkg-config line in wails/v3/pkg/application/linux_cgo.go. GTK3
+    # is the alternative, behind the `gtk3` build tag, and would want
+    # libgtk-3-dev + libwebkit2gtk-4.1-dev instead. macOS and Windows build
+    # against SDKs the runners already carry.
+    - name: Install Linux build dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential pkg-config \
+          libgtk-4-dev libwebkitgtk-6.0-dev
+
+    - name: Install frontend dependencies
+      shell: bash
+      working-directory: tlmst/frontend
+      run: npm ci

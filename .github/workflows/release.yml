@@ -1,0 +1,264 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  # Runnable by hand so the packaging and signing path can be exercised
+  # without cutting a tag.
+  workflow_dispatch:
+    inputs:
+      moq-go-ref:
+        description: Git ref of floatdrop/moq-go to build against.
+        required: false
+        default: draft-19
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package (${{ matrix.name }})
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-universal
+            runs-on: macos-latest
+          - name: linux-amd64
+            runs-on: ubuntu-latest
+          - name: windows-amd64
+            runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tlmst
+
+      - uses: ./tlmst/.github/actions/setup
+        with:
+          moq-go-ref: ${{ inputs.moq-go-ref || 'draft-19' }}
+
+      - name: Derive the version
+        id: version
+        shell: bash
+        run: |
+          # A tag names the version; a manual run is labelled by commit so two
+          # dispatches never produce indistinguishable artifacts.
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Signing is optional: a fork or a repository without certificates must
+      # still be able to produce builds. Whether it happens is decided here,
+      # in one place, because a step's `if` cannot see secrets directly.
+      - name: Check for signing credentials
+        id: signing
+        shell: bash
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+        run: |
+          set -euo pipefail
+          have() { [ -n "${1:-}" ] && echo true || echo false; }
+          {
+            echo "macos=$(have "${MACOS_CERTIFICATE:-}")"
+            echo "notarize=$(have "${MACOS_NOTARY_APPLE_ID:-}")"
+            echo "windows=$(have "${WINDOWS_CERTIFICATE:-}")"
+          } >> "$GITHUB_OUTPUT"
+
+      # ---- macOS ------------------------------------------------------
+      #
+      # A universal binary so one download covers Apple silicon and Intel.
+      # package:universal builds both arches, lipos them together, wraps the
+      # result in a .app, and ad-hoc signs it.
+      - name: Build the macOS app bundle
+        if: runner.os == 'macOS'
+        working-directory: tlmst
+        run: wails3 task package:universal
+
+      # Gatekeeper rejects an ad-hoc signed bundle downloaded from the
+      # internet, so a real Developer ID signature replaces it when one is
+      # configured. Done with codesign directly rather than through
+      # `wails3 tool sign`: the keychain import and partition-list steps below
+      # are the part that usually goes wrong, and they are worth having in
+      # plain sight.
+      - name: Sign the macOS app
+        if: runner.os == 'macOS' && steps.signing.outputs.macos == 'true'
+        working-directory: tlmst
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+
+          # A throwaway keychain rather than the login one: nothing outlives
+          # the runner, and no password has to be invented for a store that
+          # already exists.
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password=$(uuidgen)
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+
+          printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" \
+            -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          # Without this, codesign blocks on a GUI prompt for keychain access
+          # and the job hangs until it times out.
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychain -d user -s "$keychain" login.keychain-db
+
+          # A hardened runtime and a timestamp are both prerequisites for
+          # notarization, so they are applied whether or not it runs.
+          codesign --force --deep --options runtime --timestamp \
+            --sign "$MACOS_SIGNING_IDENTITY" bin/tlmst.app
+          codesign --verify --deep --strict --verbose=2 bin/tlmst.app
+
+      # Signing alone still leaves a first-run warning; only notarization
+      # removes it. Separate from the step above so a repository can sign
+      # without holding notary credentials.
+      - name: Notarize the macOS app
+        if: >-
+          runner.os == 'macOS'
+          && steps.signing.outputs.macos == 'true'
+          && steps.signing.outputs.notarize == 'true'
+        working-directory: tlmst
+        env:
+          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+          MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          ditto -c -k --keepParent bin/tlmst.app "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$MACOS_NOTARY_APPLE_ID" \
+            --password "$MACOS_NOTARY_PASSWORD" \
+            --team-id "$MACOS_NOTARY_TEAM_ID" \
+            --wait
+          # Staple so the bundle validates offline, on a machine that has
+          # never asked Apple about it.
+          xcrun stapler staple bin/tlmst.app
+
+      - name: Archive the macOS app bundle
+        if: runner.os == 'macOS'
+        working-directory: tlmst/bin
+        run: |
+          # ditto, not zip: it preserves the symlinks and extended attributes
+          # a .app depends on — including the signature, which plain zip
+          # mangles.
+          ditto -c -k --keepParent tlmst.app \
+            "tlmst-${{ steps.version.outputs.version }}-macos-universal.zip"
+
+      # ---- Linux ------------------------------------------------------
+      - name: Build the Linux binary
+        if: runner.os == 'Linux'
+        working-directory: tlmst
+        run: wails3 task build
+
+      - name: Archive the Linux binary
+        if: runner.os == 'Linux'
+        working-directory: tlmst/bin
+        run: tar -czf "tlmst-${{ steps.version.outputs.version }}-linux-amd64.tar.gz" tlmst
+
+      # ---- Windows ----------------------------------------------------
+      - name: Build the Windows binary
+        if: runner.os == 'Windows'
+        working-directory: tlmst
+        run: wails3 task build
+
+      # An unsigned Windows binary runs but trips SmartScreen. `wails3 tool
+      # sign` is a thin Authenticode wrapper that takes exactly the inputs we
+      # have, so there is no reason to locate signtool by hand here.
+      - name: Sign the Windows binary
+        if: runner.os == 'Windows' && steps.signing.outputs.windows == 'true'
+        working-directory: tlmst
+        shell: bash
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          pfx="$RUNNER_TEMP/cert.pfx"
+          printf '%s' "$WINDOWS_CERTIFICATE" | base64 --decode > "$pfx"
+          trap 'rm -f "$pfx"' EXIT
+          # A timestamp keeps the signature valid past the certificate's own
+          # expiry, which matters for anything users keep installed.
+          wails3 tool sign \
+            --input bin/tlmst.exe \
+            --certificate "$pfx" \
+            --password "$WINDOWS_CERTIFICATE_PASSWORD" \
+            --timestamp http://timestamp.digicert.com
+
+      - name: Archive the Windows binary
+        if: runner.os == 'Windows'
+        working-directory: tlmst/bin
+        shell: pwsh
+        run: |
+          Compress-Archive -Path tlmst.exe `
+            -DestinationPath "tlmst-${{ steps.version.outputs.version }}-windows-amd64.zip"
+
+      # ---- checksums and upload ---------------------------------------
+      #
+      # Checksums are the one integrity signal available on every platform,
+      # including Linux, where there is no code-signing convention at all.
+      - name: Checksum the archives
+        shell: bash
+        working-directory: tlmst/bin
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for archive in *.zip *.tar.gz; do
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$archive" > "$archive.sha256"
+            else
+              shasum -a 256 "$archive" > "$archive.sha256"
+            fi
+            cat "$archive.sha256"
+          done
+
+      - name: Upload the artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tlmst-${{ matrix.name }}
+          if-no-files-found: error
+          path: |
+            tlmst/bin/*.zip
+            tlmst/bin/*.tar.gz
+            tlmst/bin/*.sha256
+
+  release:
+    name: Publish the release
+    # Only a tag publishes; a manual run just leaves artifacts on the run.
+    if: github.ref_type == 'tag'
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          body: |
+            Built by `.github/workflows/release.yml` from ${{ github.sha }}.
+
+            Every archive ships a `.sha256` beside it. macOS and Windows builds
+            are code-signed only when the repository has the signing secrets
+            configured — see "Releases and signing" in the README for which
+            secrets those are, and for what an unsigned download means on each
+            platform.

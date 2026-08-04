@@ -27,4 +27,4 @@ require (
 	golang.org/x/text v0.40.0 // indirect
 )
 
-replace github.com/floatdrop/moq-go => /Users/floatdrop/moq-go
+replace github.com/floatdrop/moq-go => ../moq-go

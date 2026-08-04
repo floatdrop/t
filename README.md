@@ -181,6 +181,58 @@ Drag its top edge to resize. Three tabs:
   backend's `slog` level at runtime, so moq-go's per-message DEBUG output can be
   turned on mid-call.
 
+## Continuous integration
+
+Two workflows, both driving the same `wails3 task` targets used locally.
+
+`.github/workflows/ci.yml` runs on every push and pull request: `gofmt`,
+`go vet`, `svelte-check`, and `go test -race` once on Linux (nothing under test
+touches a WebView), then a build on macOS, Linux and Windows to prove each
+still compiles and links.
+
+`.github/workflows/release.yml` runs on a `v*` tag, or by hand from the Actions
+tab. It packages each platform, signs where credentials exist, writes a
+`.sha256` beside every archive, and on a tag publishes them as a GitHub release:
+
+| Platform | Artifact |
+|---|---|
+| macOS | `tlmst-<version>-macos-universal.zip` — a universal (arm64 + amd64) `.app` |
+| Linux | `tlmst-<version>-linux-amd64.tar.gz` |
+| Windows | `tlmst-<version>-windows-amd64.zip` |
+
+Both workflows check the repository out into a `tlmst/` subdirectory and
+`floatdrop/moq-go` beside it, because `go.mod` resolves moq-go through
+`replace … => ../moq-go`. The ref defaults to `draft-19` and is overridable on
+a manual release run.
+
+### Signing
+
+Signing is optional: with no secrets configured everything still builds, so a
+fork works out of the box. What you get without them:
+
+- **macOS** — the `.app` is ad-hoc signed by `wails3 task package`. It runs
+  locally, but Gatekeeper refuses it once it has been downloaded.
+- **Windows** — unsigned. It runs, but SmartScreen warns.
+- **Linux** — unsigned either way; there is no code-signing convention. The
+  `.sha256` is the integrity signal.
+
+Configure these repository secrets to sign. macOS signing and notarization are
+separate: with only the first group you get a signature but still a first-run
+warning, since only notarization removes it.
+
+| Secret | Purpose |
+|---|---|
+| `MACOS_CERTIFICATE` | Developer ID Application cert as a base64 `.p12` |
+| `MACOS_CERTIFICATE_PASSWORD` | password for that `.p12` |
+| `MACOS_SIGNING_IDENTITY` | e.g. `Developer ID Application: You (TEAMID)` |
+| `MACOS_NOTARY_APPLE_ID` | Apple ID for notarization |
+| `MACOS_NOTARY_PASSWORD` | app-specific password for that Apple ID |
+| `MACOS_NOTARY_TEAM_ID` | Apple Developer team ID |
+| `WINDOWS_CERTIFICATE` | Authenticode cert as a base64 `.pfx` |
+| `WINDOWS_CERTIFICATE_PASSWORD` | password for that `.pfx` |
+
+Base64-encode a certificate with `base64 -i cert.p12 | pbcopy`.
+
 ## Tests
 
 `internal/conf` has integration tests that run a real moq-go relay in-process
@@ -217,9 +269,9 @@ path from a `MediaStreamTrack` to WebCodecs, so video frames are pulled off a
 - **No end-to-end encryption.** LOC public properties — timestamps, codec
   configs — are visible to relays by design. The draft's SecureObjects mechanism
   is not implemented in moq-go yet.
-- **`go.mod` pins moq-go through a `replace`** to `/Users/floatdrop/moq-go`,
-  since it has no published versions. Change that to a module version when one
-  exists.
+- **`go.mod` pins moq-go through a `replace`** to `../moq-go`, since the module
+  has no published versions. That means moq-go must be checked out beside this
+  repository. Change it to a module version when one exists.
 - **Departure detection does not rely on `NAMESPACE_DONE` alone.** moq-go's
   relay only sends it to subscribers that were already watching when the
   namespace was announced, so a peer who joined later would never hear about a
@@ -232,6 +284,10 @@ path from a `MediaStreamTrack` to WebCodecs, so video frames are pulled off a
   re-added by hand afterwards.
 - One video and one audio track per participant; no simulcast, no layer
   switching, no bandwidth-driven quality adaptation.
+- **Only the macOS build has been run.** The Linux and Windows targets are
+  verified to compile and link, and the window grants camera and microphone
+  through Wails' cross-platform `Permissions` option (which those two backends
+  honour and macOS ignores), but neither has been exercised in a real call.
 - A subscriber discards inbound video until the first keyframe, so joining
   mid-GOP costs up to the keyframe interval (2 s) before the first frame paints.
   Those frames show up as `dropped` in the decoders table and are expected.

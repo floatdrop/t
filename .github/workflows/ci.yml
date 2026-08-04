@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch makes the older run's result irrelevant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Correctness checks run once, on Linux, because none of them are
+  # platform-specific: the integration tests drive a moq-go relay over
+  # loopback QUIC and never touch a WebView.
+  check:
+    name: Test and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tlmst
+
+      - uses: ./tlmst/.github/actions/setup
+
+      - name: gofmt
+        working-directory: tlmst
+        run: |
+          # build/ios ships unformatted in the Wails template; it is not ours.
+          unformatted=$(gofmt -l . | grep -v '^build/' || true)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        working-directory: tlmst
+        run: go vet ./internal/... .
+
+      - name: Frontend typecheck
+        working-directory: tlmst/frontend
+        run: npx svelte-check --tsconfig ./tsconfig.json --output human
+
+      # -race because the conference layer is goroutine-dense: a router
+      # goroutine per data stream, plus the publisher's and each remote's.
+      - name: go test -race
+        working-directory: tlmst
+        run: go test ./internal/... -race -count=1 -timeout 10m
+
+  # The build matrix proves each platform still compiles and links. It does
+  # not sign or package — release.yml does that.
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS arm64
+            runs-on: macos-latest
+          - name: Linux amd64
+            runs-on: ubuntu-latest
+          - name: Windows amd64
+            runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tlmst
+
+      - uses: ./tlmst/.github/actions/setup
+
+      - name: Build
+        working-directory: tlmst
+        run: wails3 task build

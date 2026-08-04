@@ -1,7 +1,7 @@
 <script lang="ts">
   import {onMount} from 'svelte';
   import {Events, WML} from "@wailsio/runtime";
-  import {GreetService} from "../bindings/changeme";
+  import {GreetService} from "../bindings/tlmst";
 
   const wailsVersion = "v3.0.0-beta.3";
 

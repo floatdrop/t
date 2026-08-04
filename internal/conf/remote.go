@@ -371,6 +371,8 @@ func (r *remote) readMedia(
 			frame.Config = decoded.Properties.VideoConfig
 		case bridge.KindAudio:
 			frame.Config = decoded.Properties.AudioConfig
+			frame.AudioLevel = decoded.Properties.AudioLevel
+			frame.HasAudioLevel = decoded.Properties.HasAudioLevel
 		}
 
 		counter.AddObject(len(decoded.Payload))

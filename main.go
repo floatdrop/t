@@ -45,6 +45,7 @@ func main() {
 	nickFlag := flag.String("nickname", "", "nickname to prefill on the welcome screen")
 	autoJoin := flag.Bool("join", false, "join immediately, without waiting for a click")
 	debugOpen := flag.Bool("debug", false, "open the debug drawer at start")
+	debugTab := flag.String("debug-tab", "", "debug tab to open: transport, tracks, or logs")
 	flag.Parse()
 
 	// Everything the backend logs goes two places: the terminal, for
@@ -102,7 +103,7 @@ func main() {
 		MinWidth:         900,
 		MinHeight:        600,
 		BackgroundColour: application.NewRGB(11, 13, 18),
-		URL:              startURL(*relayFlag, *roomFlag, *nickFlag, *autoJoin, *debugOpen),
+		URL:              startURL(*relayFlag, *roomFlag, *nickFlag, *autoJoin, *debugOpen, *debugTab),
 		Mac: application.MacWindow{
 			InvisibleTitleBarHeight: 42,
 			TitleBar:                application.MacTitleBarHiddenInset,
@@ -122,7 +123,7 @@ func main() {
 
 // startURL turns the launch flags into the query string the welcome screen
 // reads. Empty flags yield a bare "/", which is the normal interactive case.
-func startURL(relay, room, nickname string, join, debug bool) string {
+func startURL(relay, room, nickname string, join, debug bool, debugTab string) string {
 	q := url.Values{}
 	if relay != "" {
 		q.Set("relay", relay)
@@ -138,6 +139,9 @@ func startURL(relay, room, nickname string, join, debug bool) string {
 	}
 	if debug {
 		q.Set("debug", "1")
+	}
+	if debugTab != "" {
+		q.Set("debugTab", debugTab)
 	}
 	if len(q) == 0 {
 		return "/"

@@ -28,6 +28,21 @@
   let height = $state(320);
   let dragging = $state(false);
 
+  /**
+   * A tab reads as selected only while the drawer is open. Collapsed, there
+   * is nothing on screen for it to be selected *of*, and highlighting one
+   * would suggest the panel below is already showing it.
+   */
+  function isActive(candidate: Tab): boolean {
+    return store.debugOpen && tab === candidate;
+  }
+
+  /** Selecting a tab is a request to see it, so it also opens the drawer. */
+  function select(next: Tab): void {
+    tab = next;
+    store.debugOpen = true;
+  }
+
   function startDrag(ev: PointerEvent): void {
     dragging = true;
     const startY = ev.clientY;
@@ -81,19 +96,21 @@
       </button>
     </nav>
 
+    <!-- Only a close affordance is needed: the tabs themselves open the
+         drawer, so a separate "Debug" button would be a second control for
+         something the tab row already does. -->
     {#if store.debugOpen}
       <button
-        class="ghost minimize"
+        class="ghost close"
         onclick={() => (store.debugOpen = false)}
-        aria-label="Minimize debug panel"
-        title="Minimize debug panel"
+        aria-label="Close debug panel"
+        title="Close debug panel"
       >
         <svg viewBox="0 0 14 14" aria-hidden="true">
-          <line x1="3" y1="9" x2="11" y2="9" />
+          <line x1="4" y1="4" x2="10" y2="10" />
+          <line x1="10" y1="4" x2="4" y2="10" />
         </svg>
       </button>
-    {:else}
-      <button class="ghost" onclick={() => (store.debugOpen = true)}>Debug ▴</button>
     {/if}
   </header>
 
@@ -165,6 +182,25 @@
   .tab.active {
     color: var(--text);
     border-bottom-color: var(--accent);
+  }
+
+  /* Square so the icon sits centred, and sized to stay a comfortable hit
+     target even though the glyph itself is a pair of thin lines. */
+  .close {
+    display: grid;
+    place-items: center;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    flex: none;
+  }
+
+  .close svg {
+    width: 14px;
+    height: 14px;
+    stroke: currentColor;
+    stroke-width: 1.5;
+    stroke-linecap: round;
   }
 
   .badge {

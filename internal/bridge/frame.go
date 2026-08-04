@@ -19,7 +19,11 @@ func AppendFrame(buf []byte, f *MediaFrame) []byte {
 	hdr[0] = FrameVersion
 	hdr[1] = f.Kind
 	if f.KeyFrame {
-		hdr[2] = FlagKeyFrame
+		hdr[2] |= FlagKeyFrame
+	}
+	if f.HasAudioLevel {
+		hdr[2] |= FlagAudioLevel
+		hdr[3] = f.AudioLevel
 	}
 	binary.BigEndian.PutUint32(hdr[4:8], f.Handle)
 	binary.BigEndian.PutUint64(hdr[8:16], f.Timestamp)
@@ -53,11 +57,13 @@ func ParseFrame(b []byte) (MediaFrame, error) {
 	}
 	configEnd := FrameHeaderLen + int(configLen)
 	f := MediaFrame{
-		Kind:      b[1],
-		Handle:    binary.BigEndian.Uint32(b[4:8]),
-		Timestamp: binary.BigEndian.Uint64(b[8:16]),
-		KeyFrame:  b[2]&FlagKeyFrame != 0,
-		Payload:   b[configEnd : configEnd+int(payloadLen)],
+		Kind:          b[1],
+		Handle:        binary.BigEndian.Uint32(b[4:8]),
+		Timestamp:     binary.BigEndian.Uint64(b[8:16]),
+		KeyFrame:      b[2]&FlagKeyFrame != 0,
+		HasAudioLevel: b[2]&FlagAudioLevel != 0,
+		AudioLevel:    b[3],
+		Payload:       b[configEnd : configEnd+int(payloadLen)],
 	}
 	if configLen > 0 {
 		f.Config = b[FrameHeaderLen:configEnd]

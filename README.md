@@ -74,8 +74,46 @@ frames, which is 500 ms at the 20 ms framing WebCodecs produces. Opus's
 first object of each group, so a subscriber can configure a decoder from the
 first object it receives.
 
+Every audio object also carries LOC's **AudioLevel** property (§2.3.3.2) — the
+RFC 6464 byte holding a voice-activity flag and a magnitude in -dBov. That is
+what lights a remote participant's speaking border: a peer knows who is talking
+without decoding their audio, and a relay could prioritise on it.
+
 [draft-lcurley-moq-hang](https://datatracker.ietf.org/doc/draft-lcurley-moq-hang/)
 was the idea source for this shape; it is not a spec this implements.
+
+### Audio processing
+
+**Echo cancellation is the platform's.** `getUserMedia`'s `echoCancellation`
+constraint engages macOS's own AEC, which can see the render reference signal —
+what the speakers are actually playing. Code in the page cannot, so a WASM echo
+canceller here would be strictly worse. What the app does instead is ask for the
+constraint and report what the browser *actually applied*, which is visible in
+the Tracks & codecs panel. That matters: on this machine WebKit granted
+`echoCancellation` but silently declined `noiseSuppression` and
+`autoGainControl`.
+
+**Noise suppression is local**, running after whatever the platform did.
+[RNNoise](https://github.com/xiph/rnnoise) — a small recurrent network — removes
+the stationary noise a general-purpose suppressor leaves behind, and returns a
+voice-activity probability as a side effect, which is what drives the speaking
+indicator. It runs on the main thread between the capture AudioWorklet and the
+AudioEncoder: the PCM already makes that hop (no `MediaStreamTrackProcessor` in
+WebKit), and an `AudioWorkletGlobalScope` has neither `fetch` nor `atob` to
+instantiate a wasm module with. Cost is about 1% of a core.
+
+The model is a ~5 MB lazily-imported chunk, so startup does not pay for it, and
+a failure to load degrades to platform-only suppression plus an energy-based VAD
+rather than breaking capture. Toggle it on the welcome screen.
+
+### Voice activity
+
+A participant's tile grows a green ring while they speak, drawn as an inset
+`box-shadow` so it can never reflow the grid mid-call. The local ring comes from
+RNNoise's probability with fast attack and a 300 ms release — a border that
+flickers on every inter-word pause is worse than none. Remote rings come from
+the AudioLevel property described above, latched with a short timeout so a gap
+in delivery does not read as silence.
 
 ## Running
 
@@ -117,13 +155,15 @@ bin/tlmst.dev.app/Contents/MacOS/tlmst \
 | `-nickname` | display name |
 | `-join` | join immediately instead of waiting for a click |
 | `-debug` | open the debug drawer at start (`Cmd+D` toggles it) |
+| `-debug-tab` | which tab to open: `transport`, `tracks`, or `logs` |
 
 The welcome screen reads the same values from the URL query, so a room is also
 shareable as a link.
 
 ## Debug panels
 
-`Cmd+D` opens the drawer. Three tabs:
+Click any tab to open the drawer, the × to close it, or `Cmd+D` to toggle.
+Drag its top edge to resize. Three tabs:
 
 - **Transport** — live plots over a one-minute window: round-trip time, packet
   loss, QUIC throughput, MOQ object throughput, congestion window, objects per
@@ -131,9 +171,11 @@ shareable as a link.
   from the connection's own qlog event stream (`internal/telemetry/quictrace.go`);
   as of quic-go v0.61 that is the only way to read RTT and loss.
 - **Tracks & codecs** — per-track bytes, objects and groups on the wire, next to
-  the WebView's encoder and decoder counters. Reading them side by side is what
-  localises a fault: a track carrying bytes while its decoder sits at 0 fps
-  means the problem is in the WebView, not the network.
+  the WebView's encoder and decoder counters (codec, decoded resolution, fps,
+  queue depth, dropped frames, audio buffer depth). Reading them side by side is
+  what localises a fault: a track carrying bytes while its decoder sits at 0 fps
+  means the problem is in the WebView, not the network. Also reports which
+  microphone processing the platform actually applied, and live voice activity.
 - **Logs** — everything the backend logs, including moq-go's own output, plus
   the WebView's capture and decode events. The level selector changes the
   backend's `slog` level at runtime, so moq-go's per-message DEBUG output can be
@@ -190,3 +232,6 @@ path from a `MediaStreamTrack` to WebCodecs, so video frames are pulled off a
   re-added by hand afterwards.
 - One video and one audio track per participant; no simulcast, no layer
   switching, no bandwidth-driven quality adaptation.
+- A subscriber discards inbound video until the first keyframe, so joining
+  mid-GOP costs up to the keyframe interval (2 s) before the first frame paints.
+  Those frames show up as `dropped` in the decoders table and are expected.

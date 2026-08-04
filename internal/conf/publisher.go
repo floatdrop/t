@@ -340,6 +340,13 @@ func (t *trackPublisher) writeObject(f *bridge.MediaFrame) error {
 		Timescale:    timescaleMicros,
 		HasTimescale: true,
 	}
+	// The speaking indicator rides on every audio object: LOC §2.3.3.2 is
+	// exactly the right place for it, so a subscriber gets it without any
+	// side channel and a relay can read it without decoding audio.
+	if f.HasAudioLevel && f.Kind == bridge.KindAudio {
+		props.AudioLevel = f.AudioLevel
+		props.HasAudioLevel = true
+	}
 	// The codec config goes on the first object of every group, so a
 	// subscriber can configure a decoder from the first object it sees
 	// without waiting for the catalog to come round again.

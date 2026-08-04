@@ -212,6 +212,82 @@ func audioFrame(tsMicros uint64, size int) *bridge.MediaFrame {
 	}
 }
 
+// TestAudioLevelRoundTrip covers the speaking indicator's transport: the
+// RFC 6464 byte has to survive the LOC AudioLevel property in both
+// directions, or a remote tile can never light up.
+func TestAudioLevelRoundTrip(t *testing.T) {
+	addr := startRelay(t)
+
+	alice, _ := joinRoom(t, addr, "room5", "alice")
+	if err := alice.DeclareTrack(&bridge.TrackConfig{
+		Kind: "audio", Codec: "opus", SampleRate: 48000, Channels: 1,
+	}); err != nil {
+		t.Fatalf("declare audio: %v", err)
+	}
+
+	_, bobRec := joinRoom(t, addr, "room5", "bob")
+	waitFor(t, "bob to subscribe to audio", 10*time.Second, func() bool {
+		_, tracks, _, _ := bobRec.snapshot()
+		return len(tracks) == 1
+	})
+
+	// Voice active at magnitude 20 -dBov, then silent at 90.
+	const (
+		speaking = 0x80 | 20
+		silent   = 90
+	)
+	for i := range 30 {
+		f := audioFrame(uint64(i)*20_000, 80)
+		f.HasAudioLevel = true
+		if i < 15 {
+			f.AudioLevel = speaking
+		} else {
+			f.AudioLevel = silent
+		}
+		if err := alice.WriteFrame(f); err != nil {
+			t.Fatalf("write audio %d: %v", i, err)
+		}
+	}
+
+	waitFor(t, "bob to receive all audio", 10*time.Second, func() bool {
+		got, _ := bobRec.countsFor("audio")
+		return got >= 30
+	})
+
+	frames, tracks, _, _ := bobRec.snapshot()
+	handle := tracks[0].Handle
+	var levels []uint8
+	for _, f := range frames {
+		if f.Handle != handle {
+			continue
+		}
+		if !f.HasAudioLevel {
+			t.Fatalf("audio frame at %dus arrived without an audio level", f.Timestamp)
+		}
+		levels = append(levels, f.AudioLevel)
+	}
+	if len(levels) != 30 {
+		t.Fatalf("got %d audio frames, want 30", len(levels))
+	}
+	for i, level := range levels {
+		want := uint8(silent)
+		if i < 15 {
+			want = speaking
+		}
+		if level != want {
+			t.Errorf("frame %d: audio level = %#x, want %#x", i, level, want)
+		}
+	}
+	// The voice-activity bit is what actually drives the indicator, so
+	// assert it separately from the magnitude.
+	if levels[0]&0x80 == 0 {
+		t.Error("first frame lost its voice-activity bit")
+	}
+	if levels[29]&0x80 != 0 {
+		t.Error("last frame gained a voice-activity bit it was not sent with")
+	}
+}
+
 // TestTwoParticipants covers the whole path a call depends on: namespace
 // discovery, catalog exchange, media subscription, and object delivery
 // with LOC metadata intact.

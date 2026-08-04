@@ -22,8 +22,8 @@ import "encoding/json"
 //
 //	 0      u8      Version (always FrameVersion)
 //	 1      u8      Kind (KindVideo / KindAudio)
-//	 2      u8      Flags (FlagKeyFrame)
-//	 3      u8      reserved, zero
+//	 2      u8      Flags (FlagKeyFrame, FlagAudioLevel)
+//	 3      u8      AudioLevel — valid only with FlagAudioLevel
 //	 4..8   u32     Handle — identifies the track (see below)
 //	 8..16  u64     Timestamp in microseconds, from the encoder
 //	16..20  u32     ConfigLen — length of the config blob that follows
@@ -41,6 +41,9 @@ const (
 	KindAudio = 1
 
 	FlagKeyFrame = 1 << 0
+	// FlagAudioLevel marks the AudioLevel byte as carrying a real
+	// measurement. Needed because level 0 means "loudest", not "absent".
+	FlagAudioLevel = 1 << 1
 )
 
 // Handles for the two tracks the frontend publishes. Remote handles are
@@ -64,6 +67,14 @@ type MediaFrame struct {
 	// never, since SPS/PPS travel in-band.
 	Config  []byte
 	Payload []byte
+
+	// AudioLevel is the RFC 6464 byte LOC's AudioLevel property carries
+	// (§2.3.3.2): bit 7 is voice activity, bits 0-6 the magnitude in
+	// -dBov, where 0 is loudest and 127 is silence. Valid only when
+	// HasAudioLevel is set. It drives the speaking indicator, so it
+	// travels with every audio frame in both directions.
+	AudioLevel    uint8
+	HasAudioLevel bool
 }
 
 // ---- control messages: frontend to backend ----------------------------

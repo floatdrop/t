@@ -8,18 +8,61 @@
  */
 
 /**
- * pcm-tap forwards every render quantum of captured microphone audio to
- * the main thread, which is how this app gets PCM at all: WebKit has no
- * MediaStreamTrackProcessor, so there is no Insertable Streams path from a
- * MediaStreamTrack to an AudioData.
+ * pcm-tap forwards captured microphone audio to the main thread, which is how
+ * this app gets PCM at all: WebKit has no MediaStreamTrackProcessor, so there
+ * is no Insertable Streams path from a MediaStreamTrack to an AudioData.
+ *
+ * Two things it does beyond copying, both of which exist because the main
+ * thread is not reliably fast enough:
+ *
+ * Blocks, not quanta. A render quantum is 128 samples — 2.67 ms — so forwarding
+ * each one costs 375 messages a second, all of which the main thread has to
+ * drain while also decoding everyone else's video. Batching to the denoiser's
+ * frame size cuts that to 100.
+ *
+ * A capture timestamp. Without one the main thread cannot tell audio it is
+ * handling promptly from audio that has been sitting in the port queue, and a
+ * backlog built during a busy moment becomes permanent latency rather than a
+ * transient. Measured on a real two-party call, startup jank alone put the
+ * audio 600 ms behind and it never recovered. currentFrame is the authority
+ * here: it counts the audio hardware's own samples, so it cannot be skewed by
+ * whatever the main thread is doing.
  */
 const TAP_SOURCE = `
+// The denoiser's frame size, so the main thread gets whole frames and never
+// has to reconcile two different block sizes.
+const FRAME = 480;
+
 class PCMTap extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.buffer = new Float32Array(FRAME);
+    this.length = 0;
+  }
+
   process(inputs) {
     const channel = inputs[0] && inputs[0][0];
-    if (channel && channel.length) {
-      // Copy: the render buffer is reused after process returns.
-      this.port.postMessage(new Float32Array(channel));
+    if (!channel || !channel.length) return true;
+
+    let offset = 0;
+    while (offset < channel.length) {
+      const take = Math.min(FRAME - this.length, channel.length - offset);
+      this.buffer.set(channel.subarray(offset, offset + take), this.length);
+      this.length += take;
+      offset += take;
+      if (this.length < FRAME) continue;
+
+      const samples = this.buffer;
+      // A fresh buffer because the old one is transferred away, not copied.
+      this.buffer = new Float32Array(FRAME);
+      this.length = 0;
+      // currentFrame is the first sample of this quantum, so the block that
+      // just finished began FRAME samples before the point we have reached.
+      const startFrame = currentFrame + offset - FRAME;
+      this.port.postMessage(
+        { samples, captureUs: (startFrame / sampleRate) * 1e6 },
+        [samples.buffer],
+      );
     }
     return true;
   }
@@ -28,17 +71,35 @@ registerProcessor('pcm-tap', PCMTap);
 `;
 
 /**
- * pcm-player plays decoded audio from a ring buffer the main thread fills.
+ * pcm-player plays decoded audio from a ring buffer the main thread fills,
+ * and reports what it is currently playing so video can be synchronised to
+ * it.
  *
  * A ring buffer rather than scheduling AudioBufferSourceNodes because
  * decoded Opus arrives every 20 ms: hundreds of one-shot nodes per minute
  * per participant would both allocate heavily and click at every seam.
  * Underrun outputs silence and is counted, so the debug panel can show it.
+ *
+ * The playout clock needs only one scalar. Buffered audio is contiguous, so
+ * the timestamp of the sample about to be *heard* is the timestamp of the
+ * sample about to be *written* minus everything still queued. A gap — a lost
+ * packet — breaks that assumption, so an incoming chunk that does not
+ * continue the previous one resets the reference instead of mis-dating every
+ * sample after it.
  */
 const PLAYER_SOURCE = `
 // Two seconds at 48 kHz. Large enough to absorb network jitter, small
 // enough that the buffer can never hide a real stall.
 const CAPACITY = 96000;
+
+// A chunk whose timestamp misses the expected one by more than this is
+// treated as a new reference rather than a continuation.
+const RESYNC_US = 5000;
+
+// How often to report the playout clock, in render quanta. Eight quanta at
+// 48 kHz is about 21 ms — often enough for a 60 Hz render loop to interpolate
+// between reports without noticeable error.
+const REPORT_EVERY = 8;
 
 class PCMPlayer extends AudioWorkletProcessor {
   constructor() {
@@ -52,16 +113,42 @@ class PCMPlayer extends AudioWorkletProcessor {
     // start on the very first packet and then immediately starve.
     this.prerollFrames = 2880; // 60 ms
     this.playing = false;
+    // Publisher-clock timestamp of the next sample to be written.
+    this.writeUs = 0;
+    this.haveClock = false;
+    this.quanta = 0;
     this.port.onmessage = (ev) => {
       if (ev.data === 'stats') {
-        this.port.postMessage({available: this.available, underruns: this.underruns});
+        this.report();
         return;
       }
-      this.push(ev.data);
+      this.push(ev.data.samples, ev.data.timestampUs);
     };
   }
 
-  push(samples) {
+  // playoutUs is the timestamp of the sample about to leave the buffer.
+  report() {
+    this.port.postMessage({
+      available: this.available,
+      underruns: this.underruns,
+      playing: this.playing,
+      haveClock: this.haveClock,
+      playoutUs: this.writeUs - (this.available / sampleRate) * 1e6,
+    });
+  }
+
+  push(samples, timestampUs) {
+    if (typeof timestampUs === 'number') {
+      if (!this.haveClock || Math.abs(timestampUs - this.writeUs) > RESYNC_US) {
+        this.writeUs = timestampUs;
+        this.haveClock = true;
+      }
+    }
+    this.writeUs += (samples.length / sampleRate) * 1e6;
+    this.pushSamples(samples);
+  }
+
+  pushSamples(samples) {
     for (let i = 0; i < samples.length; i++) {
       this.buffer[this.write] = samples[i];
       this.write = (this.write + 1) % CAPACITY;
@@ -98,11 +185,44 @@ class PCMPlayer extends AudioWorkletProcessor {
       this.read = (this.read + 1) % CAPACITY;
       this.available--;
     }
+    if (++this.quanta % REPORT_EVERY === 0) {
+      this.report();
+    }
     return true;
   }
 }
 registerProcessor('pcm-player', PCMPlayer);
 `;
+
+/** One block of captured PCM, as pcm-tap posts it. */
+export interface TapBlock {
+  samples: Float32Array;
+  /**
+   * When the block's first sample was captured, on the AudioContext's own
+   * clock (the same base as `AudioContext.currentTime`), in microseconds.
+   */
+  captureUs: number;
+}
+
+/** What pcm-player posts back, either periodically or on a 'stats' request. */
+export interface PlayerReport {
+  /** Samples still queued in the ring buffer. */
+  available: number;
+  underruns: number;
+  /** False while prerolling or after a starve, when the clock is not moving. */
+  playing: boolean;
+  /** False until a timestamped chunk has arrived. */
+  haveClock: boolean;
+  /** Publisher-clock timestamp of the sample about to be heard. */
+  playoutUs: number;
+}
+
+/** What pcm-player expects on its port. */
+export interface PlayerChunk {
+  samples: Float32Array;
+  /** Publisher-clock timestamp of the first sample, in microseconds. */
+  timestampUs: number;
+}
 
 const moduleURLs = new Map<string, string>();
 

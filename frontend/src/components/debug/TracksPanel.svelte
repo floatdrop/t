@@ -130,7 +130,7 @@
   <section class="wide">
     <h3>Decoders</h3>
     {#if store.playbackStats.length}
-      <!-- Seven columns will not fit a narrow drawer, so the table scrolls
+      <!-- Nine columns will not fit a narrow drawer, so the table scrolls
            inside its own box rather than spilling out of the panel. -->
       <div class="scroll-x">
         <table>
@@ -140,6 +140,11 @@
               <th scope="col">Codec</th><th scope="col">Resolution</th>
               <th scope="col">fps</th><th scope="col">Queue</th>
               <th scope="col">Dropped</th><th scope="col">Buffered</th>
+              <!-- How far the picture led the sound at the last presented
+                   frame, and how many frames are waiting behind it. Nothing
+                   corrects from this, but without it a sync regression is
+                   invisible. -->
+              <th scope="col">A/V</th>
             </tr>
           </thead>
           <tbody>
@@ -162,6 +167,20 @@
                   {#if s.buffered !== undefined}
                     {(s.buffered / 48).toFixed(0)} ms
                     {#if s.underruns}<span class="warn"> · {s.underruns} underruns</span>{/if}
+                  {:else}
+                    —
+                  {/if}
+                </td>
+                <td>
+                  {#if s.avOffsetMs !== undefined}
+                    <span class={Math.abs(s.avOffsetMs) > 80 ? 'warn' : ''}>
+                      {s.avOffsetMs > 0 ? '+' : ''}{s.avOffsetMs.toFixed(0)} ms
+                    </span>
+                    {#if s.queued}<span class="muted"> · {s.queued} held</span>{/if}
+                  {:else if s.kind === 'video'}
+                    <!-- No audio from this participant, so the frame is
+                         presented as soon as it decodes. -->
+                    free
                   {:else}
                     —
                   {/if}
@@ -321,6 +340,10 @@
 
   .warn {
     color: var(--warn);
+  }
+
+  .muted {
+    color: var(--text-dim);
   }
 
   .errors {

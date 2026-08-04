@@ -12,7 +12,34 @@
 import { bridge } from './bridge';
 import { decodeAudioLevel } from './denoise';
 import { KIND_VIDEO, fromBase64, type MediaFrame, type RemoteTrack } from './protocol';
-import { addPlayerModule } from './worklets';
+import { offsetMillis, presentIndex, projectClock, type ClockSample } from './sync';
+import { addPlayerModule, type PlayerChunk, type PlayerReport } from './worklets';
+
+/**
+ * The shared output limiter. Every participant sums into it, so it exists to
+ * keep four people talking at once from clipping the device.
+ *
+ * A compressor with a high ratio just above the point where summing starts to
+ * hurt, rather than a hard clipper: it only engages on the loud moments, and a
+ * soft knee makes the engagement inaudible. Fast attack because a clip is
+ * instantaneous; slow-ish release so it does not pump on speech syllables.
+ */
+const LIMITER = {
+  threshold: -6, // dBFS
+  knee: 6,
+  ratio: 12,
+  attack: 0.003, // seconds
+  release: 0.25,
+} as const;
+
+/**
+ * Hard cap on the presentation queue, as a backstop rather than a working
+ * limit: the sync arithmetic keeps it a handful of frames deep. It matters when
+ * the render loop is not running at all — requestAnimationFrame stops while the
+ * window is hidden — where frames would otherwise pile up for as long as that
+ * lasts.
+ */
+const MAX_QUEUE = 60;
 
 /** Per-track playback counters for the debug panel. */
 export interface PlaybackStats {
@@ -26,6 +53,15 @@ export interface PlaybackStats {
   decodeQueue: number;
   /** Codec string the decoder was configured with. */
   codec: string;
+  /**
+   * Video only: how far ahead of the audio clock the last presented frame
+   * was, in milliseconds. Positive means the picture leads the sound. Absent
+   * when the participant publishes no audio, since there is then no clock to
+   * measure against.
+   */
+  avOffsetMs?: number;
+  /** Video only: frames decoded but not yet due for presentation. */
+  queued?: number;
   /**
    * Video only: the resolution frames are actually decoding at, which can
    * differ from what the catalog declared if the publisher's camera
@@ -53,6 +89,17 @@ interface VideoSink {
   /** Resolution of the most recently decoded frame. */
   width: number;
   height: number;
+  /**
+   * Decoded frames awaiting their presentation time, oldest first. Painting
+   * on decode is what left the picture unsynchronised: it ran as fast as the
+   * decoder emitted, with nothing tying it to the sound.
+   */
+  queue: VideoFrame[];
+  /**
+   * Offset of the last presented frame, for the debug panel. Null while the
+   * participant has no audio clock to measure against.
+   */
+  avOffsetMs: number | null;
 }
 
 interface AudioSink {
@@ -60,10 +107,17 @@ interface AudioSink {
   track: RemoteTrack;
   decoder: AudioDecoder;
   node: AudioWorkletNode | null;
+  /** Per-participant level, feeding the shared limiter. */
+  gain: GainNode | null;
   decoded: number;
   dropped: number;
   buffered: number;
   underruns: number;
+  /**
+   * Latest playout position reported by the worklet — the master clock for
+   * this participant's video. Null until audio actually starts playing.
+   */
+  clock: ClockSample | null;
 }
 
 type Sink = VideoSink | AudioSink;
@@ -78,6 +132,9 @@ export class Playback {
   #sinks = new Map<number, Sink>();
   #audioCtx: AudioContext | null = null;
   #audioReady: Promise<AudioContext> | null = null;
+  /** Shared limiter every participant's gain feeds. */
+  #limiter: DynamicsCompressorNode | null = null;
+  #renderHandle: number | null = null;
   #lastSample = 0;
   #stats: PlaybackStats[] = [];
 
@@ -103,10 +160,12 @@ export class Playback {
       dropped: 0,
       width: 0,
       height: 0,
+      queue: [],
+      avOffsetMs: null,
       decoder: null as unknown as VideoDecoder,
     };
     sink.decoder = new VideoDecoder({
-      output: (frame) => this.#paint(sink, frame),
+      output: (frame) => this.#enqueue(sink, frame),
       error: (err) =>
         bridge.report('ERROR', 'video decoder failed', {
           participant: track.participant,
@@ -134,6 +193,7 @@ export class Playback {
       return;
     }
     this.#sinks.set(track.handle, sink);
+    this.#startRender();
     bridge.report('INFO', 'video decoder ready', {
       participant: track.participant,
       handle: String(track.handle),
@@ -147,20 +207,40 @@ export class Playback {
       kind: 'audio',
       track,
       node: null,
+      gain: null,
       decoded: 0,
       dropped: 0,
       buffered: 0,
       underruns: 0,
+      clock: null,
       decoder: null as unknown as AudioDecoder,
     };
 
+    // Non-null because #ensureAudio builds the limiter alongside the context,
+    // and this ran after awaiting it.
+    const limiter = this.#limiter!;
+
     const node = new AudioWorkletNode(ctx, 'pcm-player', { outputChannelCount: [1] });
-    node.connect(ctx.destination);
-    node.port.onmessage = (ev: MessageEvent<{ available: number; underruns: number }>) => {
+    // Participant → its own gain → the shared limiter → output. Connecting
+    // straight to the destination, as this used to, sums everyone at unity
+    // with no headroom, so several loud speakers clip.
+    const gain = ctx.createGain();
+    gain.gain.value = 1;
+    node.connect(gain);
+    gain.connect(limiter);
+
+    node.port.onmessage = (ev: MessageEvent<PlayerReport>) => {
       sink.buffered = ev.data.available;
       sink.underruns = ev.data.underruns;
+      // Only a playing buffer has a meaningful position; a prerolling or
+      // starved one would report a clock that is not advancing, and video
+      // scheduled against it would stall.
+      sink.clock = ev.data.playing && ev.data.haveClock
+        ? { playoutUs: ev.data.playoutUs, atMs: performance.now() }
+        : null;
     };
     sink.node = node;
+    sink.gain = gain;
 
     sink.decoder = new AudioDecoder({
       output: (data) => this.#play(sink, data),
@@ -188,6 +268,7 @@ export class Playback {
         err: String(err),
       });
       node.disconnect();
+      gain.disconnect();
       return;
     }
     this.#sinks.set(track.handle, sink);
@@ -209,6 +290,14 @@ export class Playback {
       this.#audioReady = (async () => {
         const ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
         await addPlayerModule(ctx);
+        const limiter = ctx.createDynamicsCompressor();
+        limiter.threshold.value = LIMITER.threshold;
+        limiter.knee.value = LIMITER.knee;
+        limiter.ratio.value = LIMITER.ratio;
+        limiter.attack.value = LIMITER.attack;
+        limiter.release.value = LIMITER.release;
+        limiter.connect(ctx.destination);
+        this.#limiter = limiter;
         this.#audioCtx = ctx;
         return ctx;
       })();
@@ -234,13 +323,19 @@ export class Playback {
     if (sink.kind === 'video') {
       sink.pending?.close();
       sink.pending = null;
+      // Queued frames hold decoder resources; dropping the references is not
+      // enough, they have to be closed.
+      for (const frame of sink.queue) frame.close();
+      sink.queue.length = 0;
       if (sink.decoder.state !== 'closed') sink.decoder.close();
+      this.#stopRenderIfIdle();
     } else {
       if (sink.decoder.state !== 'closed') sink.decoder.close();
       if (sink.node) {
         sink.node.port.onmessage = null;
         sink.node.disconnect();
       }
+      sink.gain?.disconnect();
     }
   }
 
@@ -317,15 +412,101 @@ export class Playback {
     }
   }
 
-  #paint(sink: VideoSink, frame: VideoFrame): void {
+  /**
+   * Queues a decoded frame for presentation.
+   *
+   * Frames are counted as decoded here rather than when painted, so the fps
+   * column keeps reporting what the decoder produced even if presentation is
+   * dropping frames — the difference between the two is the interesting part.
+   */
+  #enqueue(sink: VideoSink, frame: VideoFrame): void {
     sink.decoded++;
     sink.width = frame.displayWidth;
     sink.height = frame.displayHeight;
+    sink.queue.push(frame);
+    while (sink.queue.length > MAX_QUEUE) sink.queue.shift()!.close();
+  }
+
+  /**
+   * Drives presentation for every video sink, once per display refresh.
+   *
+   * One shared loop rather than a timer per sink: presentation is bounded by
+   * the display anyway, so anything finer only burns CPU, and a single rAF
+   * callback also means every tile updates in the same paint.
+   */
+  #startRender(): void {
+    if (this.#renderHandle !== null) return;
+    const tick = () => {
+      this.#renderHandle = requestAnimationFrame(tick);
+      const now = performance.now();
+      for (const sink of this.#sinks.values()) {
+        if (sink.kind === 'video') this.#present(sink, now);
+      }
+    };
+    this.#renderHandle = requestAnimationFrame(tick);
+  }
+
+  #stopRenderIfIdle(): void {
+    if (this.#renderHandle === null) return;
+    for (const sink of this.#sinks.values()) {
+      if (sink.kind === 'video') return;
+    }
+    cancelAnimationFrame(this.#renderHandle);
+    this.#renderHandle = null;
+  }
+
+  /** Presents whichever queued frame is due against the audio clock. */
+  #present(sink: VideoSink, nowMs: number): void {
+    if (sink.queue.length === 0) return;
+
+    const clockUs = this.#clockFor(sink.track.participant, nowMs);
+    let index: number;
+    if (clockUs === null) {
+      // The participant publishes no audio, or it has not started playing.
+      // There is nothing to synchronise to, so show the newest frame — which
+      // is also the lowest-latency thing to do.
+      index = sink.queue.length - 1;
+      sink.avOffsetMs = null;
+    } else {
+      index = presentIndex(sink.queue.map((frame) => frame.timestamp), clockUs);
+      if (index < 0) return; // Nothing due yet; hold the queue.
+      sink.avOffsetMs = offsetMillis(sink.queue[index].timestamp, clockUs);
+    }
+
+    // Frames before the chosen one have been overtaken and are never shown.
+    for (let i = 0; i < index; i++) sink.queue[i].close();
+    const frame = sink.queue[index];
+    sink.queue.splice(0, index + 1);
+
     if (!sink.canvas || !sink.ctx) {
       // No tile mounted yet. Keep only the newest frame so a late-mounting
       // canvas paints something immediately instead of staying black.
       sink.pending?.close();
       sink.pending = frame;
+      return;
+    }
+    this.#paint(sink, frame);
+  }
+
+  /**
+   * The playout position of a participant's audio, projected to now, or null
+   * if they have no clock.
+   *
+   * Looked up by participant rather than held on the video sink because the
+   * two tracks are announced independently and in either order, so a
+   * back-reference would need fixing up on both paths.
+   */
+  #clockFor(participant: string, nowMs: number): number | null {
+    for (const sink of this.#sinks.values()) {
+      if (sink.kind !== 'audio' || sink.track.participant !== participant) continue;
+      return sink.clock ? projectClock(sink.clock, nowMs) : null;
+    }
+    return null;
+  }
+
+  #paint(sink: VideoSink, frame: VideoFrame): void {
+    if (!sink.canvas || !sink.ctx) {
+      frame.close();
       return;
     }
     if (sink.canvas.width !== frame.displayWidth || sink.canvas.height !== frame.displayHeight) {
@@ -350,8 +531,11 @@ export class Playback {
     try {
       const samples = new Float32Array(data.numberOfFrames);
       data.copyTo(samples, { planeIndex: 0, format: 'f32-planar' });
+      // The timestamp travels with the samples: it is what lets the worklet
+      // report a playout position, and so what video is synchronised to.
+      const chunk: PlayerChunk = { samples, timestampUs: data.timestamp };
       // Transfer rather than copy: the worklet consumes the buffer.
-      sink.node.port.postMessage(samples, [samples.buffer]);
+      sink.node.port.postMessage(chunk, [samples.buffer]);
     } catch (err) {
       console.warn('audio copy failed', err);
     } finally {
@@ -379,6 +563,8 @@ export class Playback {
       if (sink.kind === 'video') {
         row.width = sink.width;
         row.height = sink.height;
+        row.queued = sink.queue.length;
+        if (sink.avOffsetMs !== null) row.avOffsetMs = sink.avOffsetMs;
       }
       if (sink.kind === 'audio') {
         row.buffered = sink.buffered;

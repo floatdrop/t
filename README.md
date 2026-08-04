@@ -86,6 +86,49 @@ without decoding their audio, and a relay could prioritise on it.
 [draft-lcurley-moq-hang](https://datatracker.ietf.org/doc/draft-lcurley-moq-hang/)
 was the idea source for this shape; it is not a spec this implements.
 
+### Lip sync and mixing
+
+Audio is the master clock, because it has to be: the output device consumes
+samples at its own rate and cannot be asked to wait, whereas a video frame can
+be held for a few milliseconds and painted when its time comes. The player
+worklet reports the LOC timestamp of the sample it is about to play; decoded
+video waits in a short queue and each frame is painted when the clock reaches it
+(`frontend/src/lib/sync.ts`, tested on its own since it is pure arithmetic).
+Timestamps are only comparable within one publisher, so every participant is
+synchronised independently, and one with no audio track is painted as soon as it
+decodes — there is nothing to wait for.
+
+Getting the two capture timelines onto one clock was the whole problem, and
+neither obvious approach survived being measured:
+
+- Timestamping audio from a **counter of encoded samples** describes only the
+  audio that got through. The microphone is live for ~730 ms before the
+  `AudioEncoder` finishes configuring, and every frame dropped in that window
+  shifts all later timestamps into the past, permanently.
+- Timestamping from the **AudioContext's capture clock** fails differently: that
+  clock counts *rendered* audio, so it stops when rendering stops — and it does
+  stop, for ~500 ms during startup while the denoiser's WASM compiles and the
+  first subscriptions are set up. Audio after the pause is then named half a
+  second early, again permanently.
+
+So `Capture` tracks the offset between the capture clock and the shared media
+clock continuously, as the *smallest* skew seen over a one-second window: the
+main thread can only ever make a block look later than it was, never earlier, so
+the minimum is the least polluted observation, and a stall raises the floor and
+is followed within a second. Separately, a block that has waited more than 80 ms
+is dropped rather than encoded — encoding a backlog sends the audio anyway *and*
+keeps the delay forever, since the queue then drains at exactly 1×.
+
+Together those had the picture leading the sound by two thirds of a second on
+every call, invisibly, because nothing compared the two timelines. The **A/V**
+column in the decoders table now does: it shows how far the last presented frame
+was from the audio clock, which is normally under a frame interval.
+
+Mixing is Web Audio summation, but not the accidental kind: each participant
+gets a `GainNode` feeding a shared `DynamicsCompressorNode` before the
+destination. Connecting every player straight to the destination sums at unity
+with no headroom, so several loud speakers clip.
+
 ### Audio processing
 
 **Echo cancellation is the platform's.** `getUserMedia`'s `echoCancellation`
@@ -182,10 +225,11 @@ camera back on only has to declare the track again.
 A switch rebuilds just the local capture pipeline. The MOQ publications belong
 to the backend and stay open, so the new frames flow into the same tracks; a
 resolution change re-declares the video track, which republishes the catalog and
-makes subscribers reconfigure under a fresh handle. The media clock and audio
-sample counter are carried across the swap so timestamps stay monotonic — a
-subscriber mid-decode must not see them jump backwards. `TestTrackReconfiguration`
-in `internal/conf` covers that wire behaviour.
+makes subscribers reconfigure under a fresh handle. The media clock is carried
+across the swap so timestamps stay monotonic — a subscriber mid-decode must not
+see them jump backwards — while the audio clock offset is deliberately taken
+again, because the new `AudioContext` starts its own clock from zero.
+`TestTrackReconfiguration` in `internal/conf` covers that wire behaviour.
 
 ## Losing the relay
 
@@ -300,10 +344,15 @@ Drag its top edge to resize. Three tabs:
   as of quic-go v0.61 that is the only way to read RTT and loss.
 - **Tracks & codecs** — per-track bytes, objects and groups on the wire, next to
   the WebView's encoder and decoder counters (codec, decoded resolution, fps,
-  queue depth, dropped frames, audio buffer depth). Reading them side by side is
-  what localises a fault: a track carrying bytes while its decoder sits at 0 fps
-  means the problem is in the WebView, not the network. Also reports which
-  microphone processing the platform actually applied, and live voice activity.
+  queue depth, dropped frames, audio buffer depth, A/V offset). Reading them side
+  by side is what localises a fault: a track carrying bytes while its decoder
+  sits at 0 fps means the problem is in the WebView, not the network. The **A/V**
+  column is how far ahead of the audio clock the last presented frame was, plus
+  how many frames are held waiting for their turn — the only place a sync
+  regression is visible, and the column that revealed a 660 ms one. It reads
+  `free` for a participant publishing no audio, since there is then no clock to
+  measure against. Also reports which microphone processing the platform actually
+  applied, and live voice activity.
 - **Logs** — everything the backend logs, including moq-go's own output, plus
   the WebView's capture and decode events. The level selector changes the
   backend's `slog` level at runtime, so moq-go's per-message DEBUG output can be
@@ -478,6 +527,11 @@ path from a `MediaStreamTrack` to WebCodecs, so video frames are pulled off a
   apart, so they are never simultaneously in flight), but a burst of publishes
   does. A real jitter buffer keyed on the LOC timestamp would remove the
   assumption.
+- **The audio device's startup stall is corrected, not prevented.** Capture
+  rendering pauses for around half a second while the page finishes starting up,
+  and the clock tracker absorbs it within a second rather than the pause not
+  happening. The audio itself is genuinely missing for that window. Loading the
+  denoiser's WASM off the main thread would be the real fix.
 - **Only the macOS build has been run.** The Linux and Windows targets are
   verified to compile and link, and the window grants camera and microphone
   through Wails' cross-platform `Permissions` option (which those two backends

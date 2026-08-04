@@ -80,3 +80,14 @@ runs:
       shell: bash
       working-directory: tlmst/frontend
       run: npm ci
+
+    # main.go embeds frontend/dist, which is gitignored, so *nothing* in Go
+    # compiles until the frontend has been built — not the binary, not `go
+    # vet`, not `go test`. Building it here rather than per-job keeps that
+    # invariant with the module instead of leaving each caller to remember it.
+    # The build job's own `wails3 task build` rebuilds it, which is cheap and
+    # checksum-skipped.
+    - name: Build the frontend
+      shell: bash
+      working-directory: tlmst/frontend
+      run: npm run build

@@ -37,6 +37,9 @@ type App struct {
 	mu      sync.Mutex
 	room    *conf.Room
 	stopMet context.CancelFunc
+	// pendingInvite holds an invite link that arrived before the frontend
+	// was ready to receive it.
+	pendingInvite *bridge.Invite
 }
 
 // New returns an App. The caller must set its bridge server with
@@ -129,6 +132,9 @@ func (a *App) HandleConnect() {
 		state = room.State()
 	}
 	a.server.SendControl(&bridge.ServerMessage{Type: bridge.MsgState, State: state})
+
+	// A link that launched the app has been waiting for this moment.
+	a.flushInvite()
 }
 
 // HandleDisconnect tears the session down when the WebView goes away: its
@@ -279,6 +285,34 @@ func (a *App) sampleMetrics(ctx context.Context, room *conf.Room) {
 			m := sampler.Sample(now)
 			a.server.SendControl(&bridge.ServerMessage{Type: bridge.MsgMetrics, Metrics: &m})
 		}
+	}
+}
+
+// OpenInvite hands the frontend a relay and room to join, from an invite
+// link the OS delivered. Queued when no frontend is attached yet, which is
+// the launch-by-link case: the WebView takes a moment to connect, and
+// dropping the invite would make the link look broken.
+func (a *App) OpenInvite(relay, room string) {
+	invite := &bridge.Invite{Relay: relay, Room: room}
+	a.log.Info("invite link received", "relay", relay, "room", room)
+
+	a.mu.Lock()
+	a.pendingInvite = invite
+	a.mu.Unlock()
+
+	if a.server.Connected() {
+		a.flushInvite()
+	}
+}
+
+// flushInvite delivers a queued invite, if any.
+func (a *App) flushInvite() {
+	a.mu.Lock()
+	invite := a.pendingInvite
+	a.pendingInvite = nil
+	a.mu.Unlock()
+	if invite != nil {
+		a.server.SendControl(&bridge.ServerMessage{Type: bridge.MsgInvite, Invite: invite})
 	}
 }
 

@@ -162,7 +162,16 @@ type ServerMessage struct {
 	TrackGone    *RemoteTrackID `json:"trackGone,omitempty"`
 	Log          *LogEntry      `json:"log,omitempty"`
 	Metrics      *Metrics       `json:"metrics,omitempty"`
+	Invite       *Invite        `json:"invite,omitempty"`
 	Error        string         `json:"error,omitempty"`
+}
+
+// Invite is a relay and room the app was asked to join from outside — an
+// invite link the OS handed us. The frontend fills its welcome form from it
+// and joins.
+type Invite struct {
+	Relay string `json:"relay"`
+	Room  string `json:"room"`
 }
 
 // Server message types.
@@ -173,6 +182,7 @@ const (
 	MsgTrackGone    = "trackGone"
 	MsgLog          = "log"
 	MsgMetrics      = "metrics"
+	MsgInvite       = "invite"
 	MsgError        = "error"
 )
 

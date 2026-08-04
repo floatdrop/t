@@ -41,7 +41,7 @@ jobs:
 
       - name: go vet
         working-directory: tlmst
-        run: go vet ./internal/... .
+        run: go vet . ./internal/...
 
       - name: Frontend typecheck
         working-directory: tlmst/frontend
@@ -49,9 +49,11 @@ jobs:
 
       # -race because the conference layer is goroutine-dense: a router
       # goroutine per data stream, plus the publisher's and each remote's.
+      # `./...` would pull in build/ios, a Wails template package that does
+      # not build on the desktop.
       - name: go test -race
         working-directory: tlmst
-        run: go test ./internal/... -race -count=1 -timeout 10m
+        run: go test . ./internal/... -race -count=1 -timeout 10m
 
   # The build matrix proves each platform still compiles and links. It does
   # not sign or package — release.yml does that.

@@ -208,8 +208,15 @@ export interface Metrics {
   tracks?: TrackMetrics[];
 }
 
+/** A relay and room the OS handed us through an invite link. */
+export interface InviteMessage {
+  relay: string;
+  room: string;
+}
+
 export type ServerMessage =
   | { type: 'state'; state: SessionState }
+  | { type: 'invite'; invite: InviteMessage }
   | { type: 'participants'; participants: Participant[] }
   | { type: 'remoteTrack'; track: RemoteTrack }
   | { type: 'trackGone'; trackGone: RemoteTrackID }

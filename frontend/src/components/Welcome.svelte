@@ -10,6 +10,7 @@
    */
   import { onMount } from 'svelte';
   import { defaultAudioSettings, defaultVideoSettings, listDevices } from '../lib/capture';
+  import { parseInviteLink } from '../lib/invite';
   import { randomNickname, randomRoom } from '../lib/nickname';
   import { store } from '../lib/session.svelte';
 
@@ -56,6 +57,30 @@
         // Wait for the backend socket: join() needs it to send anything.
         await waitForBackend(10000);
         await join();
+      }
+    })();
+  });
+
+  /**
+   * Acts on an invite link the OS delivered: fill the form, then join.
+   *
+   * Joining without a further click is the point of a clickable link — the
+   * user already expressed intent by opening it. An invite that lands while a
+   * call is in progress is handled by Conference, not here.
+   */
+  $effect(() => {
+    const invite = store.pendingInvite;
+    if (!invite) return;
+    store.pendingInvite = null;
+    relay = invite.relay;
+    room = invite.room;
+    invitePasted = true;
+    void (async () => {
+      try {
+        await waitForBackend(10000);
+        await join();
+      } catch (err) {
+        joinError = err instanceof Error ? err.message : String(err);
       }
     })();
   });
@@ -123,6 +148,25 @@
     }
   }
 
+  /**
+   * Fills relay and room from a pasted invite link.
+   *
+   * Bound to both fields because either is a plausible place to paste a link
+   * that carries both values, and neither would accept it as a literal value.
+   */
+  function onPaste(event: ClipboardEvent): void {
+    const text = event.clipboardData?.getData('text') ?? '';
+    const invite = parseInviteLink(text);
+    if (!invite) return;
+    event.preventDefault();
+    relay = invite.relay;
+    room = invite.room;
+    invitePasted = true;
+    setTimeout(() => (invitePasted = false), 2400);
+  }
+
+  let invitePasted = $state(false);
+
   async function join(): Promise<void> {
     if (!relay.trim() || !room.trim()) return;
     joining = true;
@@ -166,15 +210,27 @@
     <div class="fields">
       <div class="field">
         <label for="relay">Relay address</label>
-        <input id="relay" bind:value={relay} placeholder="localhost:4433" spellcheck="false" />
-        <p class="hint">host:port, moqt://…, or https://… for WebTransport</p>
+        <input
+          id="relay"
+          bind:value={relay}
+          onpaste={onPaste}
+          placeholder="localhost:4433"
+          spellcheck="false"
+        />
+        <p class="hint">
+          {#if invitePasted}
+            <span class="ok-hint">Invite link applied — relay and room filled in.</span>
+          {:else}
+            host:port, moqt://…, or https://… for WebTransport — or paste an invite link
+          {/if}
+        </p>
       </div>
 
       <div class="row">
         <div class="field">
           <label for="room">Room</label>
           <div class="with-button">
-            <input id="room" bind:value={room} spellcheck="false" />
+            <input id="room" bind:value={room} onpaste={onPaste} spellcheck="false" />
             <button class="ghost" onclick={() => (room = randomRoom())} title="New room">↻</button>
           </div>
         </div>
@@ -382,6 +438,10 @@
 
   .err {
     color: var(--err);
+  }
+
+  .ok-hint {
+    color: var(--ok);
   }
 
   .toggle {

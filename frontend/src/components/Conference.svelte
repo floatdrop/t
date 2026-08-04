@@ -3,10 +3,56 @@
    * The in-call view: a tile per participant plus the local preview, and a
    * header carrying the room identity and the leave control.
    */
+  import { bridge } from '../lib/bridge';
+  import { buildInviteLink, copyText } from '../lib/invite';
   import { store } from '../lib/session.svelte';
   import VideoTile from './VideoTile.svelte';
 
+  /** How long the button confirms a copy before returning to its label. */
+  const COPIED_FEEDBACK_MS = 1600;
+
+  /**
+   * A link is only shareable if it carries both halves — the relay address is
+   * what makes the room reachable at all, so a link without it is useless.
+   */
+  const canInvite = $derived(!!store.session.relay && !!store.session.room);
+
+  let copied = $state(false);
+  let copyFailed = $state(false);
+  let copyTimer: ReturnType<typeof setTimeout> | undefined;
+
+  async function copyInvite(): Promise<void> {
+    const link = buildInviteLink({
+      relay: store.session.relay ?? '',
+      room: store.session.room ?? '',
+    });
+    const ok = await copyText(link);
+    copied = ok;
+    copyFailed = !ok;
+    if (!ok) {
+      bridge.report('WARN', 'could not copy the invite link to the clipboard');
+    }
+    clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => {
+      copied = false;
+      copyFailed = false;
+    }, COPIED_FEEDBACK_MS);
+  }
+
   const remotes = $derived(store.remotes);
+
+  /**
+   * An invite that arrives during a call is offered rather than obeyed:
+   * yanking someone out of a conversation they are already in would be worse
+   * than making them click once.
+   */
+  const invite = $derived(store.pendingInvite);
+
+  function acceptInvite(): void {
+    // Leaving returns to the welcome screen, which picks the invite up from
+    // the store and joins — the same path a link-launched app takes.
+    store.leave();
+  }
   /** Column count grows with the participant count, capped so tiles stay large. */
   const columns = $derived(Math.min(3, Math.max(1, Math.ceil(Math.sqrt(remotes.length + 1)))));
 </script>
@@ -24,6 +70,15 @@
           ? 'waiting for others to join'
           : `${remotes.length} other ${remotes.length === 1 ? 'participant' : 'participants'}`}
       </span>
+      <button
+        onclick={copyInvite}
+        disabled={!canInvite}
+        title={canInvite
+          ? `Copy an invite link for room ${store.session.room} on ${store.session.relay}`
+          : 'No relay and room to invite to yet'}
+      >
+        {#if copied}Copied ✓{:else if copyFailed}Copy failed{:else}Copy invite{/if}
+      </button>
       <button class="danger" onclick={() => store.leave()}>Leave</button>
     </div>
   </header>
@@ -45,6 +100,19 @@
       />
     {/each}
   </div>
+
+  {#if invite}
+    <div class="invite-banner">
+      <span>
+        Invite to room <strong>{invite.room}</strong> on
+        <span class="mono">{invite.relay}</span>
+      </span>
+      <span class="invite-actions">
+        <button onclick={acceptInvite}>Leave and join</button>
+        <button class="ghost" onclick={() => (store.pendingInvite = null)}>Dismiss</button>
+      </span>
+    </div>
+  {/if}
 
   {#if !store.connected}
     <p class="banner">Backend disconnected — reconnecting…</p>
@@ -109,6 +177,25 @@
        overflowing grid still scrolls from its first row. */
     align-content: safe center;
     min-height: 0;
+  }
+
+  .invite-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 8px 14px;
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    border-top: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+    font-size: 12px;
+    flex: none;
+  }
+
+  .invite-actions {
+    display: inline-flex;
+    gap: 6px;
+    flex: none;
   }
 
   .banner {

@@ -10,6 +10,7 @@ import { bridge } from './bridge';
 import { capture, type AudioSettings, type CaptureStats, type VideoSettings } from './capture';
 import { playback, type PlaybackStats } from './playback';
 import type {
+  InviteMessage,
   LogEntry,
   Metrics,
   Participant,
@@ -64,6 +65,13 @@ class Store {
 
   /** Local preview stream, shown in the welcome screen and own tile. */
   previewStream = $state<MediaStream | null>(null);
+
+  /**
+   * An invite link the backend received, waiting for the welcome screen to
+   * act on it. Held in the store rather than delivered as an event because
+   * the link can arrive before that screen has mounted.
+   */
+  pendingInvite = $state<InviteMessage | null>(null);
 
   /** True while the local microphone is picking up speech. */
   speaking = $state(false);
@@ -141,6 +149,10 @@ class Store {
         case 'metrics':
           this.metrics = msg.metrics;
           this.history = appendCapped(this.history, msg.metrics, HISTORY_LENGTH);
+          break;
+
+        case 'invite':
+          this.pendingInvite = msg.invite;
           break;
 
         case 'error':

@@ -18,10 +18,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/lmittmann/tint"
 	"github.com/wailsapp/wails/v3/pkg/application"
+	"github.com/wailsapp/wails/v3/pkg/events"
 
 	"tlmst/internal/app"
 	"tlmst/internal/bridge"
@@ -35,6 +37,10 @@ var assets embed.FS
 // token. Serving it from the asset handler means the WebView needs no
 // injected globals and no generated bindings to find the backend.
 const bridgeEndpointPath = "/__bridge"
+
+// inviteScheme is the URL scheme registered in build/darwin/Info.plist, which
+// makes tlmst://join?relay=…&room=… links clickable.
+const inviteScheme = "tlmst"
 
 func main() {
 	// Launch flags prefill (and optionally submit) the welcome form. They
@@ -95,6 +101,21 @@ func main() {
 			ApplicationShouldTerminateAfterLastWindowClosed: true,
 		},
 	})
+
+	// Invite links. Wails already installs the macOS Apple Event handler for
+	// custom URL schemes and republishes it as this event, so registering
+	// "tlmst" in Info.plist (CFBundleURLTypes) is all it takes to make
+	// tlmst://join?relay=…&room=… clickable. Fires both when a link launches
+	// the app and when one arrives while it is already running.
+	wailsApp.Event.OnApplicationEvent(events.Common.ApplicationLaunchedWithUrl,
+		func(event *application.ApplicationEvent) {
+			relay, room, ok := parseInviteURL(event.Context().URL())
+			if !ok {
+				logger.Warn("ignoring unusable invite link", "url", event.Context().URL())
+				return
+			}
+			backend.OpenInvite(relay, room)
+		})
 
 	wailsApp.Window.NewWithOptions(application.WebviewWindowOptions{
 		Title:            "tlmst",
@@ -158,6 +179,32 @@ func startURL(relay, room, nickname string, join, debug bool, debugTab string) s
 		return "/"
 	}
 	return "/?" + q.Encode()
+}
+
+// parseInviteURL pulls the relay and room out of an invite link —
+// tlmst://<relay>/<room>, where the relay is the authority and the room the
+// path. Must stay in step with buildInviteLink in frontend/src/lib/invite.ts.
+//
+// A `relay` query parameter overrides the authority. It is only present when
+// the relay is more than a bare host:port (a moqt:// or https:// URL, possibly
+// with a path), which an authority cannot express on its own.
+//
+// Both halves are required: half an invite cannot be joined.
+func parseInviteURL(raw string) (relay, room string, ok bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != inviteScheme {
+		return "", "", false
+	}
+	relay = strings.TrimSpace(u.Query().Get("relay"))
+	if relay == "" {
+		relay = u.Host
+	}
+	// url.Parse has already percent-decoded Path.
+	room = strings.TrimSpace(strings.Trim(u.Path, "/"))
+	if relay == "" || room == "" {
+		return "", "", false
+	}
+	return relay, room, true
 }
 
 // assetHandler serves the embedded frontend, plus the one extra route the

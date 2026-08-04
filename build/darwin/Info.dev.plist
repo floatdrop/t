@@ -19,6 +19,19 @@
             <string>icons</string>
         <key>LSMinimumSystemVersion</key>
             <string>12.0.0</string>
+        <key>CFBundleURLTypes</key>
+        <array>
+            <dict>
+                <key>CFBundleURLName</key>
+                    <string>tlmst invite link</string>
+                <key>CFBundleTypeRole</key>
+                    <string>Viewer</string>
+                <key>CFBundleURLSchemes</key>
+                    <array>
+                        <string>tlmst</string>
+                    </array>
+            </dict>
+        </array>
         <key>NSHighResolutionCapable</key>
             <string>true</string>
         <key>NSCameraUsageDescription</key>

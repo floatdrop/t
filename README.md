@@ -161,8 +161,51 @@ bin/tlmst.dev.app/Contents/MacOS/tlmst \
 | `-debug` | open the debug drawer at start (`Cmd+D` toggles it) |
 | `-debug-tab` | which tab to open: `transport`, `tracks`, or `logs` |
 
-The welcome screen reads the same values from the URL query, so a room is also
-shareable as a link.
+The welcome screen reads the same values from its own URL query, which is how
+these flags reach it.
+
+## Invite links
+
+**Copy invite** in the call header puts a link like this on the clipboard:
+
+```
+tlmst://localhost:4433/standup
+```
+
+The relay is the authority and the room is the path, so the link reads as an
+address. `tlmst` is registered as a URL scheme (`CFBundleURLTypes` in
+`build/darwin/Info.plist`), which makes it clickable: macOS launches the app and
+joins, or — if a call is already in progress — offers to switch rather than
+yanking you out of the conversation you are in. Wails already installs the Apple
+Event handler for custom schemes and republishes it as
+`ApplicationLaunchedWithUrl`, so no native code was needed for this.
+
+A relay that is more than a bare `host:port` — a `moqt://` or `https://` URL,
+possibly with a path — cannot be expressed by an authority alone. Those links
+keep the readable authority and carry the exact value in a `relay` query
+parameter, which wins when present:
+
+```
+tlmst://relay.example.com/r1?relay=https%3A%2F%2Frelay.example.com%2Flive
+```
+
+The welcome screen also accepts a link **pasted** into its relay or room field,
+for chat clients that will not linkify an unknown scheme. The format is parsed
+in two places — `parseInviteURL` in `main.go` and `parseInviteLink` in
+`frontend/src/lib/invite.ts` — and `invite_test.go` pins them to the same
+dialect.
+
+Scheme registration only happens for an app the OS knows about. For a dev build
+that means registering the bundle once:
+
+```sh
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+    -f bin/tlmst.dev.app
+```
+
+Windows and Linux need their own registration — registry keys written by an
+installer, and `MimeType=x-scheme-handler/tlmst` in the `.desktop` file — neither
+of which is wired up yet.
 
 ## Debug panels
 
@@ -267,8 +310,11 @@ over loopback QUIC and assert on the whole path — discovery, catalog exchange,
 subscription, and exact object delivery:
 
 ```sh
-go test ./internal/... -race
+go test . ./internal/... -race
 ```
+
+(`./...` would pull in `build/ios`, a Wails template package that does not build
+on the desktop.)
 
 ## Platform notes
 

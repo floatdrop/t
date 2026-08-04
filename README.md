@@ -263,13 +263,15 @@ It is also the app icon. `build/appicon.png` is a 1024px render of it, which
 rsvg-convert -w 1024 -h 1024 icon.svg -o build/appicon.png
 ```
 
-`build/appicon.icon/` holds the glyph-only variant for macOS 26's Icon Composer
-format, where the OS draws the tile and its lighting from a supplied layer.
-Building its `Assets.car` needs Xcode's `actool`, which the Command Line Tools
-alone do not provide, so `CFBundleIconName` is removed from both Info.plists and
-macOS falls back to `CFBundleIconFile` → `icons.icns`. With full Xcode
-installed, `wails3 task common:generate:icons` will produce `Assets.car` and the
-key can go back.
+macOS 26's Icon Composer format — a `.icon` bundle whose `Assets.car` the OS
+composites onto its own tile — is deliberately not used. Building it needs
+Xcode's `actool`, which the Command Line Tools alone do not provide, so it
+produced an icon on CI and silently nothing locally: two different app icons
+depending on where the build ran, and the CI one was wrong (a layer authored at
+64pt lands as a speck in a 1024pt canvas). `CFBundleIconName` is removed from
+both Info.plists so macOS uses `CFBundleIconFile` → `icons.icns`, which is the
+whole icon anyway — `icon.svg` is a finished tile, not a glyph for the OS to
+dress up.
 
 ## Continuous integration
 

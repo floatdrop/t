@@ -9,6 +9,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/floatdrop/moq-go/pkg/moqt"
 	"github.com/floatdrop/moq-go/pkg/moqt/message"
@@ -52,6 +53,15 @@ type Room struct {
 	// errors first, so there is one authoritative signal to act on.
 	lost    chan struct{}
 	lostErr error
+
+	// migrate closes when the relay sends GOAWAY (§10.4) — it is shutting
+	// down or rebalancing and wants us on a different session. Separate
+	// from lost because the session is still usable: we are being given a
+	// grace period rather than cut off, and acting on it early is the whole
+	// point of the message.
+	migrate     chan struct{}
+	migration   Migration
+	migrateOnce sync.Once
 	// leaving marks a deliberate Close, so the watcher can tell "the user
 	// left" from "the session died".
 	leaving atomic.Bool
@@ -102,6 +112,7 @@ func Join(ctx context.Context, log *slog.Logger, sink Sink, counters *telemetry.
 		cancel:   cancel,
 		done:     make(chan struct{}),
 		lost:     make(chan struct{}),
+		migrate:  make(chan struct{}),
 		remotes:  make(map[string]*remote),
 	}
 	r.handles.Store(bridge.HandleRemoteBase)
@@ -120,6 +131,10 @@ func Join(ctx context.Context, log *slog.Logger, sink Sink, counters *telemetry.
 		_ = res.sess.Close(moqt.SessionInternalError, "namespace watch failed")
 		return nil, err
 	}
+
+	// Registered after the session is up. OnGoaway replays a GOAWAY that
+	// arrived before this point, so nothing is lost by being late.
+	res.sess.OnGoaway(r.onGoaway)
 
 	go r.runRouter()
 	go r.readAnnouncements(watch)
@@ -144,6 +159,44 @@ func (r *Room) Lost() <-chan struct{} { return r.lost }
 func (r *Room) LostErr() error {
 	<-r.lost
 	return r.lostErr
+}
+
+// Migration is a relay's request that we continue on a different session,
+// carried by GOAWAY (§10.4).
+type Migration struct {
+	// Relay is where the relay wants us to go — the GOAWAY New Session URI.
+	// Empty when it did not name one, which means "reconnect to me".
+	Relay string
+	// Grace is how long the relay says it will wait before closing this
+	// session itself. Zero when it did not say.
+	Grace time.Duration
+}
+
+// Migrating is closed when the relay has asked us to move to a new session.
+// Unlike Lost, the current session still works — the request is an invitation
+// to move before being disconnected, so a supervisor should act on it
+// promptly rather than wait out the grace period.
+func (r *Room) Migrating() <-chan struct{} { return r.migrate }
+
+// Migration reports what the relay asked for, once Migrating has closed.
+func (r *Room) Migration() Migration {
+	<-r.migrate
+	return r.migration
+}
+
+// onGoaway records the relay's migration request. Only the first is acted on:
+// a second GOAWAY says nothing new, and the supervisor is already moving.
+func (r *Room) onGoaway(g *message.Goaway) {
+	r.migrateOnce.Do(func() {
+		r.migration = Migration{
+			Relay: string(g.NewSessionURI),
+			// §10.4 carries the grace period in milliseconds.
+			Grace: time.Duration(g.Timeout) * time.Millisecond,
+		}
+		r.log.Info("relay asked us to migrate",
+			"new_relay", r.migration.Relay, "grace", r.migration.Grace)
+		close(r.migrate)
+	})
 }
 
 // watchSession turns the session ending into the Lost signal.

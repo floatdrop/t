@@ -200,6 +200,27 @@ catalog describes the same tracks. The frontend is told through a
 health dot, decoders for the dead session are retired, and capture keeps
 running so the call resumes the moment the relay is back.
 
+A relay can also ask to be left rather than simply disappearing. **GOAWAY**
+(§10.4) means it is draining — shutting down or rebalancing — and it carries a
+grace period plus, optionally, the URI of a replacement. The point of the
+message is to move *during* that window, so the app treats it as its own signal
+(`Room.Migrating()`, distinct from `Lost()`) and migrates at once instead of
+publishing into a session on its way out and then taking the outage it was
+warned about.
+
+If the GOAWAY names a relay, that address gets the first attempt — a relay
+draining onto a successor is exactly the case where retrying the original would
+mean dialling something on its way down — and it becomes the address to
+reconnect to from then on. §10.4 allows the URI to be absent, which means "come
+back to me", so an empty one resolves to the configured relay; and a named relay
+that does not come up falls back to the configured one from the second attempt,
+so a stale URI cannot strand the client.
+
+The replacement session is dialled only *after* the old one is closed, rather
+than overlapping them. Two live sessions would announce the same namespace and
+publish the same tracks twice, and peers would see one participant as two —
+worse than the momentary gap closing first costs.
+
 Two failure shapes, and they are detected differently:
 
 - **A relay that shuts down** closes its sessions, so the client knows within
@@ -215,8 +236,10 @@ frame, so without that the remote view stays blank until the next scheduled
 keyframe.
 
 `internal/conf` covers all of it — graceful loss, silent loss, a deliberate
-leave *not* looking like loss, and a full rejoin against a relay restarted on
-the same address.
+leave *not* looking like loss, GOAWAY surfacing while the session is still
+usable (rather than only when it closes), GOAWAY *not* firing for a relay that
+just vanishes, and a full rejoin against a relay restarted on the same address.
+`internal/app` covers where each reconnect attempt dials.
 
 ## Invite links
 

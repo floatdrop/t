@@ -251,26 +251,41 @@ func (a *App) installRoom(ctx context.Context, room *conf.Room) {
 	go a.sampleMetrics(metCtx, room)
 }
 
-// superviseSession waits for the relay session to end and, unless the user
-// left, re-dials until it is back.
+// superviseSession keeps the room joined: it moves when the relay asks and
+// re-dials when the session dies, until the user leaves.
 func (a *App) superviseSession(ctx context.Context, room *conf.Room) {
 	for {
+		var detail, preferred string
+
 		select {
 		case <-ctx.Done():
 			return
+
+		case <-room.Migrating():
+			// GOAWAY: the session still works, and the point of being told
+			// is to move before being disconnected. Acting now spends none
+			// of the grace period.
+			m := room.Migration()
+			detail = "the relay asked us to move"
+			preferred = m.Relay
+			a.log.Info("migrating on the relay's request",
+				"new_relay", preferred, "grace", m.Grace)
+
 		case <-room.Lost():
+			detail = "the relay connection dropped"
+			if err := room.LostErr(); err != nil {
+				detail = err.Error()
+			}
+			a.log.Warn("relay session lost, reconnecting", "detail", detail)
 		}
 
-		detail := "the relay connection dropped"
-		if err := room.LostErr(); err != nil {
-			detail = err.Error()
-		}
-		a.log.Warn("relay session lost, reconnecting", "detail", detail)
-		// Release the dead session's streams and subscriptions before
-		// standing a new one up, so the two never overlap.
+		// Closed before the replacement is dialled, rather than overlapping
+		// them. Two live sessions would announce the same namespace and
+		// publish the same tracks twice, and peers would see one participant
+		// as two — worse than the momentary gap that closing first costs.
 		room.Close()
 
-		next := a.redial(ctx, detail)
+		next := a.redial(ctx, detail, preferred)
 		if next == nil {
 			return // the user left, or the app is shutting down
 		}
@@ -280,17 +295,26 @@ func (a *App) superviseSession(ctx context.Context, room *conf.Room) {
 
 // redial re-joins the room with exponential backoff, returning nil if the
 // user leaves or the app shuts down first.
-func (a *App) redial(ctx context.Context, detail string) *conf.Room {
+//
+// preferred is the relay a GOAWAY named, tried before the configured one. A
+// relay that is draining onto a replacement is the case that needs it: going
+// back to the original address would mean re-dialling something on its way
+// down. It is only preferred, not required — if it does not come up, the
+// configured relay is still there to fall back to.
+func (a *App) redial(ctx context.Context, detail, preferred string) *conf.Room {
+	// Copied, not aliased: a successful migration updates the stored relay,
+	// and reading the same struct outside the lock while doing so would race.
 	a.mu.Lock()
-	cfg := a.joined
-	a.mu.Unlock()
-	if cfg == nil {
+	if a.joined == nil {
+		a.mu.Unlock()
 		return nil
 	}
+	cfg := *a.joined
+	a.mu.Unlock()
 
 	delay := reconnectInitialDelay
 	for attempt := 1; ; attempt++ {
-		a.reportState(bridge.PhaseReconnecting, cfg, detail)
+		a.reportState(bridge.PhaseReconnecting, &cfg, detail)
 
 		select {
 		case <-ctx.Done():
@@ -298,18 +322,35 @@ func (a *App) redial(ctx context.Context, detail string) *conf.Room {
 		case <-time.After(delay):
 		}
 
+		attemptCfg := cfg
+		attemptCfg.Relay = relayForAttempt(cfg.Relay, preferred, attempt)
+
 		a.counters.Reset()
-		room, err := conf.Join(ctx, a.log, a.server, a.counters, *cfg)
+		room, err := conf.Join(ctx, a.log, a.server, a.counters, attemptCfg)
 		if err != nil {
 			detail = err.Error()
-			a.log.Warn("reconnect failed", "attempt", attempt, "err", err)
+			a.log.Warn("reconnect failed",
+				"attempt", attempt, "relay", attemptCfg.Relay, "err", err)
 			delay = min(delay*2, reconnectMaxDelay)
 			continue
 		}
 
+		// A migration that lands somewhere else makes that the address to
+		// reconnect to from now on: the old one is going away.
+		if attemptCfg.Relay != cfg.Relay {
+			a.log.Info("relay changed by migration",
+				"from", cfg.Relay, "to", attemptCfg.Relay)
+			a.mu.Lock()
+			if a.joined != nil {
+				a.joined.Relay = attemptCfg.Relay
+			}
+			a.mu.Unlock()
+			cfg.Relay = attemptCfg.Relay
+		}
+
 		a.installRoom(ctx, room)
 		a.restoreDeclarations(room)
-		a.reportState(bridge.PhaseJoined, cfg, "")
+		a.reportState(bridge.PhaseJoined, &cfg, "")
 		// A new session has no open group, and the publisher will not start
 		// one on a delta frame, so ask for a keyframe rather than waiting
 		// out the encoder's own interval.
@@ -317,6 +358,24 @@ func (a *App) redial(ctx context.Context, detail string) *conf.Room {
 		a.log.Info("reconnected to the relay", "attempt", attempt, "participant", room.State().ID)
 		return room
 	}
+}
+
+// relayForAttempt picks the address one reconnect attempt should dial.
+//
+// A GOAWAY may name a replacement relay, and §10.4 allows it to be absent —
+// which means "come back to me", not "go nowhere". An empty preferred address
+// therefore has to resolve to the relay already configured, or a graceful
+// drain by a relay that names no successor would leave us with nothing to
+// dial.
+//
+// The named relay only gets the first attempt. If it does not come up, later
+// attempts fall back to the configured address, so a bad or stale URI cannot
+// strand the client.
+func relayForAttempt(configured, preferred string, attempt int) string {
+	if preferred != "" && attempt == 1 {
+		return preferred
+	}
+	return configured
 }
 
 // restoreDeclarations replays the encoder configurations the frontend has

@@ -99,7 +99,15 @@ type testRelay struct {
 	t    *testing.T
 	cert tls.Certificate
 	addr string
+	// goawayGrace is how long the relay waits after GOAWAY before closing
+	// sessions itself. Zero — the default — makes Stop close them at once,
+	// which is the abrupt-shutdown case; a non-zero value is what makes the
+	// GOAWAY grace period observable.
+	goawayGrace time.Duration
 
+	// mu guards running and addr. Tests stop the relay from a goroutine —
+	// draining is what they are observing — while t.Cleanup may stop it too.
+	mu sync.Mutex
 	// running holds what Stop tears down; nil while stopped.
 	running *relayInstance
 }
@@ -123,12 +131,18 @@ func startRelay(t *testing.T) *testRelay {
 }
 
 // Addr is the host:port to dial, stable across a Stop/Start cycle.
-func (r *testRelay) Addr() string { return r.addr }
+func (r *testRelay) Addr() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.addr
+}
 
 // Start listens and serves. After the first call it reuses the same port, so
 // a client's stored relay address stays valid across a restart.
 func (r *testRelay) Start() {
 	r.t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.running != nil {
 		return
 	}
@@ -168,7 +182,8 @@ func (r *testRelay) Start() {
 	ctx, cancel := context.WithCancel(context.Background())
 	instance.cancel = cancel
 	instance.server = relay.New(quicconn.NewListener(ql), relay.Config{
-		Logger: testLogger(r.t).With("component", "relay"),
+		Logger:        testLogger(r.t).With("component", "relay"),
+		GoawayTimeout: r.goawayGrace,
 	})
 	go func() {
 		defer close(instance.done)
@@ -180,6 +195,8 @@ func (r *testRelay) Start() {
 // Stop shuts the relay down the way a redeploy does: it closes the sessions
 // it is serving, so clients learn at once. Idempotent.
 func (r *testRelay) Stop() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.running == nil {
 		return
 	}
@@ -193,12 +210,15 @@ func (r *testRelay) Stop() {
 // Kill makes the relay vanish without telling anyone, the way a crash or a
 // network partition does. Clients can only notice by timeout.
 func (r *testRelay) Kill() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.running == nil {
 		return
 	}
 	r.teardown()
 }
 
+// teardown releases the running instance. The caller holds mu.
 func (r *testRelay) teardown() {
 	r.running.cancel()
 	_ = r.running.ql.Close()
@@ -853,4 +873,71 @@ func TestRejoinAfterRelayRestart(t *testing.T) {
 		got, _ := bobRec2.countsFor("video")
 		return got > before
 	})
+}
+
+// TestGoawayIsActedOnBeforeTheCutoff covers GOAWAY (§10.4). A relay draining
+// gracefully tells us to move and then waits before closing the session; the
+// whole value of the message is learning about it during that window, not
+// after. So the test asserts not merely that we notice, but that we notice
+// while the session is still usable — a client that only reacted to the close
+// would spend the entire grace period publishing into a session on its way
+// out.
+func TestGoawayIsActedOnBeforeTheCutoff(t *testing.T) {
+	relayServer := startRelay(t)
+	// Long enough that "before the cutoff" is a real claim rather than a
+	// coincidence of scheduling.
+	relayServer.goawayGrace = 3 * time.Second
+	relayServer.Stop()
+	relayServer.Start()
+
+	alice, _ := joinRoom(t, relayServer.Addr(), "room10", "alice")
+
+	// Draining begins.
+	go relayServer.Stop()
+
+	select {
+	case <-alice.Migrating():
+	case <-alice.Lost():
+		t.Fatal("the session closed before GOAWAY was reported; the grace period was wasted")
+	case <-time.After(10 * time.Second):
+		t.Fatal("GOAWAY was never reported")
+	}
+
+	// Still usable at the moment we were told, which is what makes acting
+	// early worth anything.
+	select {
+	case <-alice.Lost():
+		t.Error("session was already gone when GOAWAY surfaced")
+	default:
+	}
+
+	m := alice.Migration()
+	if m.Grace != 3*time.Second {
+		t.Errorf("grace = %s, want 3s — the relay's timeout did not survive the wire", m.Grace)
+	}
+	// This relay names no replacement, which means "reconnect to me".
+	if m.Relay != "" {
+		t.Errorf("new relay = %q, want empty", m.Relay)
+	}
+}
+
+// TestNoGoawayOnAbruptLoss keeps the two signals apart: a relay that vanishes
+// says nothing, so Migrating must stay silent and only Lost fire. Confusing
+// the two would have the supervisor wait for a grace period nobody granted.
+func TestNoGoawayOnAbruptLoss(t *testing.T) {
+	relayServer := startRelay(t)
+	alice, _ := joinRoom(t, relayServer.Addr(), "room11", "alice")
+
+	relayServer.Kill()
+
+	select {
+	case <-alice.Lost():
+	case <-time.After(20 * time.Second):
+		t.Fatal("Lost did not close after the relay stopped answering")
+	}
+	select {
+	case <-alice.Migrating():
+		t.Error("Migrating closed although no GOAWAY was ever sent")
+	default:
+	}
 }

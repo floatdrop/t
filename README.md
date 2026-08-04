@@ -378,6 +378,14 @@ path from a `MediaStreamTrack` to WebCodecs, so video frames are pulled off a
   "Icon").
 - One video and one audio track per participant; no simulcast, no layer
   switching, no bandwidth-driven quality adaptation.
+- **Playback assumes groups arrive in publication order.** Each group is its
+  own subgroup stream, read on its own goroutine, so two groups in flight at
+  once may be delivered in either order — and the audio player is a ring buffer
+  fed in arrival order, with no reordering. Live capture never produces that
+  case (audio groups are 500 ms apart and video groups a keyframe interval
+  apart, so they are never simultaneously in flight), but a burst of publishes
+  does. A real jitter buffer keyed on the LOC timestamp would remove the
+  assumption.
 - **Only the macOS build has been run.** The Linux and Windows targets are
   verified to compile and link, and the window grants camera and microphone
   through Wails' cross-platform `Permissions` option (which those two backends

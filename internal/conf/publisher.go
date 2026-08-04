@@ -51,9 +51,20 @@ type publisher struct {
 	catalogGroup uint64
 }
 
-// newPublisher announces the local namespace and opens all three
-// publications. The catalog is published empty and republished each time
-// the frontend declares an encoder config.
+// newPublisher opens all three publications, emits the first catalog, and
+// only then announces the namespace. The catalog starts out declaring no
+// media tracks and is republished each time the frontend declares an
+// encoder config.
+//
+// The order matters and is not merely tidy. PUBLISH_NAMESPACE is what makes
+// this participant discoverable, and a peer watching the room reacts to it
+// immediately by subscribing to the catalog track. Announcing first
+// therefore advertises a participant whose tracks do not exist yet: the
+// peer's SUBSCRIBE races the PUBLISH that would let the relay serve it, and
+// on a fast loopback the SUBSCRIBE wins and hangs unanswered. Publishing
+// first closes that window — by the time anyone can learn this namespace,
+// every track is open and the first catalog object is already cached, which
+// is also what lets a late joiner's Joining FETCH find something.
 func newPublisher(
 	ctx context.Context,
 	log *slog.Logger,
@@ -62,15 +73,6 @@ func newPublisher(
 	cfg Config,
 ) (*publisher, error) {
 	ns := namespaceFor(cfg.Room, cfg.ID)
-
-	// PUBLISH_NAMESPACE is what makes this participant discoverable: the
-	// relay forwards it as a NAMESPACE arrival to everyone watching the
-	// room prefix.
-	if _, err := sess.PublishNamespace(ctx, &message.PublishNamespace{Namespace: ns}); err != nil {
-		return nil, fmt.Errorf("conf: PUBLISH_NAMESPACE %v: %w", ns, err)
-	}
-	log.Info("announced namespace", "namespace", nsString(ns))
-
 	p := &publisher{
 		log:      log,
 		sess:     sess,
@@ -93,6 +95,14 @@ func newPublisher(
 	if err := p.republishCatalog(); err != nil {
 		return nil, err
 	}
+
+	// Everything is serveable; now become discoverable. The relay forwards
+	// this as a NAMESPACE arrival to everyone watching the room prefix.
+	if _, err := sess.PublishNamespace(ctx, &message.PublishNamespace{Namespace: ns}); err != nil {
+		return nil, fmt.Errorf("conf: PUBLISH_NAMESPACE %v: %w", ns, err)
+	}
+	log.Info("announced namespace", "namespace", nsString(ns))
+
 	return p, nil
 }
 

@@ -256,7 +256,15 @@ func TestAudioLevelRoundTrip(t *testing.T) {
 
 	frames, tracks, _, _ := bobRec.snapshot()
 	handle := tracks[0].Handle
-	var levels []uint8
+
+	// Keyed by timestamp, not arrival order. A group is one subgroup stream
+	// and the router reads each on its own goroutine — deliberately, so a
+	// long-lived stream cannot block another track — so two groups in flight
+	// at once may be delivered in either order. Publishing 30 frames in a
+	// burst puts both audio groups in flight simultaneously, which is
+	// exactly that case. What has to hold is that every frame arrives
+	// carrying its own level, whenever it arrives.
+	levels := make(map[uint64]uint8, 30)
 	for _, f := range frames {
 		if f.Handle != handle {
 			continue
@@ -264,27 +272,33 @@ func TestAudioLevelRoundTrip(t *testing.T) {
 		if !f.HasAudioLevel {
 			t.Fatalf("audio frame at %dus arrived without an audio level", f.Timestamp)
 		}
-		levels = append(levels, f.AudioLevel)
+		levels[f.Timestamp] = f.AudioLevel
 	}
 	if len(levels) != 30 {
-		t.Fatalf("got %d audio frames, want 30", len(levels))
+		t.Fatalf("got %d distinct audio frames, want 30", len(levels))
 	}
-	for i, level := range levels {
+	for i := range 30 {
+		ts := uint64(i) * 20_000
 		want := uint8(silent)
 		if i < 15 {
 			want = speaking
 		}
-		if level != want {
-			t.Errorf("frame %d: audio level = %#x, want %#x", i, level, want)
+		got, ok := levels[ts]
+		if !ok {
+			t.Errorf("no frame arrived for timestamp %dus", ts)
+			continue
+		}
+		if got != want {
+			t.Errorf("frame at %dus: audio level = %#x, want %#x", ts, got, want)
 		}
 	}
 	// The voice-activity bit is what actually drives the indicator, so
 	// assert it separately from the magnitude.
 	if levels[0]&0x80 == 0 {
-		t.Error("first frame lost its voice-activity bit")
+		t.Error("the first speaking frame lost its voice-activity bit")
 	}
-	if levels[29]&0x80 != 0 {
-		t.Error("last frame gained a voice-activity bit it was not sent with")
+	if levels[29*20_000]&0x80 != 0 {
+		t.Error("the last silent frame gained a voice-activity bit it was not sent with")
 	}
 }
 

@@ -78,7 +78,9 @@ jobs:
       - name: Build the macOS app bundle
         if: runner.os == 'macOS'
         working-directory: tlmst
-        run: wails3 task package:universal
+        # Namespaced, not the root `package`: only the darwin Taskfile defines
+        # the universal variant, and the root only exposes a GOOS dispatcher.
+        run: wails3 task darwin:package:universal
 
       # Gatekeeper rejects an ad-hoc signed bundle downloaded from the
       # internet, so a real Developer ID signature replaces it when one is

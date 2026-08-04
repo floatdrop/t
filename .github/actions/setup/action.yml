@@ -40,6 +40,28 @@ runs:
         cache: npm
         cache-dependency-path: tlmst/frontend/package-lock.json
 
+    # Wails' Linux backend needs cgo and links against GTK4 and WebKitGTK 6.0
+    # — see the pkg-config line in wails/v3/pkg/application/linux_cgo.go. GTK3
+    # is the alternative, behind the `gtk3` build tag, and would want
+    # libgtk-3-dev + libwebkit2gtk-4.1-dev instead. macOS and Windows build
+    # against SDKs the runners already carry.
+    #
+    # This must precede the wails3 install below: the CLI itself pulls in
+    # wails/v3/internal/operatingsystem, which is cgo and pkg-configs gtk4, so
+    # `go install` fails outright without these headers.
+    - name: Install Linux build dependencies
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential pkg-config \
+          libgtk-4-dev libwebkitgtk-6.0-dev
+        # Fail here with a clear message rather than inside a cgo build, where
+        # it surfaces as an opaque pkg-config error.
+        pkg-config --modversion gtk4 webkitgtk-6.0
+
     # Wails' build orchestration lives in the Taskfiles and `wails3 task` is
     # what runs them, so the CLI is needed even though nothing here invokes it
     # interactively. Pinned to the version go.mod already depends on, so the
@@ -53,20 +75,6 @@ runs:
         echo "installing wails3 $version"
         go install "github.com/wailsapp/wails/v3/cmd/wails3@$version"
         echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-
-    # Wails' Linux backend needs cgo and links against GTK4 and WebKitGTK 6.0
-    # — see the pkg-config line in wails/v3/pkg/application/linux_cgo.go. GTK3
-    # is the alternative, behind the `gtk3` build tag, and would want
-    # libgtk-3-dev + libwebkit2gtk-4.1-dev instead. macOS and Windows build
-    # against SDKs the runners already carry.
-    - name: Install Linux build dependencies
-      if: runner.os == 'Linux'
-      shell: bash
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
-          build-essential pkg-config \
-          libgtk-4-dev libwebkitgtk-6.0-dev
 
     - name: Install frontend dependencies
       shell: bash

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="icon.svg" alt="" width="88" height="88">
+</p>
+
 # tlmst
 
 A desktop teleconference client that carries every participant's camera and
@@ -181,6 +185,29 @@ Drag its top edge to resize. Three tabs:
   backend's `slog` level at runtime, so moq-go's per-message DEBUG output can be
   turned on mid-call.
 
+## Icon
+
+`icon.svg` is the mark: a lowercase "t" whose period is the same green as the
+speaking indicator, so it reads as "a call is in progress" rather than just a
+letter. It is drawn as strokes rather than `<text>` — an icon must not depend on
+a font being installed wherever it is rendered — and sits on a tile in the app's
+own background colour so it needs no light/dark variant.
+
+It is also the app icon. `build/appicon.png` is a 1024px render of it, which
+`wails3 task build` turns into `darwin/icons.icns` and `windows/icon.ico`:
+
+```sh
+rsvg-convert -w 1024 -h 1024 icon.svg -o build/appicon.png
+```
+
+`build/appicon.icon/` holds the glyph-only variant for macOS 26's Icon Composer
+format, where the OS draws the tile and its lighting from a supplied layer.
+Building its `Assets.car` needs Xcode's `actool`, which the Command Line Tools
+alone do not provide, so `CFBundleIconName` is removed from both Info.plists and
+macOS falls back to `CFBundleIconFile` → `icons.icns`. With full Xcode
+installed, `wails3 task common:generate:icons` will produce `Assets.car` and the
+key can go back.
+
 ## Continuous integration
 
 Two workflows, both driving the same `wails3 task` targets used locally.
@@ -279,9 +306,10 @@ path from a `MediaStreamTrack` to WebCodecs, so video frames are pulled off a
   departure too, which also covers a peer that crashes.
 - **Regenerating build assets overwrites the Info.plist.** `wails3 task
   common:update:build-assets` rewrites `build/darwin/Info.plist` from
-  `build/config.yml`, which has no field for usage descriptions —
-  `NSCameraUsageDescription` and `NSMicrophoneUsageDescription` must be
-  re-added by hand afterwards.
+  `build/config.yml`. Two hand edits have to be reapplied afterwards: the
+  `NSCameraUsageDescription` / `NSMicrophoneUsageDescription` keys, which
+  `config.yml` has no field for, and the removal of `CFBundleIconName` (see
+  "Icon").
 - One video and one audio track per participant; no simulcast, no layer
   switching, no bandwidth-driven quality adaptation.
 - **Only the macOS build has been run.** The Linux and Windows targets are

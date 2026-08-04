@@ -49,6 +49,41 @@
    */
   const invite = $derived(store.pendingInvite);
 
+  /**
+   * Health of the link to the relay, as one of three states.
+   *
+   * Green is not merely "joined": a session can be up and still unusable, so
+   * sustained packet loss reads as degraded rather than healthy. Red is
+   * reserved for having no working session at all — that is the state a
+   * participant needs to recognise instantly.
+   */
+  const LOSS_DEGRADED_PERCENT = 2;
+
+  const health = $derived.by(() => {
+    if (!store.connected) {
+      return { level: 'down', label: 'Backend disconnected' };
+    }
+    switch (store.session.phase) {
+      case 'joined':
+        break;
+      case 'reconnecting':
+        return { level: 'degraded', label: 'Reconnecting to the relay' };
+      case 'failed':
+        return { level: 'down', label: store.session.detail || 'Connection failed' };
+      default:
+        return { level: 'down', label: 'Not connected' };
+    }
+    const loss = store.metrics?.lossPercent ?? 0;
+    if (loss >= LOSS_DEGRADED_PERCENT) {
+      return { level: 'degraded', label: `Connected · ${loss.toFixed(1)}% packet loss` };
+    }
+    const rtt = store.metrics?.rttMs;
+    return {
+      level: 'ok',
+      label: rtt ? `Connected · ${rtt.toFixed(0)} ms round trip` : 'Connected',
+    };
+  });
+
   function acceptInvite(): void {
     // Leaving returns to the welcome screen, which picks the invite up from
     // the store and joins — the same path a link-launched app takes.
@@ -64,6 +99,12 @@
       <span class="room">{store.session.room}</span>
       <span class="sep">·</span>
       <span class="relay mono">{store.session.relay}</span>
+      <span
+        class="health {health.level}"
+        title={health.label}
+        role="img"
+        aria-label={health.label}
+      ></span>
     </div>
     <div class="right">
       <span class="peers">
@@ -116,7 +157,13 @@
     </div>
   {/if}
 
-  {#if !store.connected}
+  {#if store.session.phase === 'reconnecting'}
+    <p class="banner">
+      Lost the relay — reconnecting…{store.session.detail
+        ? ` (${store.session.detail})`
+        : ''}
+    </p>
+  {:else if !store.connected}
     <p class="banner">Backend disconnected — reconnecting…</p>
   {/if}
 </div>
@@ -155,6 +202,39 @@
   .sep,
   .relay {
     color: var(--text-faint);
+  }
+
+  /* Relay health. Kept beside the address because that is what it describes,
+     and given a title so the colour is never the only thing carrying it. */
+  .health {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex: none;
+    align-self: center;
+    background: var(--text-faint);
+    transition: background 200ms ease, box-shadow 200ms ease;
+  }
+
+  .health.ok {
+    background: var(--ok);
+    box-shadow: 0 0 6px color-mix(in srgb, var(--ok) 55%, transparent);
+  }
+
+  .health.degraded {
+    background: var(--warn);
+    box-shadow: 0 0 6px color-mix(in srgb, var(--warn) 55%, transparent);
+  }
+
+  .health.down {
+    background: var(--err);
+    box-shadow: 0 0 6px color-mix(in srgb, var(--err) 55%, transparent);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .health {
+      transition: none;
+    }
   }
 
   .right {

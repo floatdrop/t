@@ -172,6 +172,13 @@ room. That control is not a convenience: joining by an invite link skips the
 welcome screen entirely, so it is the only place those choices can be made on
 that path.
 
+Turning a device off withdraws the track rather than just stopping the frames.
+A catalog that still declares video leaves every subscriber holding a decoder
+and showing its last frame, so the peer would see a frozen picture instead of
+a "camera off" tile; the frontend sends an explicit `untrack` and the publisher
+republishes the catalog without it. The publication stays open, so turning the
+camera back on only has to declare the track again.
+
 A switch rebuilds just the local capture pipeline. The MOQ publications belong
 to the backend and stay open, so the new frames flow into the same tracks; a
 resolution change re-declares the video track, which republishes the catalog and
@@ -179,6 +186,37 @@ makes subscribers reconfigure under a fresh handle. The media clock and audio
 sample counter are carried across the swap so timestamps stay monotonic — a
 subscriber mid-decode must not see them jump backwards. `TestTrackReconfiguration`
 in `internal/conf` covers that wire behaviour.
+
+## Losing the relay
+
+The relay going away is treated as a normal event, not a crash. `Room` watches
+`session.Done` — one authoritative signal, rather than inferring failure from
+whichever read loop errors first — and exposes it as `Lost()`, which never fires
+for a deliberate `Close`. A supervisor in `internal/app` waits on that and
+re-dials with exponential backoff (0.5 s doubling to 10 s), then replays the
+encoder configurations the frontend already declared so the new session's
+catalog describes the same tracks. The frontend is told through a
+`reconnecting` phase: the call stays on screen with a banner and an amber
+health dot, decoders for the dead session are retired, and capture keeps
+running so the call resumes the moment the relay is back.
+
+Two failure shapes, and they are detected differently:
+
+- **A relay that shuts down** closes its sessions, so the client knows within
+  milliseconds.
+- **A relay that simply stops answering** — a crash, a network partition — sends
+  nothing, so detection is the QUIC idle timeout. That timeout is therefore how
+  long a call sits dead before recovery can even begin, which is why it is 10 s
+  with a 2 s keepalive (five missed probes) rather than the 30 s it started at.
+
+After reconnecting the backend asks the frontend for an immediate keyframe: a
+new session has no open group and the publisher will not start one on a delta
+frame, so without that the remote view stays blank until the next scheduled
+keyframe.
+
+`internal/conf` covers all of it — graceful loss, silent loss, a deliberate
+leave *not* looking like loss, and a full rejoin against a relay restarted on
+the same address.
 
 ## Invite links
 

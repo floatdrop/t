@@ -23,6 +23,10 @@
             <string>12.0.0</string>
         <key>NSHighResolutionCapable</key>
             <string>true</string>
+        <key>NSCameraUsageDescription</key>
+            <string>tlmst publishes your camera to the other participants in the conference.</string>
+        <key>NSMicrophoneUsageDescription</key>
+            <string>tlmst publishes your microphone to the other participants in the conference.</string>
         <key>NSHumanReadableCopyright</key>
             <string>© 2026, Yandex LLC</string>
     </dict>

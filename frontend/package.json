@@ -10,9 +10,6 @@
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json"
   },
-  "dependencies": {
-    "@wailsio/runtime": "latest"
-  },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^7.0.0",
     "@tsconfig/svelte": "^5.0.8",

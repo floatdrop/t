@@ -1,0 +1,136 @@
+/* Design tokens. Dark only: this is a video app, and a bright chrome
+   around live video washes it out. */
+:root {
+  --bg: #0b0d12;
+  --bg-raised: #12151d;
+  --bg-sunken: #080a0e;
+  --panel: #161a24;
+  --border: #242a38;
+  --border-strong: #333b4d;
+
+  --text: #e6e9f0;
+  --text-dim: #98a1b3;
+  --text-faint: #646d80;
+
+  --accent: #5b8cff;
+  --accent-hover: #7aa2ff;
+  --accent-dim: #1e2a47;
+
+  --ok: #3ecf8e;
+  --warn: #e5b567;
+  --err: #f2777a;
+
+  --radius: 10px;
+  --radius-sm: 6px;
+
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 7px 14px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+button:hover:not(:disabled) {
+  background: var(--panel);
+  border-color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #08101f;
+  font-weight: 600;
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+button.danger {
+  border-color: color-mix(in srgb, var(--err) 50%, var(--border-strong));
+  color: var(--err);
+}
+
+button.ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-dim);
+  padding: 4px 8px;
+}
+
+button.ghost:hover:not(:disabled) {
+  background: var(--bg-raised);
+  border-color: var(--border);
+}
+
+input,
+select {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  width: 100%;
+}
+
+input:focus,
+select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 5px;
+}
+
+code,
+.mono {
+  font-family: var(--mono);
+  font-size: 12px;
+}

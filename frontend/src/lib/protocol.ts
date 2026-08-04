@@ -1,0 +1,237 @@
+/**
+ * Wire types and framing shared with the Go backend. Keep in step with
+ * internal/bridge/protocol.go and internal/bridge/frame.go.
+ */
+
+export const FRAME_VERSION = 1;
+export const FRAME_HEADER_LEN = 24;
+
+export const KIND_VIDEO = 0;
+export const KIND_AUDIO = 1;
+
+export const FLAG_KEYFRAME = 1 << 0;
+
+/** Handles for the two tracks this frontend publishes. */
+export const HANDLE_LOCAL_VIDEO = 0;
+export const HANDLE_LOCAL_AUDIO = 1;
+
+export interface MediaFrame {
+  kind: number;
+  handle: number;
+  /** Microseconds, straight from the encoder. */
+  timestamp: number;
+  keyFrame: boolean;
+  /** Codec description bytes, when the encoder emitted a new config. */
+  config?: Uint8Array;
+  payload: Uint8Array;
+}
+
+/** Encodes one media frame into the binary layout the backend parses. */
+export function encodeFrame(f: MediaFrame): ArrayBuffer {
+  const configLen = f.config ? f.config.byteLength : 0;
+  const buf = new ArrayBuffer(FRAME_HEADER_LEN + configLen + f.payload.byteLength);
+  const view = new DataView(buf);
+  const bytes = new Uint8Array(buf);
+
+  view.setUint8(0, FRAME_VERSION);
+  view.setUint8(1, f.kind);
+  view.setUint8(2, f.keyFrame ? FLAG_KEYFRAME : 0);
+  view.setUint8(3, 0);
+  view.setUint32(4, f.handle);
+  // Timestamps are microseconds in a u64. Number stays exact to 2^53 µs,
+  // which is ~285 years — far beyond any session.
+  view.setBigUint64(8, BigInt(Math.max(0, Math.round(f.timestamp))));
+  view.setUint32(16, configLen);
+  view.setUint32(20, f.payload.byteLength);
+
+  if (f.config) {
+    bytes.set(f.config, FRAME_HEADER_LEN);
+  }
+  bytes.set(f.payload, FRAME_HEADER_LEN + configLen);
+  return buf;
+}
+
+/** Decodes one binary frame received from the backend. */
+export function decodeFrame(buf: ArrayBuffer): MediaFrame | null {
+  if (buf.byteLength < FRAME_HEADER_LEN) return null;
+  const view = new DataView(buf);
+  if (view.getUint8(0) !== FRAME_VERSION) return null;
+
+  const configLen = view.getUint32(16);
+  const payloadLen = view.getUint32(20);
+  if (FRAME_HEADER_LEN + configLen + payloadLen > buf.byteLength) return null;
+
+  const configEnd = FRAME_HEADER_LEN + configLen;
+  return {
+    kind: view.getUint8(1),
+    handle: view.getUint32(4),
+    timestamp: Number(view.getBigUint64(8)),
+    keyFrame: (view.getUint8(2) & FLAG_KEYFRAME) !== 0,
+    config: configLen > 0 ? new Uint8Array(buf, FRAME_HEADER_LEN, configLen) : undefined,
+    payload: new Uint8Array(buf, configEnd, payloadLen),
+  };
+}
+
+// ---- control messages -------------------------------------------------
+
+export interface JoinRequest {
+  relay: string;
+  room: string;
+  nickname: string;
+}
+
+export interface TrackConfig {
+  kind: 'video' | 'audio';
+  codec: string;
+  /** Codec extradata, base64. Empty for Annex B H.264. */
+  description?: string;
+  width?: number;
+  height?: number;
+  framerate?: number;
+  bitrate?: number;
+  sampleRate?: number;
+  channels?: number;
+}
+
+export interface ClientStats {
+  encodeFps: number;
+  encodeQueue: number;
+  encodeKbps: number;
+  audioEncodeFps: number;
+  decoders?: Record<string, number>;
+}
+
+/**
+ * Something the WebView wants in the backend's log — a capture failure, a
+ * decoder error. Without this the two halves keep separate logs and the
+ * debug panel only shows half the story.
+ */
+export interface ClientReport {
+  level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
+  msg: string;
+  attrs?: Record<string, string>;
+}
+
+export type ClientMessage =
+  | { type: 'join'; join: JoinRequest }
+  | { type: 'leave' }
+  | { type: 'track'; track: TrackConfig }
+  | { type: 'stats'; stats: ClientStats }
+  | { type: 'logLevel'; logLevel: string }
+  | { type: 'report'; report: ClientReport };
+
+export type Phase = 'idle' | 'connecting' | 'joined' | 'failed';
+
+export interface SessionState {
+  phase: Phase;
+  relay?: string;
+  room?: string;
+  id?: string;
+  nickname?: string;
+  detail?: string;
+}
+
+export interface Participant {
+  id: string;
+  nickname: string;
+  hasVideo: boolean;
+  hasAudio: boolean;
+}
+
+export interface RemoteTrack {
+  handle: number;
+  participant: string;
+  nickname: string;
+  config: TrackConfig;
+}
+
+export interface RemoteTrackID {
+  handle: number;
+  participant: string;
+}
+
+export interface LogEntry {
+  /** Unix milliseconds. */
+  t: number;
+  level: string;
+  msg: string;
+  attrs?: Record<string, string>;
+}
+
+export interface TrackMetrics {
+  label: string;
+  kbps: number;
+  objects: number;
+  groups: number;
+}
+
+export interface Metrics {
+  t: number;
+
+  rttMs: number;
+  minRttMs: number;
+  latestRttMs: number;
+  cwnd: number;
+  bytesInFlight: number;
+  packetsInFlight: number;
+  congestionState?: string;
+
+  packetsSentPerSec: number;
+  packetsLostPerSec: number;
+  lossPercent: number;
+  sendKbps: number;
+  receiveKbps: number;
+
+  packetsSent: number;
+  packetsReceived: number;
+  packetsLost: number;
+
+  publishKbps: number;
+  subscribeKbps: number;
+  objectsOutPerSec: number;
+  objectsInPerSec: number;
+  groupsOutPerSec: number;
+
+  tracks?: TrackMetrics[];
+}
+
+export type ServerMessage =
+  | { type: 'state'; state: SessionState }
+  | { type: 'participants'; participants: Participant[] }
+  | { type: 'remoteTrack'; track: RemoteTrack }
+  | { type: 'trackGone'; trackGone: RemoteTrackID }
+  | { type: 'log'; log: LogEntry }
+  | { type: 'metrics'; metrics: Metrics }
+  | { type: 'error'; error: string };
+
+/** Endpoint descriptor served by the backend at /__bridge. */
+export interface Endpoint {
+  url: string;
+  token: string;
+}
+
+/**
+ * Normalises whatever WebCodecs hands back as a codec description into a
+ * Uint8Array. The spec types `description` as AllowSharedBufferSource, so
+ * it can be an ArrayBuffer, a SharedArrayBuffer, or any view over either.
+ */
+export function toBytes(src: AllowSharedBufferSource): Uint8Array {
+  if (src instanceof ArrayBuffer) return new Uint8Array(src);
+  const view = src as ArrayBufferView;
+  return new Uint8Array(view.buffer as ArrayBuffer, view.byteOffset, view.byteLength);
+}
+
+/** base64-encodes raw bytes for the JSON control channel. */
+export function toBase64(bytes: Uint8Array): string {
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+
+/** Decodes a base64 codec description back to bytes. */
+export function fromBase64(b64: string): Uint8Array {
+  const s = atob(b64);
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+}

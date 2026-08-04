@@ -9,7 +9,6 @@
    * before anyone joins a call.
    */
   import { onMount } from 'svelte';
-  import { defaultAudioSettings, defaultVideoSettings, listDevices } from '../lib/capture';
   import { parseInviteLink } from '../lib/invite';
   import { randomNickname, randomRoom } from '../lib/nickname';
   import { store } from '../lib/session.svelte';
@@ -30,17 +29,10 @@
     params.get('nickname') ?? localStorage.getItem(NICK_KEY) ?? randomNickname(),
   );
 
-  let cameras = $state<MediaDeviceInfo[]>([]);
-  let microphones = $state<MediaDeviceInfo[]>([]);
-  let cameraId = $state('');
-  let microphoneId = $state('');
-  let useVideo = $state(true);
-  let useAudio = $state(true);
-
-  let resolution = $state('1280x720');
-  let videoBitrate = $state(defaultVideoSettings.bitrate);
-  let audioBitrate = $state(defaultAudioSettings.bitrate);
-  let denoise = $state(defaultAudioSettings.denoise);
+  // Device and encoder choices live in the store, shared with the in-call
+  // device menu — see MediaSettings in session.svelte.ts.
+  const cameras = $derived(store.devices.cameras);
+  const microphones = $derived(store.devices.microphones);
 
   let previewEl = $state<HTMLVideoElement | null>(null);
   let permissionError = $state('');
@@ -106,47 +98,18 @@
     }
   });
 
+  /** Opens the devices, which is also what populates their labels. */
   async function refreshDevices(): Promise<void> {
     try {
-      await store.openPreview(videoSettings(), audioSettings());
+      await store.openPreview();
       permissionError = '';
     } catch (err) {
       permissionError = err instanceof Error ? err.message : String(err);
     }
-    // Enumerate after opening: labels stay empty until permission lands.
-    const devices = await listDevices();
-    cameras = devices.cameras;
-    microphones = devices.microphones;
-    if (!cameraId && cameras.length) cameraId = cameras[0].deviceId;
-    if (!microphoneId && microphones.length) microphoneId = microphones[0].deviceId;
-  }
-
-  function videoSettings() {
-    if (!useVideo) return null;
-    const [width, height] = resolution.split('x').map(Number);
-    return {
-      deviceId: cameraId || undefined,
-      width,
-      height,
-      framerate: defaultVideoSettings.framerate,
-      bitrate: videoBitrate,
-    };
-  }
-
-  function audioSettings() {
-    if (!useAudio) return null;
-    return { deviceId: microphoneId || undefined, bitrate: audioBitrate, denoise };
   }
 
   /** Reopens the devices when a selection changes, so preview follows it. */
-  async function reopen(): Promise<void> {
-    try {
-      await store.openPreview(videoSettings(), audioSettings());
-      permissionError = '';
-    } catch (err) {
-      permissionError = err instanceof Error ? err.message : String(err);
-    }
-  }
+  const reopen = refreshDevices;
 
   /**
    * Fills relay and room from a pasted invite link.
@@ -174,7 +137,7 @@
     localStorage.setItem(RELAY_KEY, relay);
     localStorage.setItem(NICK_KEY, nickname);
     try {
-      await store.join(relay, room, nickname, videoSettings(), audioSettings());
+      await store.join(relay, room, nickname);
     } catch (err) {
       joinError = err instanceof Error ? err.message : String(err);
     } finally {
@@ -191,14 +154,14 @@
     </header>
 
     <div class="preview">
-      {#if store.previewStream && useVideo}
+      {#if store.previewStream && store.media.useVideo}
         <!-- svelte-ignore a11y_media_has_caption -->
         <video bind:this={previewEl} autoplay muted playsinline></video>
       {:else}
         <div class="preview-empty">
           {#if permissionError}
             <span class="err">{permissionError}</span>
-          {:else if !useVideo}
+          {:else if !store.media.useVideo}
             <span>Camera off</span>
           {:else}
             <span>Starting camera…</span>
@@ -249,11 +212,11 @@
             <input
               type="checkbox"
               class="inline"
-              bind:checked={useVideo}
+              bind:checked={store.media.useVideo}
               onchange={reopen}
             /> Camera
           </label>
-          <select id="cam" bind:value={cameraId} onchange={reopen} disabled={!useVideo}>
+          <select id="cam" bind:value={store.media.cameraId} onchange={reopen} disabled={!store.media.useVideo}>
             {#each cameras as cam (cam.deviceId)}
               <option value={cam.deviceId}>{cam.label || 'Camera'}</option>
             {/each}
@@ -264,11 +227,11 @@
             <input
               type="checkbox"
               class="inline"
-              bind:checked={useAudio}
+              bind:checked={store.media.useAudio}
               onchange={reopen}
             /> Microphone
           </label>
-          <select id="mic" bind:value={microphoneId} onchange={reopen} disabled={!useAudio}>
+          <select id="mic" bind:value={store.media.microphoneId} onchange={reopen} disabled={!store.media.useAudio}>
             {#each microphones as mic (mic.deviceId)}
               <option value={mic.deviceId}>{mic.label || 'Microphone'}</option>
             {/each}
@@ -279,7 +242,7 @@
       <div class="row">
         <div class="field">
           <label for="res">Resolution</label>
-          <select id="res" bind:value={resolution} onchange={reopen} disabled={!useVideo}>
+          <select id="res" bind:value={store.media.resolution} onchange={reopen} disabled={!store.media.useVideo}>
             <option value="640x360">640 × 360</option>
             <option value="854x480">854 × 480</option>
             <option value="1280x720">1280 × 720</option>
@@ -288,7 +251,7 @@
         </div>
         <div class="field">
           <label for="vbr">Video bitrate</label>
-          <select id="vbr" bind:value={videoBitrate} disabled={!useVideo}>
+          <select id="vbr" bind:value={store.media.videoBitrate} disabled={!store.media.useVideo}>
             <option value={500_000}>500 kbps</option>
             <option value={1_000_000}>1 Mbps</option>
             <option value={1_500_000}>1.5 Mbps</option>
@@ -297,7 +260,7 @@
         </div>
         <div class="field">
           <label for="abr">Audio bitrate</label>
-          <select id="abr" bind:value={audioBitrate} disabled={!useAudio}>
+          <select id="abr" bind:value={store.media.audioBitrate} disabled={!store.media.useAudio}>
             <option value={16_000}>16 kbps</option>
             <option value={32_000}>32 kbps</option>
             <option value={64_000}>64 kbps</option>
@@ -306,7 +269,7 @@
       </div>
 
       <label class="toggle">
-        <input type="checkbox" bind:checked={denoise} disabled={!useAudio} />
+        <input type="checkbox" bind:checked={store.media.denoise} disabled={!store.media.useAudio} />
         <span>
           Noise suppression
           <em>
@@ -329,7 +292,7 @@
       <button
         class="primary"
         onclick={join}
-        disabled={joining || connecting || !store.connected || (!useVideo && !useAudio)}
+        disabled={joining || connecting || !store.connected || (!store.media.useVideo && !store.media.useAudio)}
       >
         {joining || connecting ? 'Connecting…' : 'Join room'}
       </button>

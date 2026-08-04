@@ -132,6 +132,14 @@ func (s *Sampler) Sample(now time.Time) bridge.Metrics {
 		m.SmoothedRTTMillis = millis(q.SmoothedRTT)
 		m.MinRTTMillis = millis(q.MinRTT)
 		m.LatestRTTMillis = millis(q.LatestRTT)
+		// With no RTT sample in the interval there is no peak to report;
+		// the smoothed value keeps the series continuous instead of
+		// dropping it to zero, which would read as a collapse in latency.
+		if q.PeakRTT > 0 {
+			m.PeakRTTMillis = millis(q.PeakRTT)
+		} else {
+			m.PeakRTTMillis = millis(q.SmoothedRTT)
+		}
 		m.CongestionWindow = q.CongestionWindow
 		m.BytesInFlight = q.BytesInFlight
 		m.PacketsInFlight = q.PacketsInFlight

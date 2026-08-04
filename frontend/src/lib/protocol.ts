@@ -184,6 +184,7 @@ export interface Metrics {
   rttMs: number;
   minRttMs: number;
   latestRttMs: number;
+  peakRttMs: number;
   cwnd: number;
   bytesInFlight: number;
   packetsInFlight: number;

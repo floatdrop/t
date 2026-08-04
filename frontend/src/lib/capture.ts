@@ -165,7 +165,12 @@ export class Capture {
   async start(video: VideoSettings | null, audio: AudioSettings | null): Promise<void> {
     if (!this.stream) throw new Error('capture: open() must run before start()');
     this.#running = true;
-    this.#epochUs = performance.now() * 1000;
+    // Set once per session, not per start: switchDevices restarts the
+    // pipeline, and re-basing the clock would send timestamps backwards
+    // mid-stream for every subscriber already decoding us.
+    if (this.#epochUs === 0) {
+      this.#epochUs = performance.now() * 1000;
+    }
 
     if (video && this.stream.getVideoTracks().length > 0) {
       await this.#startVideo(video);
@@ -485,6 +490,39 @@ export class Capture {
     return this.#stats;
   }
 
+  /**
+   * Swaps the capture devices on a live call.
+   *
+   * The MOQ publications belong to the backend and stay open, so this only
+   * rebuilds the local pipeline: the new frames simply keep flowing into the
+   * same tracks. A resolution or codec change is picked up by the fresh
+   * `track` declaration that #startVideo sends, which republishes the catalog
+   * and makes subscribers reconfigure.
+   *
+   * The media clock and the audio sample counter are deliberately carried
+   * across, so timestamps stay monotonic through the swap.
+   */
+  async switchDevices(
+    video: VideoSettings | null,
+    audio: AudioSettings | null,
+  ): Promise<MediaStream> {
+    const epoch = this.#epochUs;
+    const samples = this.#audioSamples;
+
+    this.stop();
+
+    this.#epochUs = epoch;
+    const stream = await this.open(video, audio);
+    // open() calls stop(), which clears the counter; restore it after.
+    this.#audioSamples = samples;
+    await this.start(video, audio);
+    bridge.report('INFO', 'capture devices switched', {
+      video: video ? 'on' : 'off',
+      audio: audio ? 'on' : 'off',
+    });
+    return stream;
+  }
+
   /** Releases the devices, encoders and audio graph. */
   stop(): void {
     this.#running = false;
@@ -514,6 +552,8 @@ export class Capture {
     this.#frameIndex = 0;
     this.#audioConfigSent = false;
     this.#pendingLen = 0;
+    this.#audioSamples = 0;
+    this.#epochUs = 0;
     this.#voice = { speaking: false, level: 0, rfc6464: 127 };
     this.#denoiser.destroy();
   }

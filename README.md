@@ -164,6 +164,22 @@ bin/tlmst.dev.app/Contents/MacOS/tlmst \
 The welcome screen reads the same values from its own URL query, which is how
 these flags reach it.
 
+## Devices
+
+The welcome screen picks camera, microphone, resolution and bitrates before
+joining, and **Devices** in the call header changes them without leaving the
+room. That control is not a convenience: joining by an invite link skips the
+welcome screen entirely, so it is the only place those choices can be made on
+that path.
+
+A switch rebuilds just the local capture pipeline. The MOQ publications belong
+to the backend and stay open, so the new frames flow into the same tracks; a
+resolution change re-declares the video track, which republishes the catalog and
+makes subscribers reconfigure under a fresh handle. The media clock and audio
+sample counter are carried across the swap so timestamps stay monotonic — a
+subscriber mid-decode must not see them jump backwards. `TestTrackReconfiguration`
+in `internal/conf` covers that wire behaviour.
+
 ## Invite links
 
 **Copy invite** in the call header puts a link like this on the clipboard:
@@ -214,7 +230,11 @@ Drag its top edge to resize. Three tabs:
 
 - **Transport** — live plots over a one-minute window: round-trip time, packet
   loss, QUIC throughput, MOQ object throughput, congestion window, objects per
-  second. Plus a table view of every plotted measure. The transport numbers come
+  second. RTT is plotted as smoothed against the interval's *peak*, not its
+  minimum: the minimum is the path's propagation floor and near-constant, so as
+  a line it says nothing, while the gap between smoothed and peak is queueing
+  delay and the spike a smoothed average hides is what makes a call stutter.
+  The floor is still worth knowing, so it stays as a number on the tile. Plus a table view of every plotted measure. The transport numbers come
   from the connection's own qlog event stream (`internal/telemetry/quictrace.go`);
   as of quic-go v0.61 that is the only way to read RTT and loss.
 - **Tracks & codecs** — per-track bytes, objects and groups on the wire, next to

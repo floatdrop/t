@@ -6,6 +6,7 @@
   import { bridge } from '../lib/bridge';
   import { buildInviteLink, copyText } from '../lib/invite';
   import { store } from '../lib/session.svelte';
+  import DeviceMenu from './DeviceMenu.svelte';
   import VideoTile from './VideoTile.svelte';
 
   /** How long the button confirms a copy before returning to its label. */
@@ -70,6 +71,7 @@
           ? 'waiting for others to join'
           : `${remotes.length} other ${remotes.length === 1 ? 'participant' : 'participants'}`}
       </span>
+      <DeviceMenu />
       <button
         onclick={copyInvite}
         disabled={!canInvite}

@@ -522,3 +522,87 @@ func TestAudioOnly(t *testing.T) {
 		return got >= 60
 	})
 }
+
+// TestTrackReconfiguration covers what an in-call device or resolution switch
+// does on the wire: the publisher re-declares its video track, which
+// republishes the catalog, and the subscriber has to retire the old
+// subscription and pick up the new one under a fresh handle. Without that the
+// frontend would keep feeding a decoder configured for the old geometry.
+func TestTrackReconfiguration(t *testing.T) {
+	addr := startRelay(t)
+
+	alice, _ := joinRoom(t, addr, "room6", "alice")
+	if err := alice.DeclareTrack(&bridge.TrackConfig{
+		Kind: "video", Codec: "avc1.42E01F", Width: 640, Height: 480, Framerate: 30,
+	}); err != nil {
+		t.Fatalf("declare video: %v", err)
+	}
+
+	_, bobRec := joinRoom(t, addr, "room6", "bob")
+	waitFor(t, "bob to subscribe to the first configuration", 10*time.Second, func() bool {
+		_, tracks, _, _ := bobRec.snapshot()
+		return len(tracks) == 1
+	})
+
+	_, tracks, _, _ := bobRec.snapshot()
+	first := tracks[0]
+	if first.Config.Width != 640 {
+		t.Fatalf("first config width = %d, want 640", first.Config.Width)
+	}
+
+	for i := range 30 {
+		if err := alice.WriteFrame(videoFrame(uint64(i)*33_000, i%30 == 0, 500)); err != nil {
+			t.Fatalf("write video %d: %v", i, err)
+		}
+	}
+	waitFor(t, "media on the first configuration", 10*time.Second, func() bool {
+		got, _ := bobRec.countsFor("video")
+		return got >= 30
+	})
+
+	// The switch: same track, different geometry.
+	if err := alice.DeclareTrack(&bridge.TrackConfig{
+		Kind: "video", Codec: "avc1.42E01F", Width: 1280, Height: 720, Framerate: 30,
+	}); err != nil {
+		t.Fatalf("redeclare video: %v", err)
+	}
+
+	waitFor(t, "bob to resubscribe under a new handle", 10*time.Second, func() bool {
+		_, tracks, _, _ := bobRec.snapshot()
+		for _, tr := range tracks {
+			if tr.Config.Width == 1280 && tr.Handle != first.Handle {
+				return true
+			}
+		}
+		return false
+	})
+
+	_, tracks, _, _ = bobRec.snapshot()
+	var second bridge.RemoteTrack
+	for _, tr := range tracks {
+		if tr.Config.Width == 1280 {
+			second = tr
+		}
+	}
+	if second.Handle == 0 {
+		t.Fatal("no track announced for the new configuration")
+	}
+	if second.Handle == first.Handle {
+		t.Error("reconfigured track reused its handle; the frontend keys decoders off it")
+	}
+	if second.Config.Height != 720 {
+		t.Errorf("new config height = %d, want 720", second.Config.Height)
+	}
+
+	// And media must resume on the new subscription, not merely be announced.
+	before, _ := bobRec.countsFor("video")
+	for i := range 30 {
+		if err := alice.WriteFrame(videoFrame(uint64(1000+i)*33_000, i%30 == 0, 900)); err != nil {
+			t.Fatalf("write video after switch %d: %v", i, err)
+		}
+	}
+	waitFor(t, "media on the new configuration", 10*time.Second, func() bool {
+		got, _ := bobRec.countsFor("video")
+		return got > before
+	})
+}

@@ -7,7 +7,15 @@
  */
 
 import { bridge } from './bridge';
-import { capture, type AudioSettings, type CaptureStats, type VideoSettings } from './capture';
+import {
+  capture,
+  defaultAudioSettings,
+  defaultVideoSettings,
+  listDevices,
+  type AudioSettings,
+  type CaptureStats,
+  type VideoSettings,
+} from './capture';
 import { playback, type PlaybackStats } from './playback';
 import type {
   InviteMessage,
@@ -34,6 +42,24 @@ const STATS_INTERVAL_MS = 250;
  * hysteresis (see denoise.ts).
  */
 const SPEAKING_TIMEOUT_MS = 400;
+
+/**
+ * The device and encoder selection, shared by the welcome screen and the
+ * in-call device menu. It lives in the store because both need to read and
+ * write the same values: joining by an invite link skips the welcome screen
+ * entirely, so the in-call menu is the only place those choices can be made.
+ */
+export interface MediaSettings {
+  cameraId: string;
+  microphoneId: string;
+  useVideo: boolean;
+  useAudio: boolean;
+  /** "WIDTHxHEIGHT", matching the welcome screen's options. */
+  resolution: string;
+  videoBitrate: number;
+  audioBitrate: number;
+  denoise: boolean;
+}
 
 /** One remote participant's tracks, keyed for the video grid. */
 export interface RemoteView {
@@ -65,6 +91,23 @@ class Store {
 
   /** Local preview stream, shown in the welcome screen and own tile. */
   previewStream = $state<MediaStream | null>(null);
+
+  media = $state<MediaSettings>({
+    cameraId: '',
+    microphoneId: '',
+    useVideo: true,
+    useAudio: true,
+    resolution: '1280x720',
+    videoBitrate: defaultVideoSettings.bitrate,
+    audioBitrate: defaultAudioSettings.bitrate,
+    denoise: defaultAudioSettings.denoise,
+  });
+
+  /** Cameras and microphones the browser is willing to name. */
+  devices = $state<{ cameras: MediaDeviceInfo[]; microphones: MediaDeviceInfo[] }>({
+    cameras: [],
+    microphones: [],
+  });
 
   /**
    * An invite link the backend received, waiting for the welcome screen to
@@ -214,10 +257,61 @@ class Store {
     );
   }
 
+  /** The current selection as the capture layer's video settings, or null. */
+  get videoSettings(): VideoSettings | null {
+    if (!this.media.useVideo) return null;
+    const [width, height] = this.media.resolution.split('x').map(Number);
+    return {
+      deviceId: this.media.cameraId || undefined,
+      width,
+      height,
+      framerate: defaultVideoSettings.framerate,
+      bitrate: this.media.videoBitrate,
+    };
+  }
+
+  /** The current selection as the capture layer's audio settings, or null. */
+  get audioSettings(): AudioSettings | null {
+    if (!this.media.useAudio) return null;
+    return {
+      deviceId: this.media.microphoneId || undefined,
+      bitrate: this.media.audioBitrate,
+      denoise: this.media.denoise,
+    };
+  }
+
   /** Opens the selected devices and shows a preview. */
-  async openPreview(video: VideoSettings | null, audio: AudioSettings | null): Promise<void> {
-    const stream = await capture.open(video, audio);
-    this.previewStream = stream;
+  async openPreview(): Promise<void> {
+    this.previewStream = await capture.open(this.videoSettings, this.audioSettings);
+    await this.refreshDevices();
+  }
+
+  /**
+   * Reloads the device list. Labels stay empty until capture permission has
+   * been granted, so this is worth repeating after a stream opens.
+   */
+  async refreshDevices(): Promise<void> {
+    const found = await listDevices();
+    this.devices = found;
+    if (!this.media.cameraId && found.cameras.length) {
+      this.media.cameraId = found.cameras[0].deviceId;
+    }
+    if (!this.media.microphoneId && found.microphones.length) {
+      this.media.microphoneId = found.microphones[0].deviceId;
+    }
+  }
+
+  /**
+   * Applies the current selection to a live call, switching devices without
+   * leaving the room. Falls back to just reopening the preview when idle.
+   */
+  async applyMedia(): Promise<void> {
+    if (this.session.phase !== 'joined') {
+      await this.openPreview();
+      return;
+    }
+    this.previewStream = await capture.switchDevices(this.videoSettings, this.audioSettings);
+    await this.refreshDevices();
   }
 
   /**
@@ -225,25 +319,19 @@ class Store {
    * must have a session before the frontend declares its tracks, since
    * declaring one republishes the catalog.
    */
-  async join(
-    relay: string,
-    room: string,
-    nickname: string,
-    video: VideoSettings | null,
-    audio: AudioSettings | null,
-  ): Promise<void> {
+  async join(relay: string, room: string, nickname: string): Promise<void> {
     this.errors = [];
     // Resume playback audio from the join click: an AudioContext created
     // without a user gesture starts suspended and stays silent.
     await playback.resume();
 
     if (!capture.stream) {
-      await this.openPreview(video, audio);
+      await this.openPreview();
     }
 
     bridge.send({ type: 'join', join: { relay, room, nickname } });
     await this.#awaitPhase('joined', 15000);
-    await capture.start(video, audio);
+    await capture.start(this.videoSettings, this.audioSettings);
   }
 
   leave(): void {

@@ -14,16 +14,23 @@
    */
   const BLUE = '#3987e5';
   const ORANGE = '#d95926';
-  const AQUA = '#199e70';
 
   let showTable = $state(false);
 
   const history = $derived(store.history);
   const pick = (fn: (m: (typeof history)[number]) => number) => history.map(fn);
 
+  /**
+   * Smoothed against the interval's worst sample, not against the minimum.
+   * The minimum is the path's propagation floor: near-constant, so as a line
+   * it carries no information. The peak is where the trouble shows — the gap
+   * between the two lines is queueing delay, and a spike a smoothed average
+   * would hide is exactly what makes a call stutter. The floor is still worth
+   * knowing, so it stays as a number in the tile below.
+   */
   const rtt = $derived([
     { label: 'smoothed', color: BLUE, values: pick((m) => m.rttMs) },
-    { label: 'minimum', color: AQUA, values: pick((m) => m.minRttMs) },
+    { label: 'peak', color: ORANGE, values: pick((m) => m.peakRttMs) },
   ]);
 
   const loss = $derived([
@@ -57,7 +64,9 @@
   <div class="tiles">
     <div class="tile">
       <span class="label">Round trip</span>
-      <span class="figure">{(current?.rttMs ?? 0).toFixed(1)}<em>ms</em></span>
+      <span class="figure">
+        {(current?.rttMs ?? 0).toFixed(1)}<em>ms · floor {(current?.minRttMs ?? 0).toFixed(1)}</em>
+      </span>
     </div>
     <div class="tile">
       <span class="label">Packet loss</span>
@@ -106,6 +115,8 @@
         <tr><th scope="row">Smoothed RTT</th><td>{(current?.rttMs ?? 0).toFixed(2)}</td><td>ms</td></tr>
         <tr><th scope="row">Minimum RTT</th><td>{(current?.minRttMs ?? 0).toFixed(2)}</td><td>ms</td></tr>
         <tr><th scope="row">Latest RTT</th><td>{(current?.latestRttMs ?? 0).toFixed(2)}</td><td>ms</td></tr>
+        <tr><th scope="row">Peak RTT (this interval)</th><td>{(current?.peakRttMs ?? 0).toFixed(2)}</td><td>ms</td></tr>
+        <tr><th scope="row">Queueing delay (peak − floor)</th><td>{Math.max(0, (current?.peakRttMs ?? 0) - (current?.minRttMs ?? 0)).toFixed(2)}</td><td>ms</td></tr>
         <tr><th scope="row">Packet loss</th><td>{(current?.lossPercent ?? 0).toFixed(3)}</td><td>%</td></tr>
         <tr><th scope="row">Packets lost per second</th><td>{(current?.packetsLostPerSec ?? 0).toFixed(2)}</td><td>1/s</td></tr>
         <tr><th scope="row">QUIC sent</th><td>{Math.round(current?.sendKbps ?? 0)}</td><td>kbps</td></tr>

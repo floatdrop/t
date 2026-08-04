@@ -30,6 +30,11 @@ type QUICTrace struct {
 	packetsInFly int
 	congestion   string
 
+	// peakRTT is the highest LatestRTT seen since the last Snapshot, which
+	// is the only way to catch a spike between two samples: the gauges above
+	// only carry whatever value happened to be current when we looked.
+	peakRTT time.Duration
+
 	// Monotonic counters since the connection opened.
 	packetsSent     uint64
 	packetsReceived uint64
@@ -40,9 +45,11 @@ type QUICTrace struct {
 
 // QUICSnapshot is a point-in-time read of a QUICTrace.
 type QUICSnapshot struct {
-	MinRTT           time.Duration
-	SmoothedRTT      time.Duration
-	LatestRTT        time.Duration
+	MinRTT      time.Duration
+	SmoothedRTT time.Duration
+	LatestRTT   time.Duration
+	// PeakRTT is the worst LatestRTT observed since the previous Snapshot.
+	PeakRTT          time.Duration
 	RTTVariance      time.Duration
 	CongestionWindow int
 	BytesInFlight    int
@@ -90,6 +97,9 @@ func (t *QUICTrace) RecordEvent(ev qlogwriter.Event) {
 		}
 		if e.LatestRTT != 0 {
 			t.latestRTT = e.LatestRTT
+			if e.LatestRTT > t.peakRTT {
+				t.peakRTT = e.LatestRTT
+			}
 		}
 		if e.RTTVariance != 0 {
 			t.rttVariance = e.RTTVariance
@@ -117,10 +127,18 @@ func (t *QUICTrace) RecordEvent(ev qlogwriter.Event) {
 }
 
 // Snapshot reads the current values.
+//
+// It also consumes PeakRTT, resetting the accumulator so the next call
+// reports the next interval's worst RTT rather than the session's. That makes
+// Snapshot a read *and* a write, which is safe because exactly one sampler
+// calls it — see [Sampler].
 func (t *QUICTrace) Snapshot() QUICSnapshot {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	peak := t.peakRTT
+	t.peakRTT = 0
 	return QUICSnapshot{
+		PeakRTT:          peak,
 		MinRTT:           t.minRTT,
 		SmoothedRTT:      t.smoothedRTT,
 		LatestRTT:        t.latestRTT,

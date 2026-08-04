@@ -248,10 +248,13 @@ type Metrics struct {
 	SmoothedRTTMillis float64 `json:"rttMs"`
 	MinRTTMillis      float64 `json:"minRttMs"`
 	LatestRTTMillis   float64 `json:"latestRttMs"`
-	CongestionWindow  int     `json:"cwnd"`
-	BytesInFlight     int     `json:"bytesInFlight"`
-	PacketsInFlight   int     `json:"packetsInFlight"`
-	CongestionState   string  `json:"congestionState,omitempty"`
+	// PeakRTTMillis is the worst RTT measured during the sample interval —
+	// the spike a smoothed average hides.
+	PeakRTTMillis    float64 `json:"peakRttMs"`
+	CongestionWindow int     `json:"cwnd"`
+	BytesInFlight    int     `json:"bytesInFlight"`
+	PacketsInFlight  int     `json:"packetsInFlight"`
+	CongestionState  string  `json:"congestionState,omitempty"`
 
 	// Rates over the sample interval.
 	PacketsSentPerSec float64 `json:"packetsSentPerSec"`

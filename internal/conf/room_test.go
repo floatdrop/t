@@ -92,44 +92,119 @@ func (r *recorder) countsFor(kind string) (frames, bytes int) {
 	return frames, bytes
 }
 
-// startRelay runs a moq-go relay on a loopback QUIC listener and returns
-// its address. Hermetic: an ephemeral port and a self-signed certificate,
-// torn down with the test.
-func startRelay(t *testing.T) string {
-	t.Helper()
+// testRelay is a moq-go relay on a loopback QUIC listener that can be taken
+// down and brought back on the same address, which is what makes relay
+// failure testable.
+type testRelay struct {
+	t    *testing.T
+	cert tls.Certificate
+	addr string
 
-	cert := selfSignedCert(t)
-	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	// running holds what Stop tears down; nil while stopped.
+	running *relayInstance
+}
+
+type relayInstance struct {
+	udp    *net.UDPConn
+	ql     *quic.Listener
+	server *relay.Relay
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+// startRelay brings up a relay on an ephemeral loopback port. Hermetic: its
+// own port and a self-signed certificate, torn down with the test.
+func startRelay(t *testing.T) *testRelay {
+	t.Helper()
+	r := &testRelay{t: t, cert: selfSignedCert(t)}
+	r.Start()
+	t.Cleanup(r.Stop)
+	return r
+}
+
+// Addr is the host:port to dial, stable across a Stop/Start cycle.
+func (r *testRelay) Addr() string { return r.addr }
+
+// Start listens and serves. After the first call it reuses the same port, so
+// a client's stored relay address stays valid across a restart.
+func (r *testRelay) Start() {
+	r.t.Helper()
+	if r.running != nil {
+		return
+	}
+
+	// An explicit port on the second and later calls: the whole point is
+	// for a reconnecting client to find the relay where it left it.
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)}
+	if r.addr != "" {
+		_, port, err := net.SplitHostPort(r.addr)
+		if err != nil {
+			r.t.Fatalf("split relay addr %q: %v", r.addr, err)
+		}
+		p, err := net.LookupPort("udp", port)
+		if err != nil {
+			r.t.Fatalf("parse relay port %q: %v", port, err)
+		}
+		addr.Port = p
+	}
+
+	udp, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		t.Fatalf("listen udp: %v", err)
+		r.t.Fatalf("listen udp: %v", err)
 	}
 	ql, err := quic.Listen(udp, &tls.Config{
-		Certificates: []tls.Certificate{cert},
+		Certificates: []tls.Certificate{r.cert},
 		NextProtos:   []string{alpnDraft19},
 	}, &quic.Config{
 		EnableDatagrams:                  true,
 		EnableStreamResetPartialDelivery: true,
 	})
 	if err != nil {
-		t.Fatalf("quic listen: %v", err)
+		r.t.Fatalf("quic listen: %v", err)
 	}
+	r.addr = udp.LocalAddr().String()
 
-	r := relay.New(quicconn.NewListener(ql), relay.Config{
-		Logger: testLogger(t).With("component", "relay"),
-	})
+	instance := relayInstance{udp: udp, ql: ql, done: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_ = r.Start(ctx)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		_ = ql.Close()
-		_ = udp.Close()
-		<-done
+	instance.cancel = cancel
+	instance.server = relay.New(quicconn.NewListener(ql), relay.Config{
+		Logger: testLogger(r.t).With("component", "relay"),
 	})
-	return udp.LocalAddr().String()
+	go func() {
+		defer close(instance.done)
+		_ = instance.server.Start(ctx)
+	}()
+	r.running = &instance
+}
+
+// Stop shuts the relay down the way a redeploy does: it closes the sessions
+// it is serving, so clients learn at once. Idempotent.
+func (r *testRelay) Stop() {
+	if r.running == nil {
+		return
+	}
+	// Relay.Stop closes the listener and then every session. Cancelling the
+	// context passed to Start only unblocks the accept loop, which is the
+	// silent case — see Kill.
+	_ = r.running.server.Stop(context.Background())
+	r.teardown()
+}
+
+// Kill makes the relay vanish without telling anyone, the way a crash or a
+// network partition does. Clients can only notice by timeout.
+func (r *testRelay) Kill() {
+	if r.running == nil {
+		return
+	}
+	r.teardown()
+}
+
+func (r *testRelay) teardown() {
+	r.running.cancel()
+	_ = r.running.ql.Close()
+	_ = r.running.udp.Close()
+	<-r.running.done
+	r.running = nil
 }
 
 func selfSignedCert(t *testing.T) tls.Certificate {
@@ -153,20 +228,34 @@ func selfSignedCert(t *testing.T) tls.Certificate {
 }
 
 // joinRoom brings up one participant against the relay.
+//
+// The dial is retried a few times because quic-go abandons a handshake after
+// five seconds of quiet, and a loaded machine — the race detector, ten tests
+// each running a relay and two participants — can stall one past that. The
+// attempts are bounded, so a genuinely broken dial still fails the test
+// quickly rather than being papered over.
 func joinRoom(t *testing.T, addr, room, nickname string) (*Room, *recorder) {
 	t.Helper()
 	rec := newRecorder()
-	r, err := Join(t.Context(), testLogger(t), rec, telemetry.NewRegistry(), Config{
-		Relay:    addr,
-		Room:     room,
-		Nickname: nickname,
-		Insecure: true,
-	})
-	if err != nil {
-		t.Fatalf("join as %s: %v", nickname, err)
+
+	const attempts = 3
+	var err error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		var r *Room
+		r, err = Join(t.Context(), testLogger(t), rec, telemetry.NewRegistry(), Config{
+			Relay:    addr,
+			Room:     room,
+			Nickname: nickname,
+			Insecure: true,
+		})
+		if err == nil {
+			t.Cleanup(r.Close)
+			return r, rec
+		}
+		t.Logf("join as %s failed (attempt %d/%d): %v", nickname, attempt, attempts, err)
 	}
-	t.Cleanup(r.Close)
-	return r, rec
+	t.Fatalf("join as %s: %v", nickname, err)
+	return nil, nil
 }
 
 // waitFor polls until cond holds or the deadline passes. Discovery and
@@ -216,7 +305,8 @@ func audioFrame(tsMicros uint64, size int) *bridge.MediaFrame {
 // RFC 6464 byte has to survive the LOC AudioLevel property in both
 // directions, or a remote tile can never light up.
 func TestAudioLevelRoundTrip(t *testing.T) {
-	addr := startRelay(t)
+	relayServer := startRelay(t)
+	addr := relayServer.Addr()
 
 	alice, _ := joinRoom(t, addr, "room5", "alice")
 	if err := alice.DeclareTrack(&bridge.TrackConfig{
@@ -306,7 +396,8 @@ func TestAudioLevelRoundTrip(t *testing.T) {
 // discovery, catalog exchange, media subscription, and object delivery
 // with LOC metadata intact.
 func TestTwoParticipants(t *testing.T) {
-	addr := startRelay(t)
+	relayServer := startRelay(t)
+	addr := relayServer.Addr()
 
 	alice, aliceRec := joinRoom(t, addr, "room1", "alice")
 	if err := alice.DeclareTrack(&bridge.TrackConfig{
@@ -444,7 +535,8 @@ func TestTwoParticipants(t *testing.T) {
 // must open on a keyframe, so leading delta frames are refused rather than
 // published into a group no subscriber could decode.
 func TestVideoNeedsKeyFrame(t *testing.T) {
-	addr := startRelay(t)
+	relayServer := startRelay(t)
+	addr := relayServer.Addr()
 	alice, _ := joinRoom(t, addr, "room2", "alice")
 
 	if err := alice.WriteFrame(videoFrame(0, false, 100)); err == nil {
@@ -466,7 +558,8 @@ func TestVideoNeedsKeyFrame(t *testing.T) {
 // withdraw its namespace so peers drop the participant and retire the
 // decoders bound to their handles.
 func TestParticipantLeaves(t *testing.T) {
-	addr := startRelay(t)
+	relayServer := startRelay(t)
+	addr := relayServer.Addr()
 
 	alice, _ := joinRoom(t, addr, "room3", "alice")
 	if err := alice.DeclareTrack(&bridge.TrackConfig{
@@ -507,7 +600,8 @@ func (w testWriter) Write(p []byte) (int, error) {
 
 // TestAudioOnly isolates the audio group cadence from the video path.
 func TestAudioOnly(t *testing.T) {
-	addr := startRelay(t)
+	relayServer := startRelay(t)
+	addr := relayServer.Addr()
 
 	alice, _ := joinRoom(t, addr, "room4", "alice")
 	if err := alice.DeclareTrack(&bridge.TrackConfig{
@@ -543,7 +637,8 @@ func TestAudioOnly(t *testing.T) {
 // subscription and pick up the new one under a fresh handle. Without that the
 // frontend would keep feeding a decoder configured for the old geometry.
 func TestTrackReconfiguration(t *testing.T) {
-	addr := startRelay(t)
+	relayServer := startRelay(t)
+	addr := relayServer.Addr()
 
 	alice, _ := joinRoom(t, addr, "room6", "alice")
 	if err := alice.DeclareTrack(&bridge.TrackConfig{
@@ -617,6 +712,145 @@ func TestTrackReconfiguration(t *testing.T) {
 	}
 	waitFor(t, "media on the new configuration", 10*time.Second, func() bool {
 		got, _ := bobRec.countsFor("video")
+		return got > before
+	})
+}
+
+// TestSessionLossIsDetected covers the signal a reconnect depends on: when
+// the relay goes away, Lost has to close. Everything else about recovery is
+// built on noticing at all.
+func TestSessionLossIsDetected(t *testing.T) {
+	relayServer := startRelay(t)
+	addr := relayServer.Addr()
+
+	alice, _ := joinRoom(t, addr, "room7", "alice")
+
+	select {
+	case <-alice.Lost():
+		t.Fatal("Lost closed while the relay was still up")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	relayServer.Stop()
+
+	select {
+	case <-alice.Lost():
+	case <-time.After(10 * time.Second):
+		t.Fatal("Lost did not close after the relay went away")
+	}
+}
+
+// TestSessionLossOnSilentOutage covers the failure that has no notification
+// at all: the relay stops answering without closing anything, as a crash or a
+// network partition does. Nothing arrives to say so, so detection is the QUIC
+// idle timeout — and that timeout is how long a call sits dead before a
+// reconnect can even start, which is why it is set where it is in dial.go.
+//
+// Necessarily slower than the graceful case; it is waiting out a real timeout.
+func TestSessionLossOnSilentOutage(t *testing.T) {
+	relayServer := startRelay(t)
+	alice, _ := joinRoom(t, relayServer.Addr(), "room7b", "alice")
+
+	relayServer.Kill()
+
+	// Generous against the configured MaxIdleTimeout so a loaded machine
+	// does not fail the test, while still failing if detection regresses to
+	// the tens of seconds it used to take.
+	select {
+	case <-alice.Lost():
+	case <-time.After(20 * time.Second):
+		t.Fatal("Lost did not close after the relay stopped answering")
+	}
+}
+
+// TestLeavingIsNotLoss pins the other half of that signal: Close must not
+// look like a failure, or a supervisor would reconnect to a room the user
+// deliberately left.
+func TestLeavingIsNotLoss(t *testing.T) {
+	relayServer := startRelay(t)
+	alice, _ := joinRoom(t, relayServer.Addr(), "room8", "alice")
+
+	alice.Close()
+
+	select {
+	case <-alice.Lost():
+		t.Fatal("Lost closed for a deliberate Close")
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// TestRejoinAfterRelayRestart walks the sequence the reconnect supervisor
+// performs — notice the loss, close the dead room, re-join the same room on
+// the same address — and checks the call genuinely comes back: both
+// participants rediscover each other and media flows again.
+func TestRejoinAfterRelayRestart(t *testing.T) {
+	relayServer := startRelay(t)
+	addr := relayServer.Addr()
+
+	videoConfig := &bridge.TrackConfig{
+		Kind: "video", Codec: "avc1.42E01F", Width: 640, Height: 480, Framerate: 30,
+	}
+
+	alice, _ := joinRoom(t, addr, "room9", "alice")
+	if err := alice.DeclareTrack(videoConfig); err != nil {
+		t.Fatalf("alice declare video: %v", err)
+	}
+	_, bobRec := joinRoom(t, addr, "room9", "bob")
+
+	waitFor(t, "bob to see alice's track", 10*time.Second, func() bool {
+		_, tracks, _, _ := bobRec.snapshot()
+		return len(tracks) == 1
+	})
+	for i := range 30 {
+		if err := alice.WriteFrame(videoFrame(uint64(i)*33_000, i%30 == 0, 400)); err != nil {
+			t.Fatalf("write video %d: %v", i, err)
+		}
+	}
+	waitFor(t, "media before the outage", 10*time.Second, func() bool {
+		got, _ := bobRec.countsFor("video")
+		return got >= 30
+	})
+
+	// The outage — a redeploy, so sessions are closed rather than stranded.
+	relayServer.Stop()
+	for name, room := range map[string]*Room{"alice": alice} {
+		select {
+		case <-room.Lost():
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s did not notice the relay going away", name)
+		}
+	}
+	alice.Close()
+
+	relayServer.Start()
+	if got := relayServer.Addr(); got != addr {
+		t.Fatalf("relay came back on %s, want the original %s", got, addr)
+	}
+
+	// What the supervisor does: re-join, then replay the declarations so the
+	// new session's catalog describes the same tracks.
+	alice2, _ := joinRoom(t, addr, "room9", "alice")
+	if err := alice2.DeclareTrack(videoConfig); err != nil {
+		t.Fatalf("alice re-declare video: %v", err)
+	}
+
+	// bob never left, so his own reconnect is what rediscovers alice. He is
+	// still on the old session here, so stand him up again too.
+	_, bobRec2 := joinRoom(t, addr, "room9", "bob")
+
+	waitFor(t, "bob to rediscover alice after the restart", 15*time.Second, func() bool {
+		_, tracks, _, _ := bobRec2.snapshot()
+		return len(tracks) == 1
+	})
+
+	before, _ := bobRec2.countsFor("video")
+	for i := range 30 {
+		if err := alice2.WriteFrame(videoFrame(uint64(1000+i)*33_000, i%30 == 0, 400)); err != nil {
+			t.Fatalf("write video after restart %d: %v", i, err)
+		}
+	}
+	waitFor(t, "media after the restart", 15*time.Second, func() bool {
+		got, _ := bobRec2.countsFor("video")
 		return got > before
 	})
 }

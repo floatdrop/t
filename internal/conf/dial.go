@@ -47,8 +47,16 @@ func dial(ctx context.Context, log *slog.Logger, addr string, insecure bool) (*d
 	trace := telemetry.NewQUICTrace()
 
 	quicCfg := &quic.Config{
-		MaxIdleTimeout:                   30 * time.Second,
-		KeepAlivePeriod:                  5 * time.Second,
+		// A relay that vanishes without closing — a crash, a partition —
+		// is only detectable by timeout, and that timeout is how long the
+		// call sits dead before a reconnect can even begin. Ten seconds
+		// with a 2 s keepalive means five missed probes before giving up:
+		// fast enough not to strand a conversation, patient enough not to
+		// tear down a session over a brief stall. Media traffic refreshes
+		// the timer anyway, so this only bites when the path is genuinely
+		// gone.
+		MaxIdleTimeout:                   10 * time.Second,
+		KeepAlivePeriod:                  2 * time.Second,
 		EnableDatagrams:                  true,
 		EnableStreamResetPartialDelivery: true, // §11.4.3 RESET_STREAM_AT
 		Tracer: func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace {

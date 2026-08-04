@@ -37,10 +37,26 @@ type App struct {
 	mu      sync.Mutex
 	room    *conf.Room
 	stopMet context.CancelFunc
+	// stopSession ends the supervisor watching the current session, so a
+	// deliberate leave does not race a reconnect.
+	stopSession context.CancelFunc
+	// joined is what a reconnect re-dials with.
+	joined *conf.Config
+	// declared caches the encoder configurations the frontend has sent, by
+	// kind. A reconnect rebuilds the catalog from these, so the frontend
+	// does not have to notice the session was replaced.
+	declared map[string]*bridge.TrackConfig
 	// pendingInvite holds an invite link that arrived before the frontend
 	// was ready to receive it.
 	pendingInvite *bridge.Invite
 }
+
+// Reconnect backoff. Short enough that a relay restart is barely noticed,
+// capped so a relay that is gone for good is retried without hammering it.
+const (
+	reconnectInitialDelay = 500 * time.Millisecond
+	reconnectMaxDelay     = 10 * time.Second
+)
 
 // New returns an App. The caller must set its bridge server with
 // SetServer before serving, and call Shutdown on exit.
@@ -49,6 +65,7 @@ func New(log *slog.Logger, sink *telemetry.LogSink) *App {
 		log:      log,
 		sink:     sink,
 		counters: telemetry.NewRegistry(),
+		declared: map[string]*bridge.TrackConfig{},
 	}
 }
 
@@ -84,6 +101,12 @@ func (a *App) HandleControl(ctx context.Context, msg *bridge.ClientMessage) erro
 
 	case bridge.MsgLogLevel:
 		return a.setLogLevel(msg.LogLevel)
+
+	case bridge.MsgUntrack:
+		if msg.Untrack == "" {
+			return errors.New("app: untrack message names no kind")
+		}
+		return a.untrackKind(msg.Untrack)
 
 	case bridge.MsgReport:
 		if msg.Report == nil {
@@ -168,8 +191,7 @@ func (a *App) join(ctx context.Context, req *bridge.JoinRequest) error {
 		},
 	})
 
-	a.counters.Reset()
-	joined, err := conf.Join(ctx, a.log, a.server, a.counters, conf.Config{
+	cfg := conf.Config{
 		Relay:    relay,
 		Room:     room,
 		Nickname: req.Nickname,
@@ -178,7 +200,10 @@ func (a *App) join(ctx context.Context, req *bridge.JoinRequest) error {
 		// has no UI for trusting one. Revisit before any deployment
 		// where the relay identity matters.
 		Insecure: true,
-	})
+	}
+
+	a.counters.Reset()
+	joined, err := conf.Join(ctx, a.log, a.server, a.counters, cfg)
 	if err != nil {
 		a.server.SendControl(&bridge.ServerMessage{
 			Type: bridge.MsgState,
@@ -192,26 +217,155 @@ func (a *App) join(ctx context.Context, req *bridge.JoinRequest) error {
 		return err
 	}
 
-	metCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
+	// The session's lifetime is not the caller's: HandleControl returns as
+	// soon as the join succeeds, and the supervisor has to outlive it.
+	sessCtx, stopSession := context.WithCancel(context.WithoutCancel(ctx))
 	a.mu.Lock()
-	a.room = joined
-	a.stopMet = stop
+	a.joined = &cfg
+	a.declared = map[string]*bridge.TrackConfig{}
+	a.stopSession = stopSession
 	a.mu.Unlock()
 
-	go a.sampleMetrics(metCtx, joined)
+	a.installRoom(sessCtx, joined)
+	go a.superviseSession(sessCtx, joined)
 
 	a.server.SendControl(&bridge.ServerMessage{Type: bridge.MsgState, State: joined.State()})
 	return nil
 }
 
-func (a *App) leave() {
+// installRoom makes room the current one and restarts the metrics sampler
+// against its QUIC trace, which is per-session and does not survive a
+// reconnect.
+func (a *App) installRoom(ctx context.Context, room *conf.Room) {
+	metCtx, stopMet := context.WithCancel(ctx)
+
 	a.mu.Lock()
-	room, stop := a.room, a.stopMet
-	a.room, a.stopMet = nil, nil
+	previous := a.stopMet
+	a.room = room
+	a.stopMet = stopMet
 	a.mu.Unlock()
 
-	if stop != nil {
-		stop()
+	if previous != nil {
+		previous()
+	}
+	go a.sampleMetrics(metCtx, room)
+}
+
+// superviseSession waits for the relay session to end and, unless the user
+// left, re-dials until it is back.
+func (a *App) superviseSession(ctx context.Context, room *conf.Room) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-room.Lost():
+		}
+
+		detail := "the relay connection dropped"
+		if err := room.LostErr(); err != nil {
+			detail = err.Error()
+		}
+		a.log.Warn("relay session lost, reconnecting", "detail", detail)
+		// Release the dead session's streams and subscriptions before
+		// standing a new one up, so the two never overlap.
+		room.Close()
+
+		next := a.redial(ctx, detail)
+		if next == nil {
+			return // the user left, or the app is shutting down
+		}
+		room = next
+	}
+}
+
+// redial re-joins the room with exponential backoff, returning nil if the
+// user leaves or the app shuts down first.
+func (a *App) redial(ctx context.Context, detail string) *conf.Room {
+	a.mu.Lock()
+	cfg := a.joined
+	a.mu.Unlock()
+	if cfg == nil {
+		return nil
+	}
+
+	delay := reconnectInitialDelay
+	for attempt := 1; ; attempt++ {
+		a.reportState(bridge.PhaseReconnecting, cfg, detail)
+
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(delay):
+		}
+
+		a.counters.Reset()
+		room, err := conf.Join(ctx, a.log, a.server, a.counters, *cfg)
+		if err != nil {
+			detail = err.Error()
+			a.log.Warn("reconnect failed", "attempt", attempt, "err", err)
+			delay = min(delay*2, reconnectMaxDelay)
+			continue
+		}
+
+		a.installRoom(ctx, room)
+		a.restoreDeclarations(room)
+		a.reportState(bridge.PhaseJoined, cfg, "")
+		// A new session has no open group, and the publisher will not start
+		// one on a delta frame, so ask for a keyframe rather than waiting
+		// out the encoder's own interval.
+		a.server.SendControl(&bridge.ServerMessage{Type: bridge.MsgRequestKeyFrame})
+		a.log.Info("reconnected to the relay", "attempt", attempt, "participant", room.State().ID)
+		return room
+	}
+}
+
+// restoreDeclarations replays the encoder configurations the frontend has
+// already sent, so the new session's catalog describes the same tracks.
+func (a *App) restoreDeclarations(room *conf.Room) {
+	a.mu.Lock()
+	declared := make([]*bridge.TrackConfig, 0, len(a.declared))
+	for _, cfg := range a.declared {
+		declared = append(declared, cfg)
+	}
+	a.mu.Unlock()
+
+	for _, cfg := range declared {
+		if err := room.DeclareTrack(cfg); err != nil {
+			a.log.Warn("could not restore a track declaration",
+				"kind", cfg.Kind, "err", err)
+		}
+	}
+}
+
+// reportState pushes one session-state update to the frontend.
+func (a *App) reportState(phase string, cfg *conf.Config, detail string) {
+	state := &bridge.SessionState{Phase: phase, Detail: detail}
+	if cfg != nil {
+		state.Relay, state.Room, state.Nickname = cfg.Relay, cfg.Room, cfg.Nickname
+	}
+	a.mu.Lock()
+	if a.room != nil {
+		state.ID = a.room.State().ID
+	}
+	a.mu.Unlock()
+	a.server.SendControl(&bridge.ServerMessage{Type: bridge.MsgState, State: state})
+}
+
+func (a *App) leave() {
+	a.mu.Lock()
+	room, stopMet, stopSession := a.room, a.stopMet, a.stopSession
+	a.room, a.stopMet, a.stopSession = nil, nil, nil
+	a.joined = nil
+	a.declared = map[string]*bridge.TrackConfig{}
+	a.mu.Unlock()
+
+	// Stop supervising before closing, or the supervisor would see the
+	// session end and start reconnecting to a room the user just left.
+	if stopSession != nil {
+		stopSession()
+	}
+	if stopMet != nil {
+		stopMet()
 	}
 	if room == nil {
 		return
@@ -234,6 +388,11 @@ func (a *App) declareTrack(cfg *bridge.TrackConfig) error {
 
 	a.mu.Lock()
 	room := a.room
+	if room != nil {
+		// Remembered so a reconnect can rebuild the catalog without the
+		// frontend having to re-send anything.
+		a.declared[cfg.Kind] = cfg
+	}
 	a.mu.Unlock()
 	if room == nil {
 		return errors.New("app: cannot declare a track before joining")
@@ -254,6 +413,19 @@ func (a *App) logReport(r *bridge.ClientReport) {
 		attrs = append(attrs, k, v)
 	}
 	a.log.Log(context.Background(), level, r.Message, attrs...)
+}
+
+// untrackKind withdraws a local track and forgets its declaration, so a
+// reconnect does not resurrect a track the user switched off.
+func (a *App) untrackKind(kind string) error {
+	a.mu.Lock()
+	room := a.room
+	delete(a.declared, kind)
+	a.mu.Unlock()
+	if room == nil {
+		return nil // nothing is published, so nothing to withdraw
+	}
+	return room.UndeclareTrack(kind)
 }
 
 func (a *App) setLogLevel(name string) error {

@@ -88,6 +88,9 @@ type ClientMessage struct {
 	Stats    *ClientStats  `json:"stats,omitempty"`
 	LogLevel string        `json:"logLevel,omitempty"`
 	Report   *ClientReport `json:"report,omitempty"`
+	// Untrack names a kind ("video"/"audio") the frontend has stopped
+	// publishing, so the catalog stops advertising it.
+	Untrack string `json:"untrack,omitempty"`
 }
 
 // Client message types.
@@ -98,6 +101,11 @@ const (
 	MsgStats    = "stats"    // frontend-side encode/decode counters
 	MsgLogLevel = "logLevel" // change the backend slog level
 	MsgReport   = "report"   // a frontend-side event worth logging
+	// MsgUntrack withdraws a local track. Turning the camera off stops the
+	// frames, but a catalog that still declares video leaves every
+	// subscriber holding a decoder and showing its last frame forever — so
+	// stopping has to be said, not merely done.
+	MsgUntrack = "untrack"
 )
 
 // ClientReport is something the frontend wants in the shared log: a
@@ -184,6 +192,11 @@ const (
 	MsgMetrics      = "metrics"
 	MsgInvite       = "invite"
 	MsgError        = "error"
+	// MsgRequestKeyFrame asks the frontend's video encoder for an immediate
+	// keyframe. A fresh session has no open group, and writeVideo will not
+	// start one on a delta frame, so without this a reconnect stays blank
+	// until the next scheduled keyframe — up to the keyframe interval.
+	MsgRequestKeyFrame = "requestKeyFrame"
 )
 
 // Session lifecycle states reported in SessionState.Phase.
@@ -192,6 +205,11 @@ const (
 	PhaseConnecting = "connecting"
 	PhaseJoined     = "joined"
 	PhaseFailed     = "failed"
+	// PhaseReconnecting means the room was joined and the relay session
+	// then ended; the backend is re-dialling. Distinct from connecting so
+	// the frontend can keep the call on screen and say what is happening
+	// rather than dumping the user back to the welcome form.
+	PhaseReconnecting = "reconnecting"
 )
 
 // SessionState is the backend's view of the MOQ session.

@@ -46,6 +46,16 @@ type Room struct {
 	// wait for a quiet shutdown.
 	done chan struct{}
 
+	// lost closes when the MOQ session ends without Close being called —
+	// the relay went away, the transport broke, the peer sent GOAWAY. It is
+	// driven off session.Done rather than inferred from whichever read loop
+	// errors first, so there is one authoritative signal to act on.
+	lost    chan struct{}
+	lostErr error
+	// leaving marks a deliberate Close, so the watcher can tell "the user
+	// left" from "the session died".
+	leaving atomic.Bool
+
 	handles atomic.Uint32
 
 	mu      sync.Mutex
@@ -91,6 +101,7 @@ func Join(ctx context.Context, log *slog.Logger, sink Sink, counters *telemetry.
 		ctx:      roomCtx,
 		cancel:   cancel,
 		done:     make(chan struct{}),
+		lost:     make(chan struct{}),
 		remotes:  make(map[string]*remote),
 	}
 	r.handles.Store(bridge.HandleRemoteBase)
@@ -112,6 +123,7 @@ func Join(ctx context.Context, log *slog.Logger, sink Sink, counters *telemetry.
 
 	go r.runRouter()
 	go r.readAnnouncements(watch)
+	go r.watchSession()
 
 	r.log.Info("joined room", "relay", cfg.Relay, "nickname", cfg.Nickname)
 	return r, nil
@@ -120,6 +132,30 @@ func Join(ctx context.Context, log *slog.Logger, sink Sink, counters *telemetry.
 // Trace exposes the session's QUIC trace so the metrics sampler can read
 // transport health.
 func (r *Room) Trace() *telemetry.QUICTrace { return r.trace }
+
+// Lost is closed when the session ended on its own — the relay became
+// unreachable, the transport failed, the peer went away. It never closes for
+// a Close initiated here, so a supervisor can use it as "reconnect now"
+// without having to second-guess a deliberate leave.
+func (r *Room) Lost() <-chan struct{} { return r.lost }
+
+// LostErr reports why the session ended, once Lost has closed. Nil means it
+// ended cleanly, which for a relay-side shutdown is the normal case.
+func (r *Room) LostErr() error {
+	<-r.lost
+	return r.lostErr
+}
+
+// watchSession turns the session ending into the Lost signal.
+func (r *Room) watchSession() {
+	<-r.sess.Done()
+	if r.leaving.Load() {
+		return // Close did this on purpose
+	}
+	r.lostErr = r.sess.Err()
+	r.log.Warn("relay session ended", "err", r.lostErr)
+	close(r.lost)
+}
 
 // State renders the room for the frontend's session banner.
 func (r *Room) State() *bridge.SessionState {
@@ -136,6 +172,12 @@ func (r *Room) State() *bridge.SessionState {
 // catalog so remote participants can decode what follows.
 func (r *Room) DeclareTrack(cfg *bridge.TrackConfig) error {
 	return r.pub.declareConfig(cfg)
+}
+
+// UndeclareTrack withdraws a local track from the catalog, so subscribers
+// drop it instead of holding a decoder that will never be fed again.
+func (r *Room) UndeclareTrack(kind string) error {
+	return r.pub.undeclareConfig(kind)
 }
 
 // WriteFrame publishes one encoded frame captured by the frontend.
@@ -296,11 +338,10 @@ func (r *Room) runRouter() {
 	defer close(r.done)
 	err := r.router.Run(r.ctx, r.sess)
 	if err != nil && r.ctx.Err() == nil && !errors.Is(err, context.Canceled) {
-		r.log.Warn("data stream loop ended", "err", err)
-		r.sink.SendControl(&bridge.ServerMessage{
-			Type:  bridge.MsgError,
-			Error: "transport closed: " + err.Error(),
-		})
+		// Logged only. A dead session surfaces through Lost, which is the
+		// one signal the supervisor acts on — reporting it from here too
+		// would race that and tell the frontend the same thing twice.
+		r.log.Debug("data stream loop ended", "err", err)
 	}
 }
 
@@ -313,6 +354,7 @@ func (r *Room) Close() {
 		return
 	}
 	r.closed = true
+	r.leaving.Store(true)
 	remotes := make([]*remote, 0, len(r.remotes))
 	for _, rem := range r.remotes {
 		if rem != nil {

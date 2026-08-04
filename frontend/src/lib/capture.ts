@@ -91,6 +91,8 @@ export class Capture {
 
   #running = false;
   #frameIndex = 0;
+  /** Set by forceKeyFrame; consumed by the next captured frame. */
+  #forceKeyFrame = false;
   /** Shared epoch so audio and video timestamps sit on one clock. */
   #epochUs = 0;
   #audioSamples = 0;
@@ -248,7 +250,16 @@ export class Capture {
           frame = new VideoFrame(this.#video, {
             timestamp: Math.round(performance.now() * 1000 - this.#epochUs),
           });
-          this.#videoEncoder.encode(frame, { keyFrame: this.#frameIndex % keyEvery === 0 });
+          const forced = this.#forceKeyFrame;
+          this.#forceKeyFrame = false;
+          if (forced) {
+            // Restart the cadence from here, so a forced keyframe does not
+            // leave the next scheduled one moments behind it.
+            this.#frameIndex = 0;
+          }
+          this.#videoEncoder.encode(frame, {
+            keyFrame: forced || this.#frameIndex % keyEvery === 0,
+          });
           this.#frameIndex++;
         } catch (err) {
           bridge.report('WARN', 'video frame capture failed', { err: String(err) });
@@ -516,6 +527,14 @@ export class Capture {
     // open() calls stop(), which clears the counter; restore it after.
     this.#audioSamples = samples;
     await this.start(video, audio);
+
+    // start() declares whichever kinds it brought up. The ones it did not
+    // have to be withdrawn explicitly, or the catalog keeps advertising a
+    // track that will never produce another frame and every subscriber sits
+    // on its last one.
+    if (!video) bridge.send({ type: 'untrack', untrack: 'video' });
+    if (!audio) bridge.send({ type: 'untrack', untrack: 'audio' });
+
     bridge.report('INFO', 'capture devices switched', {
       video: video ? 'on' : 'off',
       audio: audio ? 'on' : 'off',
@@ -556,6 +575,17 @@ export class Capture {
     this.#epochUs = 0;
     this.#voice = { speaking: false, level: 0, rfc6464: 127 };
     this.#denoiser.destroy();
+  }
+
+  /**
+   * Makes the next captured frame a keyframe.
+   *
+   * Used after a reconnect: the new session has no open group, and the
+   * publisher will not start one on a delta frame, so without this the
+   * remote view stays blank until the next scheduled keyframe.
+   */
+  forceKeyFrame(): void {
+    this.#forceKeyFrame = true;
   }
 
   /** The local participant's current voice state. */

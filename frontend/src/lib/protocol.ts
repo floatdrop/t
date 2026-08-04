@@ -131,9 +131,15 @@ export type ClientMessage =
   | { type: 'track'; track: TrackConfig }
   | { type: 'stats'; stats: ClientStats }
   | { type: 'logLevel'; logLevel: string }
+  | { type: 'untrack'; untrack: 'video' | 'audio' }
   | { type: 'report'; report: ClientReport };
 
-export type Phase = 'idle' | 'connecting' | 'joined' | 'failed';
+/**
+ * `reconnecting` means the room was joined and the relay session then ended;
+ * the backend is re-dialling. Distinct from `connecting` so the call can stay
+ * on screen instead of dropping the user back to the welcome form.
+ */
+export type Phase = 'idle' | 'connecting' | 'joined' | 'failed' | 'reconnecting';
 
 export interface SessionState {
   phase: Phase;
@@ -218,6 +224,7 @@ export interface InviteMessage {
 export type ServerMessage =
   | { type: 'state'; state: SessionState }
   | { type: 'invite'; invite: InviteMessage }
+  | { type: 'requestKeyFrame' }
   | { type: 'participants'; participants: Participant[] }
   | { type: 'remoteTrack'; track: RemoteTrack }
   | { type: 'trackGone'; trackGone: RemoteTrackID }

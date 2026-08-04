@@ -156,16 +156,27 @@ class Store {
       if (!connected) {
         // The backend is gone: its session and every decoder that fed
         // from it are void.
-        this.tracks = [];
-        this.participants = [];
-        playback.clear();
+        this.#dropRemoteState();
       }
     });
 
     bridge.onControl((msg) => {
       switch (msg.type) {
-        case 'state':
+        case 'state': {
+          const wasJoined = this.session.phase === 'joined';
           this.session = msg.state;
+          // The session that produced those handles is gone: its decoders
+          // decode nothing, and its participants are about to be
+          // rediscovered under new handles. Capture keeps running, so the
+          // call resumes the moment the relay is back.
+          if (wasJoined && msg.state.phase === 'reconnecting') {
+            this.#dropRemoteState();
+          }
+          break;
+        }
+
+        case 'requestKeyFrame':
+          capture.forceKeyFrame();
           break;
 
         case 'participants':
@@ -218,6 +229,16 @@ class Store {
       this.captureStats = capture.sampleStats();
       this.playbackStats = playback.sampleStats();
     }, STATS_INTERVAL_MS);
+  }
+
+  /** Forgets every remote track and participant, retiring their decoders. */
+  #dropRemoteState(): void {
+    playback.clear();
+    this.tracks = [];
+    this.participants = [];
+    this.speakingPeers = [];
+    this.#speakingTimers.forEach(clearTimeout);
+    this.#speakingTimers.clear();
   }
 
   detach(): void {

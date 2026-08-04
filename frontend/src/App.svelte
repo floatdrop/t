@@ -27,7 +27,12 @@
     };
   });
 
-  const inCall = $derived(store.session.phase === 'joined');
+  // A reconnect keeps the call on screen: the room, the local preview and the
+  // debug history are all still meaningful, and being thrown back to the
+  // welcome form would read as having been hung up on.
+  const inCall = $derived(
+    store.session.phase === 'joined' || store.session.phase === 'reconnecting',
+  );
 </script>
 
 <main>

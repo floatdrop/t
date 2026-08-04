@@ -10,6 +10,8 @@ export const KIND_VIDEO = 0;
 export const KIND_AUDIO = 1;
 
 export const FLAG_KEYFRAME = 1 << 0;
+/** Marks the header's audio-level byte as a real measurement. */
+export const FLAG_AUDIO_LEVEL = 1 << 1;
 
 /** Handles for the two tracks this frontend publishes. */
 export const HANDLE_LOCAL_VIDEO = 0;
@@ -24,6 +26,11 @@ export interface MediaFrame {
   /** Codec description bytes, when the encoder emitted a new config. */
   config?: Uint8Array;
   payload: Uint8Array;
+  /**
+   * RFC 6464 byte from LOC's AudioLevel property: bit 7 voice activity,
+   * bits 0-6 magnitude in -dBov. Audio frames only.
+   */
+  audioLevel?: number;
 }
 
 /** Encodes one media frame into the binary layout the backend parses. */
@@ -35,8 +42,12 @@ export function encodeFrame(f: MediaFrame): ArrayBuffer {
 
   view.setUint8(0, FRAME_VERSION);
   view.setUint8(1, f.kind);
-  view.setUint8(2, f.keyFrame ? FLAG_KEYFRAME : 0);
-  view.setUint8(3, 0);
+  let flags = f.keyFrame ? FLAG_KEYFRAME : 0;
+  if (f.audioLevel !== undefined) {
+    flags |= FLAG_AUDIO_LEVEL;
+    view.setUint8(3, f.audioLevel & 0xff);
+  }
+  view.setUint8(2, flags);
   view.setUint32(4, f.handle);
   // Timestamps are microseconds in a u64. Number stays exact to 2^53 µs,
   // which is ~285 years — far beyond any session.
@@ -62,13 +73,15 @@ export function decodeFrame(buf: ArrayBuffer): MediaFrame | null {
   if (FRAME_HEADER_LEN + configLen + payloadLen > buf.byteLength) return null;
 
   const configEnd = FRAME_HEADER_LEN + configLen;
+  const flags = view.getUint8(2);
   return {
     kind: view.getUint8(1),
     handle: view.getUint32(4),
     timestamp: Number(view.getBigUint64(8)),
-    keyFrame: (view.getUint8(2) & FLAG_KEYFRAME) !== 0,
+    keyFrame: (flags & FLAG_KEYFRAME) !== 0,
     config: configLen > 0 ? new Uint8Array(buf, FRAME_HEADER_LEN, configLen) : undefined,
     payload: new Uint8Array(buf, configEnd, payloadLen),
+    audioLevel: (flags & FLAG_AUDIO_LEVEL) !== 0 ? view.getUint8(3) : undefined,
   };
 }
 

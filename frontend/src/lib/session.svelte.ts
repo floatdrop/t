@@ -26,12 +26,22 @@ const LOG_LIMIT = 1500;
 /** How often the frontend samples its own encode/decode counters. */
 const STATS_INTERVAL_MS = 250;
 
+/**
+ * How long a participant keeps their speaking indicator after their last
+ * voice-active frame. Audio frames arrive every 20 ms, so this only has to
+ * outlast ordinary jitter; the sender already applies its own release
+ * hysteresis (see denoise.ts).
+ */
+const SPEAKING_TIMEOUT_MS = 400;
+
 /** One remote participant's tracks, keyed for the video grid. */
 export interface RemoteView {
   id: string;
   nickname: string;
   videoHandle: number | null;
   audioHandle: number | null;
+  /** True while they are speaking, for the tile's border. */
+  speaking: boolean;
 }
 
 class Store {
@@ -47,11 +57,21 @@ class Store {
   captureStats = $state<CaptureStats>({
     videoFps: 0, videoKbps: 0, encodeQueue: 0,
     audioFps: 0, audioKbps: 0, keyFrames: 0, dropped: 0,
+    echoCancellation: false, noiseSuppression: false, autoGainControl: false,
+    denoiseActive: false,
   });
   playbackStats = $state<PlaybackStats[]>([]);
 
   /** Local preview stream, shown in the welcome screen and own tile. */
   previewStream = $state<MediaStream | null>(null);
+
+  /** True while the local microphone is picking up speech. */
+  speaking = $state(false);
+  /** Remote participant IDs currently speaking. */
+  speakingPeers = $state<string[]>([]);
+
+  /** Per-participant release timers for the speaking indicator. */
+  #speakingTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   logLevel = $state('INFO');
   logPaused = $state(false);
@@ -73,6 +93,7 @@ class Store {
         nickname: p.nickname || video?.nickname || audio?.nickname || p.id,
         videoHandle: video?.handle ?? null,
         audioHandle: audio?.handle ?? null,
+        speaking: this.speakingPeers.includes(p.id),
       };
     });
   }
@@ -130,6 +151,14 @@ class Store {
 
     bridge.onMedia((frame) => playback.push(frame));
 
+    // Voice activity, local and remote, drives the tiles' speaking border.
+    capture.onVoice = (state) => {
+      this.speaking = state.speaking;
+    };
+    playback.onVoice = (participant, speaking) => {
+      this.#markSpeaking(participant, speaking);
+    };
+
     this.#statsTimer = setInterval(() => {
       this.captureStats = capture.sampleStats();
       this.playbackStats = playback.sampleStats();
@@ -139,6 +168,38 @@ class Store {
   detach(): void {
     if (this.#statsTimer) clearInterval(this.#statsTimer);
     this.#statsTimer = null;
+    this.#speakingTimers.forEach(clearTimeout);
+    this.#speakingTimers.clear();
+  }
+
+  /**
+   * Latches a remote participant as speaking and arms the release timer.
+   *
+   * Voice activity arrives per audio frame, so a participant is "still
+   * speaking" until frames stop saying so — a timer rather than a false
+   * edge, because a gap in delivery must not read as silence any more than
+   * a pause between words should.
+   */
+  #markSpeaking(participant: string, speaking: boolean): void {
+    const existing = this.#speakingTimers.get(participant);
+    if (existing) clearTimeout(existing);
+
+    if (!speaking) {
+      this.#speakingTimers.delete(participant);
+      this.speakingPeers = this.speakingPeers.filter((id) => id !== participant);
+      return;
+    }
+
+    if (!this.speakingPeers.includes(participant)) {
+      this.speakingPeers = [...this.speakingPeers, participant];
+    }
+    this.#speakingTimers.set(
+      participant,
+      setTimeout(() => {
+        this.#speakingTimers.delete(participant);
+        this.speakingPeers = this.speakingPeers.filter((id) => id !== participant);
+      }, SPEAKING_TIMEOUT_MS),
+    );
   }
 
   /** Opens the selected devices and shows a preview. */
@@ -179,6 +240,10 @@ class Store {
     this.previewStream = null;
     this.tracks = [];
     this.participants = [];
+    this.speaking = false;
+    this.speakingPeers = [];
+    this.#speakingTimers.forEach(clearTimeout);
+    this.#speakingTimers.clear();
     bridge.send({ type: 'leave' });
   }
 

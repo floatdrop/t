@@ -44,6 +44,38 @@
   </section>
 
   <section>
+    <h3>Audio processing</h3>
+    <dl>
+      <div>
+        <dt>Echo cancellation</dt>
+        <dd class:on={cap.echoCancellation}>
+          {cap.echoCancellation ? 'platform' : 'off'}
+        </dd>
+      </div>
+      <div>
+        <dt>Platform noise suppression</dt>
+        <dd class:on={cap.noiseSuppression}>{cap.noiseSuppression ? 'on' : 'off'}</dd>
+      </div>
+      <div>
+        <dt>Auto gain control</dt>
+        <dd class:on={cap.autoGainControl}>{cap.autoGainControl ? 'on' : 'off'}</dd>
+      </div>
+      <div>
+        <dt>Local denoiser</dt>
+        <dd class:on={cap.denoiseActive}>{cap.denoiseActive ? 'rnnoise' : 'off'}</dd>
+      </div>
+      <div>
+        <dt>Voice activity</dt>
+        <dd class:on={store.speaking}>{store.speaking ? 'speaking' : 'silent'}</dd>
+      </div>
+    </dl>
+    <p class="note">
+      Echo cancellation is the platform's: only it can see what the speakers
+      are playing. The local denoiser runs after it.
+    </p>
+  </section>
+
+  <section>
     <h3>Published tracks</h3>
     {#if outbound.length}
       <table>
@@ -95,37 +127,50 @@
     {/if}
   </section>
 
-  <section>
+  <section class="wide">
     <h3>Decoders</h3>
     {#if store.playbackStats.length}
-      <table>
-        <thead>
-          <tr>
-            <th scope="col">Participant</th><th scope="col">Kind</th>
-            <th scope="col">fps</th><th scope="col">Queue</th>
-            <th scope="col">Dropped</th><th scope="col">Buffered</th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each store.playbackStats as s (s.handle)}
+      <!-- Seven columns will not fit a narrow drawer, so the table scrolls
+           inside its own box rather than spilling out of the panel. -->
+      <div class="scroll-x">
+        <table>
+          <thead>
             <tr>
-              <th scope="row">{s.participant}</th>
-              <td>{s.kind}</td>
-              <td>{s.fps.toFixed(1)}</td>
-              <td>{s.decodeQueue}</td>
-              <td>{s.dropped}</td>
-              <td>
-                {#if s.buffered !== undefined}
-                  {(s.buffered / 48).toFixed(0)} ms
-                  {#if s.underruns}<span class="warn"> · {s.underruns} underruns</span>{/if}
-                {:else}
-                  —
-                {/if}
-              </td>
+              <th scope="col">Participant</th><th scope="col">Kind</th>
+              <th scope="col">Codec</th><th scope="col">Resolution</th>
+              <th scope="col">fps</th><th scope="col">Queue</th>
+              <th scope="col">Dropped</th><th scope="col">Buffered</th>
             </tr>
-          {/each}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {#each store.playbackStats as s (s.handle)}
+              <tr>
+                <th scope="row">{s.participant}</th>
+                <td>{s.kind}</td>
+                <td class="codec">{s.codec}</td>
+                <td>
+                  {#if s.kind === 'video'}
+                    {s.width && s.height ? `${s.width}×${s.height}` : '—'}
+                  {:else}
+                    —
+                  {/if}
+                </td>
+                <td>{s.fps.toFixed(1)}</td>
+                <td>{s.decodeQueue}</td>
+                <td>{s.dropped}</td>
+                <td>
+                  {#if s.buffered !== undefined}
+                    {(s.buffered / 48).toFixed(0)} ms
+                    {#if s.underruns}<span class="warn"> · {s.underruns} underruns</span>{/if}
+                  {:else}
+                    —
+                  {/if}
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
     {:else}
       <p class="empty">No active decoders.</p>
     {/if}
@@ -196,10 +241,44 @@
     word-break: break-all;
   }
 
+  /* A section that needs the drawer's full width rather than one grid cell. */
+  .wide {
+    grid-column: 1 / -1;
+  }
+
+  .scroll-x {
+    overflow-x: auto;
+    margin: 0 -4px;
+    padding: 0 4px;
+  }
+
   table {
     width: 100%;
     border-collapse: collapse;
     font-size: 12px;
+  }
+
+  .scroll-x table {
+    /* Let the columns size to their content and the box scroll, instead of
+       squeezing text until it wraps out of the cell. */
+    width: auto;
+    min-width: 100%;
+    white-space: nowrap;
+  }
+
+  .codec {
+    text-align: left;
+  }
+
+  dd.on {
+    color: var(--ok);
+  }
+
+  .note {
+    margin: 8px 0 0;
+    font-size: 11px;
+    color: var(--text-faint);
+    line-height: 1.45;
   }
 
   th,

@@ -10,7 +10,21 @@
   import TracksPanel from './TracksPanel.svelte';
 
   type Tab = 'metrics' | 'logs' | 'tracks';
-  let tab = $state<Tab>('metrics');
+
+  /**
+   * `?debugTab=` picks the tab the drawer opens on, so a particular view can
+   * be reproduced from the command line (see -debug-tab in main.go).
+   */
+  const REQUESTED: Record<string, Tab> = {
+    transport: 'metrics',
+    metrics: 'metrics',
+    tracks: 'tracks',
+    codecs: 'tracks',
+    logs: 'logs',
+  };
+  const requested = new URLSearchParams(location.search).get('debugTab') ?? '';
+
+  let tab = $state<Tab>(REQUESTED[requested] ?? 'metrics');
   let height = $state(320);
   let dragging = $state(false);
 
@@ -55,20 +69,32 @@
 
   <header>
     <nav>
-      <button class="tab" class:active={tab === 'metrics'} onclick={() => (tab = 'metrics')}>
+      <button class="tab" class:active={isActive('metrics')} onclick={() => select('metrics')}>
         Transport
       </button>
-      <button class="tab" class:active={tab === 'tracks'} onclick={() => (tab = 'tracks')}>
+      <button class="tab" class:active={isActive('tracks')} onclick={() => select('tracks')}>
         Tracks &amp; codecs
       </button>
-      <button class="tab" class:active={tab === 'logs'} onclick={() => (tab = 'logs')}>
+      <button class="tab" class:active={isActive('logs')} onclick={() => select('logs')}>
         Logs
         {#if errorCount}<span class="badge">{errorCount}</span>{/if}
       </button>
     </nav>
-    <button class="ghost" onclick={() => (store.debugOpen = !store.debugOpen)}>
-      {store.debugOpen ? 'Hide ▾' : 'Debug ▴'}
-    </button>
+
+    {#if store.debugOpen}
+      <button
+        class="ghost minimize"
+        onclick={() => (store.debugOpen = false)}
+        aria-label="Minimize debug panel"
+        title="Minimize debug panel"
+      >
+        <svg viewBox="0 0 14 14" aria-hidden="true">
+          <line x1="3" y1="9" x2="11" y2="9" />
+        </svg>
+      </button>
+    {:else}
+      <button class="ghost" onclick={() => (store.debugOpen = true)}>Debug ▴</button>
+    {/if}
   </header>
 
   {#if store.debugOpen}

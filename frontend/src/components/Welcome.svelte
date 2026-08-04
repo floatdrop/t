@@ -39,6 +39,7 @@
   let resolution = $state('1280x720');
   let videoBitrate = $state(defaultVideoSettings.bitrate);
   let audioBitrate = $state(defaultAudioSettings.bitrate);
+  let denoise = $state(defaultAudioSettings.denoise);
 
   let previewEl = $state<HTMLVideoElement | null>(null);
   let permissionError = $state('');
@@ -109,7 +110,7 @@
 
   function audioSettings() {
     if (!useAudio) return null;
-    return { deviceId: microphoneId || undefined, bitrate: audioBitrate };
+    return { deviceId: microphoneId || undefined, bitrate: audioBitrate, denoise };
   }
 
   /** Reopens the devices when a selection changes, so preview follows it. */
@@ -247,6 +248,17 @@
           </select>
         </div>
       </div>
+
+      <label class="toggle">
+        <input type="checkbox" bind:checked={denoise} disabled={!useAudio} />
+        <span>
+          Noise suppression
+          <em>
+            RNNoise, on top of the platform's own echo cancellation and
+            suppression
+          </em>
+        </span>
+      </label>
     </div>
 
     {#if joinError}
@@ -284,11 +296,11 @@
     background: var(--bg-raised);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    padding: 24px;
+    padding: 18px 20px;
   }
 
   header {
-    margin-bottom: 18px;
+    margin-bottom: 12px;
   }
 
   h1 {
@@ -305,11 +317,15 @@
 
   .preview {
     aspect-ratio: 16 / 9;
+    /* Cap the height so the card as a whole clears the default window at
+       any width: the preview is the one element that would otherwise grow
+       with it and push the form into a scroll. */
+    max-height: 232px;
     background: var(--bg-sunken);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     overflow: hidden;
-    margin-bottom: 18px;
+    margin-bottom: 12px;
   }
 
   .preview video {
@@ -334,7 +350,7 @@
   .fields {
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: 10px;
   }
 
   .row {
@@ -368,6 +384,28 @@
     color: var(--err);
   }
 
+  .toggle {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    margin: 0;
+    font-size: 12px;
+    color: var(--text);
+  }
+
+  .toggle input {
+    width: auto;
+    margin-top: 2px;
+    flex: none;
+  }
+
+  .toggle em {
+    display: block;
+    font-style: normal;
+    font-size: 11px;
+    color: var(--text-faint);
+  }
+
   .error-box {
     margin: 14px 0 0;
     padding: 8px 10px;
@@ -379,7 +417,7 @@
   }
 
   footer {
-    margin-top: 20px;
+    margin-top: 14px;
     display: flex;
     align-items: center;
     justify-content: space-between;

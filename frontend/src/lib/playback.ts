@@ -10,6 +10,7 @@
  */
 
 import { bridge } from './bridge';
+import { decodeAudioLevel } from './denoise';
 import { KIND_VIDEO, fromBase64, type MediaFrame, type RemoteTrack } from './protocol';
 import { addPlayerModule } from './worklets';
 
@@ -23,6 +24,15 @@ export interface PlaybackStats {
   /** Frames received but not decodable yet (pre-keyframe, or errors). */
   dropped: number;
   decodeQueue: number;
+  /** Codec string the decoder was configured with. */
+  codec: string;
+  /**
+   * Video only: the resolution frames are actually decoding at, which can
+   * differ from what the catalog declared if the publisher's camera
+   * negotiated something else.
+   */
+  width?: number;
+  height?: number;
   /** Audio only: samples buffered in the player worklet. */
   buffered?: number;
   underruns?: number;
@@ -40,6 +50,9 @@ interface VideoSink {
   sawKeyFrame: boolean;
   decoded: number;
   dropped: number;
+  /** Resolution of the most recently decoded frame. */
+  width: number;
+  height: number;
 }
 
 interface AudioSink {
@@ -56,6 +69,12 @@ interface AudioSink {
 type Sink = VideoSink | AudioSink;
 
 export class Playback {
+  /**
+   * Notified when a remote participant's voice activity changes, from the
+   * audio level their frames carry.
+   */
+  onVoice: ((participant: string, speaking: boolean, level: number) => void) | null = null;
+
   #sinks = new Map<number, Sink>();
   #audioCtx: AudioContext | null = null;
   #audioReady: Promise<AudioContext> | null = null;
@@ -82,6 +101,8 @@ export class Playback {
       sawKeyFrame: false,
       decoded: 0,
       dropped: 0,
+      width: 0,
+      height: 0,
       decoder: null as unknown as VideoDecoder,
     };
     sink.decoder = new VideoDecoder({
@@ -276,6 +297,12 @@ export class Playback {
     }
 
     const audio = sink as AudioSink;
+    // The publisher's LOC AudioLevel property tells us they are speaking
+    // without our having to measure the decoded audio ourselves.
+    if (frame.audioLevel !== undefined) {
+      const { voiceActivity, level } = decodeAudioLevel(frame.audioLevel);
+      this.onVoice?.(sink.track.participant, voiceActivity, level);
+    }
     if (audio.decoder.state !== 'configured') return;
     try {
       audio.decoder.decode(new EncodedAudioChunk({
@@ -292,6 +319,8 @@ export class Playback {
 
   #paint(sink: VideoSink, frame: VideoFrame): void {
     sink.decoded++;
+    sink.width = frame.displayWidth;
+    sink.height = frame.displayHeight;
     if (!sink.canvas || !sink.ctx) {
       // No tile mounted yet. Keep only the newest frame so a late-mounting
       // canvas paints something immediately instead of staying black.
@@ -345,7 +374,12 @@ export class Playback {
         fps: elapsed > 0 ? sink.decoded / elapsed : 0,
         dropped: sink.dropped,
         decodeQueue: sink.decoder.decodeQueueSize,
+        codec: sink.track.config.codec,
       };
+      if (sink.kind === 'video') {
+        row.width = sink.width;
+        row.height = sink.height;
+      }
       if (sink.kind === 'audio') {
         row.buffered = sink.buffered;
         row.underruns = sink.underruns;

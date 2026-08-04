@@ -33,6 +33,7 @@
       nickname={store.session.nickname ?? 'me'}
       localStream={store.previewStream}
       hasAudio={!!store.previewStream?.getAudioTracks().length}
+      speaking={store.speaking}
     />
     {#each remotes as remote (remote.id)}
       <VideoTile
@@ -40,6 +41,7 @@
         videoHandle={remote.videoHandle}
         hasAudio={remote.audioHandle !== null}
         label={remote.id}
+        speaking={remote.speaking}
       />
     {/each}
   </div>

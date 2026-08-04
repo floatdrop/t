@@ -19,6 +19,7 @@ import {
   toBase64,
   toBytes,
 } from './protocol';
+import { DENOISE_FRAME, Denoiser, type VoiceState } from './denoise';
 import { addTapModule } from './worklets';
 
 /** Seconds between forced keyframes — also the video group length. */
@@ -35,6 +36,8 @@ export interface VideoSettings {
 export interface AudioSettings {
   deviceId?: string;
   bitrate: number;
+  /** Run the local RNNoise denoiser on top of the platform's own. */
+  denoise: boolean;
 }
 
 export const defaultVideoSettings: VideoSettings = {
@@ -46,6 +49,7 @@ export const defaultVideoSettings: VideoSettings = {
 
 export const defaultAudioSettings: AudioSettings = {
   bitrate: 32_000,
+  denoise: true,
 };
 
 /** Live counters for the debug panel. */
@@ -57,6 +61,12 @@ export interface CaptureStats {
   audioKbps: number;
   keyFrames: number;
   dropped: number;
+  /** What the browser actually applied to the microphone track. */
+  echoCancellation: boolean;
+  noiseSuppression: boolean;
+  autoGainControl: boolean;
+  /** True while the local RNNoise model is running. */
+  denoiseActive: boolean;
 }
 
 /**
@@ -95,6 +105,8 @@ export class Capture {
   #stats: CaptureStats = {
     videoFps: 0, videoKbps: 0, encodeQueue: 0,
     audioFps: 0, audioKbps: 0, keyFrames: 0, dropped: 0,
+    echoCancellation: false, noiseSuppression: false, autoGainControl: false,
+    denoiseActive: false,
   };
 
   /**
@@ -129,6 +141,23 @@ export class Capture {
     bridge.report('INFO', 'capture devices opened', {
       tracks: this.stream.getTracks().map((t) => `${t.kind}:${t.label}`).join(', '),
     });
+
+    // Report the settings the browser actually granted, not the ones we
+    // asked for. Echo cancellation in particular can only be done by the
+    // platform, so knowing whether it engaged is the difference between a
+    // usable call and an unexplained howl.
+    const mic = this.stream.getAudioTracks()[0];
+    if (mic) {
+      const applied = mic.getSettings();
+      this.#stats.echoCancellation = applied.echoCancellation ?? false;
+      this.#stats.noiseSuppression = applied.noiseSuppression ?? false;
+      this.#stats.autoGainControl = applied.autoGainControl ?? false;
+      bridge.report('INFO', 'microphone processing applied by the platform', {
+        echoCancellation: String(this.#stats.echoCancellation),
+        noiseSuppression: String(this.#stats.noiseSuppression),
+        autoGainControl: String(this.#stats.autoGainControl),
+      });
+    }
     return this.stream;
   }
 
@@ -298,32 +327,75 @@ export class Capture {
     // down its decoder and resubscribe when the real config landed a
     // moment later. #onAudioChunk declares it once, correctly.
     this.#audioSamples = 0;
+    this.#pendingLen = 0;
+    if (settings.denoise) {
+      // Loading is deliberately not awaited: capture starts immediately on
+      // the platform's own suppression and the model joins in once ready.
+      void this.#denoiser.load();
+    }
+
     tap.port.onmessage = (ev: MessageEvent<Float32Array>) => {
-      if (!this.#running || !this.#audioEncoder) return;
-      const pcm = ev.data;
-      // Timestamps come from a sample counter, not the wall clock: the
-      // encoder needs them monotonic and exactly the width of the audio
-      // they describe, which per-callback clock reads would not be.
-      const timestamp = Math.round((this.#audioSamples / SAMPLE_RATE) * 1e6);
-      try {
-        const data = new AudioData({
-          format: 'f32-planar',
-          sampleRate: SAMPLE_RATE,
-          numberOfFrames: pcm.length,
-          numberOfChannels: 1,
-          timestamp,
-          // The worklet posts a plain Float32Array; the DOM types widen
-          // this slot to the SharedArrayBuffer-backed case we never hit.
-          data: pcm as unknown as BufferSource,
-        });
-        this.#audioEncoder.encode(data);
-        data.close();
-        this.#audioSamples += pcm.length;
-      } catch (err) {
-        bridge.report('WARN', 'audio encode failed', { err: String(err) });
-      }
+      if (!this.#running) return;
+      this.#accumulate(ev.data);
     };
     this.#audioBitrate = settings.bitrate;
+  }
+
+  /**
+   * Buffers the worklet's render quanta into the fixed-size frames the
+   * denoiser needs, and encodes each completed frame.
+   *
+   * The worklet emits 128 samples at a time and RNNoise works on 480, so
+   * the two never line up; this is where they are reconciled.
+   */
+  #accumulate(pcm: Float32Array): void {
+    let offset = 0;
+    while (offset < pcm.length) {
+      const take = Math.min(DENOISE_FRAME - this.#pendingLen, pcm.length - offset);
+      this.#pending.set(pcm.subarray(offset, offset + take), this.#pendingLen);
+      this.#pendingLen += take;
+      offset += take;
+
+      if (this.#pendingLen === DENOISE_FRAME) {
+        this.#emitAudioFrame(this.#pending);
+        this.#pendingLen = 0;
+      }
+    }
+  }
+
+  /** Denoises one frame, tracks voice activity, and encodes it. */
+  #emitAudioFrame(frame: Float32Array): void {
+    if (!this.#audioEncoder || this.#audioEncoder.state !== 'configured') return;
+
+    const wasSpeaking = this.#voice.speaking;
+    this.#voice = this.#denoiser.process(frame);
+    this.#stats.denoiseActive = this.#denoiser.active;
+    if (this.#voice.speaking !== wasSpeaking) {
+      this.onVoice?.(this.#voice);
+    }
+
+    // Timestamps come from a sample counter, not the wall clock: the
+    // encoder needs them monotonic and exactly the width of the audio they
+    // describe, which per-callback clock reads would not be.
+    const timestamp = Math.round((this.#audioSamples / SAMPLE_RATE) * 1e6);
+    try {
+      const data = new AudioData({
+        format: 'f32-planar',
+        sampleRate: SAMPLE_RATE,
+        numberOfFrames: frame.length,
+        numberOfChannels: 1,
+        timestamp,
+        // AudioData copies on construction, so handing it the reused
+        // accumulation buffer is safe. The DOM types widen this slot to
+        // the SharedArrayBuffer-backed case we never hit.
+        data: frame as unknown as BufferSource,
+      });
+      this.#audioEncoder.encode(data);
+      data.close();
+      this.#audioSamples += frame.length;
+    } catch (err) {
+      bridge.report('WARN', 'audio encode failed', { err: String(err) });
+    }
   }
 
   #onAudioChunk(chunk: EncodedAudioChunk, meta?: EncodedAudioChunkMetadata): void {
@@ -363,6 +435,9 @@ export class Capture {
       keyFrame: false,
       config,
       payload,
+      // Carried in LOC's AudioLevel property, which is how remote peers
+      // light their speaking indicator without decoding our audio.
+      audioLevel: this.#voice.rfc6464,
     })) {
       this.#dropped++;
     }
@@ -370,6 +445,16 @@ export class Capture {
 
   #audioConfigSent = false;
   #audioBitrate = 0;
+
+  #denoiser = new Denoiser();
+  /** Accumulates the worklet's 128-sample blocks into 480-sample frames. */
+  #pending = new Float32Array(DENOISE_FRAME);
+  #pendingLen = 0;
+  /** Latest voice state, and the RFC 6464 byte published with each frame. */
+  #voice: VoiceState = { speaking: false, level: 0, rfc6464: 127 };
+
+  /** Notified whenever the local speaking state changes. */
+  onVoice: ((state: VoiceState) => void) | null = null;
 
   /** Samples the counters into per-second rates for the debug panel. */
   sampleStats(): CaptureStats {
@@ -385,6 +470,10 @@ export class Capture {
         audioKbps: (this.#audioBytes * 8) / 1000 / elapsed,
         keyFrames: this.#stats.keyFrames + this.#keyFrames,
         dropped: this.#stats.dropped + this.#dropped,
+        echoCancellation: this.#stats.echoCancellation,
+        noiseSuppression: this.#stats.noiseSuppression,
+        autoGainControl: this.#stats.autoGainControl,
+        denoiseActive: this.#denoiser.active,
       };
     }
     this.#videoFrames = 0;
@@ -424,6 +513,14 @@ export class Capture {
 
     this.#frameIndex = 0;
     this.#audioConfigSent = false;
+    this.#pendingLen = 0;
+    this.#voice = { speaking: false, level: 0, rfc6464: 127 };
+    this.#denoiser.destroy();
+  }
+
+  /** The local participant's current voice state. */
+  get voice(): VoiceState {
+    return this.#voice;
   }
 }
 

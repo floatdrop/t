@@ -15,6 +15,8 @@
     /** Set for the local tile; renders the capture stream directly. */
     localStream?: MediaStream | null;
     label?: string;
+    /** Draws the voice-activity border. */
+    speaking?: boolean;
   }
 
   let {
@@ -23,6 +25,7 @@
     hasAudio = false,
     localStream = null,
     label = '',
+    speaking = false,
   }: Props = $props();
 
   let canvas = $state<HTMLCanvasElement | null>(null);
@@ -45,7 +48,7 @@
   const hasVideo = $derived(isLocal ? !!localStream?.getVideoTracks().length : videoHandle !== null);
 </script>
 
-<div class="tile" class:local={isLocal}>
+<div class="tile" class:local={isLocal} class:speaking>
   {#if isLocal && hasVideo}
     <!-- svelte-ignore a11y_media_has_caption -->
     <video bind:this={video} autoplay muted playsinline></video>
@@ -61,6 +64,7 @@
   <div class="overlay">
     <span class="name">{nickname}{isLocal ? ' (you)' : ''}</span>
     <span class="badges">
+      {#if speaking}<span class="badge speaking-badge" title="speaking">●</span>{/if}
       {#if hasAudio}<span class="badge" title="publishing audio">🔊</span>{/if}
       {#if label}<span class="badge mono">{label}</span>{/if}
     </span>
@@ -76,10 +80,32 @@
     overflow: hidden;
     aspect-ratio: 16 / 9;
     min-width: 0;
+    transition: box-shadow 120ms ease, border-color 120ms ease;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .tile {
+      transition: none;
+    }
   }
 
   .tile.local {
     border-color: var(--accent-dim);
+  }
+
+  /* Voice activity. The ring is drawn as an inset box-shadow rather than a
+     border so turning it on never changes the tile's box size and cannot
+     reflow the grid mid-call. */
+  .tile.speaking {
+    border-color: var(--ok);
+    box-shadow:
+      inset 0 0 0 2px var(--ok),
+      0 0 12px color-mix(in srgb, var(--ok) 35%, transparent);
+  }
+
+  .speaking-badge {
+    color: var(--ok);
+    font-size: 9px;
   }
 
   canvas,

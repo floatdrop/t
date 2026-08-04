@@ -306,6 +306,35 @@ fork works out of the box. What you get without them:
 - **Linux** — unsigned either way; there is no code-signing convention. The
   `.sha256` is the integrity signal.
 
+### Running an unsigned build
+
+There is no free path to a signed, notarized macOS app: a Developer ID
+certificate and notarization both require the Apple Developer Program
+($99/year). Without it the release `.app` is ad-hoc signed, which is enough to
+run on the machine that built it but not enough for one that downloaded it —
+macOS quarantines the download and Gatekeeper refuses to open it.
+
+Three ways round that, best first:
+
+1. **Build it yourself.** A locally built binary is never quarantined, so
+   `wails3 task build && wails3 task run` sidesteps the problem entirely. For a
+   tool aimed at people who already have Go and Node installed, this is the
+   primary route, not a fallback.
+2. **Open it anyway.** Launch the downloaded app once and let macOS block it,
+   then go to System Settings → Privacy & Security, where an **Open Anyway**
+   button now appears for it. Confirm once and it launches from then on. (Older
+   macOS put this behind Control-click → Open on the app itself.)
+3. **Strip the quarantine flag**, if you would rather do it from a terminal —
+   and having checked the `.sha256` first, since this bypasses the warning
+   rather than answering it:
+
+   ```sh
+   xattr -dr com.apple.quarantine /Applications/tlmst.app
+   ```
+
+Windows is less strict: an unsigned `.exe` runs after clicking through
+SmartScreen's "More info → Run anyway". Linux has nothing to bypass.
+
 Configure these repository secrets to sign. macOS signing and notarization are
 separate: with only the first group you get a signature but still a first-run
 warning, since only notarization removes it.

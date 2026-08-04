@@ -258,9 +258,18 @@ jobs:
           generate_release_notes: true
           body: |
             Built by `.github/workflows/release.yml` from ${{ github.sha }}.
+            Every archive ships a `.sha256` beside it.
 
-            Every archive ships a `.sha256` beside it. macOS and Windows builds
-            are code-signed only when the repository has the signing secrets
-            configured — see "Releases and signing" in the README for which
-            secrets those are, and for what an unsigned download means on each
-            platform.
+            **These builds are not signed or notarized** — that needs a paid
+            Apple Developer account, which this project does not have. So:
+
+            - **macOS** — the download is quarantined and Gatekeeper will refuse
+              it. Open it once, let it be blocked, then allow it under System
+              Settings → Privacy & Security → **Open Anyway**. Or build from
+              source (`wails3 task build`), which is never quarantined.
+            - **Windows** — unsigned, so SmartScreen warns. "More info → Run
+              anyway".
+            - **Linux** — nothing to bypass.
+
+            See "Running an unsigned build" in the README for the details, and
+            "Signing" for the secrets that would make this section unnecessary.

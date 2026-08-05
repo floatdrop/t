@@ -64,6 +64,20 @@ button {
   padding: 7px 14px;
   cursor: pointer;
   transition: background 120ms ease, border-color 120ms ease;
+  /* Laid out as a row so a button carrying an icon centres it against the
+     label rather than dropping it on the text baseline. Text-only buttons are
+     unaffected: their content is one anonymous item, centred as before. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+}
+
+/* An icon is never the thing that should give way when a button is short of
+   room; the label is. (Colour needs no rule here — lucide strokes with
+   currentColor already, and overriding it would defeat its `color` prop.) */
+button svg {
+  flex: none;
 }
 
 button:hover:not(:disabled) {

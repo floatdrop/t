@@ -3,7 +3,11 @@
    * The in-call view: a tile per participant plus the local preview, and a
    * header carrying the room identity and the leave control.
    */
+  import Check from '@lucide/svelte/icons/check';
+  import Link from '@lucide/svelte/icons/link';
+  import PhoneOff from '@lucide/svelte/icons/phone-off';
   import { bridge } from '../lib/bridge';
+  import { ICON_SIZE } from '../lib/icons';
   import { buildInviteLink, copyText } from '../lib/invite';
   import { store } from '../lib/session.svelte';
   import DeviceMenu from './DeviceMenu.svelte';
@@ -120,9 +124,20 @@
           ? `Copy an invite link for room ${store.session.room} on ${store.session.relay}`
           : 'No relay and room to invite to yet'}
       >
-        {#if copied}Copied ✓{:else if copyFailed}Copy failed{:else}Copy invite{/if}
+        <!-- The tick was a ✓ in the text; it is the icon's job now, so the
+             label just says what happened. -->
+        {#if copied}
+          <Check size={ICON_SIZE} />Copied
+        {:else if copyFailed}
+          <Link size={ICON_SIZE} />Copy failed
+        {:else}
+          <Link size={ICON_SIZE} />Copy invite
+        {/if}
       </button>
-      <button class="danger" onclick={() => store.leave()}>Leave</button>
+      <button class="danger" onclick={() => store.leave()}>
+        <PhoneOff size={ICON_SIZE} />
+        Leave
+      </button>
     </div>
   </header>
 

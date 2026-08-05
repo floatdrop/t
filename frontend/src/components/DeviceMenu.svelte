@@ -9,6 +9,14 @@
    * Switching rebuilds only the local capture pipeline — the MOQ publications
    * stay open — so a swap costs a keyframe, not a rejoin.
    */
+  // Imported one icon at a time rather than from the barrel, so only the five
+  // that are used reach the bundle.
+  import Mic from '@lucide/svelte/icons/mic';
+  import MicOff from '@lucide/svelte/icons/mic-off';
+  import Settings2 from '@lucide/svelte/icons/settings-2';
+  import Video from '@lucide/svelte/icons/video';
+  import VideoOff from '@lucide/svelte/icons/video-off';
+  import { ICON_SIZE } from '../lib/icons';
   import { store } from '../lib/session.svelte';
 
   let open = $state(false);
@@ -75,34 +83,57 @@
 
 <div class="controls" bind:this={root}>
   {#if error && !open}
-    <span class="note err" role="status">{error}</span>
+    <span class="note err inline" role="status" title={error}>{error}</span>
   {/if}
 
+  <!-- Named for the device, not the action, because aria-pressed already
+       carries the state: "Microphone, pressed" is what a toggle should
+       announce, where "Turn the microphone off, pressed" contradicts itself.
+       The action stays in the tooltip, which is where a sighted user looks. -->
   <button
     class="track"
     class:off={!store.media.useAudio}
+    aria-label="Microphone"
     aria-pressed={store.media.useAudio}
     disabled={busy}
     onclick={() => toggleTrack('audio')}
     title={store.media.useAudio ? 'Turn the microphone off' : 'Turn the microphone on'}
   >
-    Mic {store.media.useAudio ? 'on' : 'off'}
+    {#if store.media.useAudio}
+      <Mic size={ICON_SIZE} />
+    {:else}
+      <MicOff size={ICON_SIZE} />
+    {/if}
   </button>
 
   <button
     class="track"
     class:off={!store.media.useVideo}
+    aria-label="Camera"
     aria-pressed={store.media.useVideo}
     disabled={busy}
     onclick={() => toggleTrack('video')}
     title={store.media.useVideo ? 'Turn the camera off' : 'Turn the camera on'}
   >
-    Cam {store.media.useVideo ? 'on' : 'off'}
+    {#if store.media.useVideo}
+      <Video size={ICON_SIZE} />
+    {:else}
+      <VideoOff size={ICON_SIZE} />
+    {/if}
   </button>
 
   <div class="wrap">
-    <button onclick={toggle} aria-expanded={open} title="Camera and microphone">
-      Devices {open ? '▾' : '▴'}
+    <button
+      class="devices"
+      onclick={toggle}
+      aria-label="Devices"
+      aria-expanded={open}
+      title="Camera and microphone"
+    >
+      <Settings2 size={ICON_SIZE} />
+      <!-- The panel drops below, so closed points down at where it will
+           appear and open points back up at the button. -->
+      <span class="caret" aria-hidden="true">{open ? '▴' : '▾'}</span>
     </button>
 
     {#if open}
@@ -184,17 +215,37 @@
   }
 
   /* Mic and camera read as pressed-in when live, and go quiet — not alarming —
-     when off, since being muted is a normal state rather than an error. */
+     when off, since being muted is a normal state rather than an error. The
+     slashed-through icon says which state it is; the colour only agrees with
+     it. */
   .track {
-    padding: 7px 10px;
-    font-size: 12px;
+    padding: 7px;
     border-color: var(--accent);
     background: var(--accent-dim);
+  }
+
+  /* As tall as a button carrying one line of text, so the icon-only controls
+     sit level with Copy invite and Leave beside them rather than 6px short.
+     Expressed in em so it follows the font rather than a measured pixel. */
+  .track,
+  .devices {
+    min-height: calc(1.5em + 16px);
   }
 
   .track.off {
     border-color: var(--border-strong);
     background: var(--bg-raised);
+    color: var(--text-faint);
+  }
+
+  .devices {
+    padding: 7px 8px;
+    gap: 3px;
+  }
+
+  .caret {
+    font-size: 10px;
+    line-height: 1;
     color: var(--text-faint);
   }
 
@@ -239,5 +290,15 @@
 
   .note.err {
     color: var(--err);
+  }
+
+  /* Capped in the header, where the row does not shrink and a long message
+     from getUserMedia would otherwise push the controls off the edge. The
+     tooltip keeps the whole of it. */
+  .note.inline {
+    max-width: 22ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 </style>

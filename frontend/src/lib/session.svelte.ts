@@ -91,6 +91,25 @@ class Store {
 
   /** Local preview stream, shown in the welcome screen and own tile. */
   previewStream = $state<MediaStream | null>(null);
+  /**
+   * What that stream is actually carrying.
+   *
+   * Mirrored as state because the stream object is now reused across a device
+   * switch — capture adds and removes its tracks in place, so the local tile is
+   * not rebound for a change that did not touch it. Nothing would observe a
+   * track list read straight off the object.
+   *
+   * The camera is identified rather than counted, so the one change that does
+   * need a rebind — a different camera behind the same stream — is visible as
+   * one, while a microphone change stays invisible.
+   */
+  previewVideoId = $state('');
+  previewAudio = $state(false);
+
+  /** Whether the preview is carrying video at all. */
+  get previewVideo(): boolean {
+    return this.previewVideoId !== '';
+  }
 
   media = $state<MediaSettings>({
     cameraId: '',
@@ -303,8 +322,22 @@ class Store {
 
   /** Opens the selected devices and shows a preview. */
   async openPreview(): Promise<void> {
-    this.previewStream = await capture.open(this.videoSettings, this.audioSettings);
+    try {
+      await capture.open(this.videoSettings, this.audioSettings);
+    } finally {
+      // In a finally because a partial failure still changed things: one kind
+      // can open while the other is refused, and the preview should show what
+      // is really there rather than what was asked for.
+      this.#syncPreview();
+    }
     await this.refreshDevices();
+  }
+
+  /** Republishes what capture is holding as observable state. */
+  #syncPreview(): void {
+    this.previewStream = capture.stream;
+    this.previewVideoId = capture.stream?.getVideoTracks()[0]?.id ?? '';
+    this.previewAudio = !!capture.stream?.getAudioTracks().length;
   }
 
   /**
@@ -331,7 +364,11 @@ class Store {
       await this.openPreview();
       return;
     }
-    this.previewStream = await capture.switchDevices(this.videoSettings, this.audioSettings);
+    try {
+      await capture.switchDevices(this.videoSettings, this.audioSettings);
+    } finally {
+      this.#syncPreview();
+    }
     await this.refreshDevices();
   }
 
@@ -358,7 +395,7 @@ class Store {
   leave(): void {
     capture.stop();
     playback.clear();
-    this.previewStream = null;
+    this.#syncPreview();
     this.tracks = [];
     this.participants = [];
     this.speaking = false;

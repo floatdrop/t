@@ -52,6 +52,34 @@ export const defaultAudioSettings: AudioSettings = {
   denoise: true,
 };
 
+/**
+ * Whether a pipeline built for `have` already satisfies `want`.
+ *
+ * Any difference rebuilds that kind, including a bitrate the encoder could in
+ * principle just be reconfigured for. Bitrate is not something a call changes
+ * often enough to be worth a second path, and an exact match is the honest
+ * test of "nothing to do".
+ */
+function sameVideoSettings(want: VideoSettings, have: VideoSettings | null): boolean {
+  return (
+    have !== null &&
+    have.deviceId === want.deviceId &&
+    have.width === want.width &&
+    have.height === want.height &&
+    have.framerate === want.framerate &&
+    have.bitrate === want.bitrate
+  );
+}
+
+function sameAudioSettings(want: AudioSettings, have: AudioSettings | null): boolean {
+  return (
+    have !== null &&
+    have.deviceId === want.deviceId &&
+    have.bitrate === want.bitrate &&
+    have.denoise === want.denoise
+  );
+}
+
 /** Live counters for the debug panel. */
 export interface CaptureStats {
   videoFps: number;
@@ -121,7 +149,20 @@ export class Capture {
   #audioCtx: AudioContext | null = null;
   #tap: AudioWorkletNode | null = null;
 
-  #running = false;
+  /**
+   * Liveness and settings per kind, rather than one flag for the pair.
+   *
+   * Split because muting must not disturb the picture: open() and start()
+   * compare these against what is asked for and rebuild only the side that
+   * changed. Each records the request its pipeline was built from, with the
+   * device replaced by the one actually granted — see #acquire for why that
+   * distinction matters.
+   */
+  #videoRunning = false;
+  #audioRunning = false;
+  #videoFor: VideoSettings | null = null;
+  #audioFor: AudioSettings | null = null;
+
   #frameIndex = 0;
   /** Set by forceKeyFrame; consumed by the next captured frame. */
   #forceKeyFrame = false;
@@ -162,12 +203,45 @@ export class Capture {
   };
 
   /**
-   * Opens the requested devices. Call before start(). Returns the stream
-   * so the caller can show a local preview.
+   * Opens the requested devices, keeping any already open on the settings
+   * asked for. Call before start(). Returns the stream so the caller can show
+   * a local preview.
+   *
+   * The stream keeps its identity across calls — tracks are added to and
+   * removed from it in place — so a kind that was left alone is not even
+   * momentarily detached from whatever is rendering it. The cost is that a
+   * swap has nothing to announce it from the outside, which is why the local
+   * tile keys itself on the video track's id instead of the stream's.
    */
   async open(video: VideoSettings | null, audio: AudioSettings | null): Promise<MediaStream> {
-    this.stop();
+    // Checked before anything is released, so a call that asks for nothing
+    // leaves what is running alone.
+    if (!video && !audio) {
+      throw new Error('capture: neither camera nor microphone selected');
+    }
 
+    const freshVideo = !!video && !sameVideoSettings(video, this.#videoFor);
+    const freshAudio = !!audio && !sameAudioSettings(audio, this.#audioFor);
+
+    // Release only what is going away or being replaced.
+    if (!video || freshVideo) this.#stopVideo();
+    if (!audio || freshAudio) this.#stopAudio();
+
+    if (freshVideo || freshAudio) {
+      await this.#acquire(freshVideo ? video : null, freshAudio ? audio : null);
+    }
+    return this.stream!;
+  }
+
+  /**
+   * Acquires the named kinds and merges them into the live stream.
+   *
+   * One getUserMedia call covers both when both are wanted, which is the
+   * ordinary first open and keeps it to a single permission check. A later
+   * single-kind switch asks for that kind alone, leaving the other track — and
+   * the device light that goes with it — untouched.
+   */
+  async #acquire(video: VideoSettings | null, audio: AudioSettings | null): Promise<void> {
     const constraints: MediaStreamConstraints = {};
     if (video) {
       constraints.video = {
@@ -185,21 +259,31 @@ export class Capture {
         ...(audio.deviceId ? { deviceId: { exact: audio.deviceId } } : {}),
       };
     }
-    if (!constraints.video && !constraints.audio) {
-      throw new Error('capture: neither camera nor microphone selected');
-    }
 
-    this.stream = await navigator.mediaDevices.getUserMedia(constraints);
+    const fresh = await navigator.mediaDevices.getUserMedia(constraints);
+    if (!this.stream) this.stream = new MediaStream();
+    fresh.getTracks().forEach((track) => this.stream!.addTrack(track));
     bridge.report('INFO', 'capture devices opened', {
-      tracks: this.stream.getTracks().map((t) => `${t.kind}:${t.label}`).join(', '),
+      tracks: fresh.getTracks().map((t) => `${t.kind}:${t.label}`).join(', '),
     });
 
-    // Report the settings the browser actually granted, not the ones we
-    // asked for. Echo cancellation in particular can only be done by the
-    // platform, so knowing whether it engaged is the difference between a
-    // usable call and an unexplained howl.
-    const mic = this.stream.getAudioTracks()[0];
-    if (mic) {
+    // What each pipeline is running on is remembered as the device that was
+    // granted, not the one asked for. The first open names no device at all,
+    // and the selection that follows names the one it just got — recording the
+    // request would make those two look different and rebuild for nothing.
+    const cam = fresh.getVideoTracks()[0];
+    if (video && cam) {
+      this.#videoFor = { ...video, deviceId: cam.getSettings().deviceId ?? video.deviceId };
+    }
+
+    const mic = fresh.getAudioTracks()[0];
+    if (audio && mic) {
+      this.#audioFor = { ...audio, deviceId: mic.getSettings().deviceId ?? audio.deviceId };
+
+      // Report the processing the browser actually applied, not what we asked
+      // for. Echo cancellation in particular can only be done by the platform,
+      // so knowing whether it engaged is the difference between a usable call
+      // and an unexplained howl.
       const applied = mic.getSettings();
       this.#stats.echoCancellation = applied.echoCancellation ?? false;
       this.#stats.noiseSuppression = applied.noiseSuppression ?? false;
@@ -210,24 +294,26 @@ export class Capture {
         autoGainControl: String(this.#stats.autoGainControl),
       });
     }
-    return this.stream;
   }
 
-  /** Starts encoding and publishing whatever open() acquired. */
+  /**
+   * Starts encoding and publishing whatever open() acquired, for the kinds not
+   * already running. A kind that is running is left as it is — that is what
+   * keeps a mute from costing the picture anything.
+   */
   async start(video: VideoSettings | null, audio: AudioSettings | null): Promise<void> {
     if (!this.stream) throw new Error('capture: open() must run before start()');
-    this.#running = true;
-    // Set once per session, not per start: switchDevices restarts the
+    // Set once per session, not per start: a device switch rebuilds a
     // pipeline, and re-basing the clock would send timestamps backwards
     // mid-stream for every subscriber already decoding us.
     if (this.#epochUs === 0) {
       this.#epochUs = performance.now() * 1000;
     }
 
-    if (video && this.stream.getVideoTracks().length > 0) {
+    if (video && !this.#videoRunning && this.stream.getVideoTracks().length > 0) {
       await this.#startVideo(video);
     }
-    if (audio && this.stream.getAudioTracks().length > 0) {
+    if (audio && !this.#audioRunning && this.stream.getAudioTracks().length > 0) {
       await this.#startAudio(audio);
     }
   }
@@ -289,7 +375,7 @@ export class Capture {
 
     const keyEvery = Math.max(1, Math.round(framerate * KEYFRAME_INTERVAL_SEC));
     const pump = () => {
-      if (!this.#running || !this.#videoEncoder || !this.#video) return;
+      if (!this.#videoRunning || !this.#videoEncoder || !this.#video) return;
       // Dropping frames while the encoder is backed up keeps latency
       // bounded; queueing them would only push the backlog further out.
       if (this.#videoEncoder.encodeQueueSize > 2) {
@@ -319,6 +405,15 @@ export class Capture {
       }
       this.#video.requestVideoFrameCallback(pump);
     };
+
+    // The running pipeline is what "unchanged" now means, so record what it was
+    // built with — encoder settings included, since a bitrate can be chosen
+    // before joining and only takes effect here. The device stays as the
+    // acquisition resolved it; the resolution stays as it was *asked* for,
+    // because a camera that cannot do 1080p grants 720p and asking again would
+    // otherwise look like a change on every comparison.
+    this.#videoFor = { ...settings, deviceId: this.#videoFor?.deviceId ?? settings.deviceId };
+    this.#videoRunning = true;
     el.requestVideoFrameCallback(pump);
   }
 
@@ -402,8 +497,11 @@ export class Capture {
     this.#haveAudioEpoch = false;
     this.#skewWindowEndUs = 0;
 
+    // What the pipeline was built with, for the same reason as #startVideo.
+    this.#audioFor = { ...settings, deviceId: this.#audioFor?.deviceId ?? settings.deviceId };
+    this.#audioRunning = true;
     tap.port.onmessage = (ev: MessageEvent<TapBlock>) => {
-      if (!this.#running) return;
+      if (!this.#audioRunning) return;
       this.#onTapBlock(ev.data);
     };
     this.#audioBitrate = settings.bitrate;
@@ -594,54 +692,93 @@ export class Capture {
   }
 
   /**
-   * Swaps the capture devices on a live call.
+   * Brings the capture in line with a new selection on a live call.
    *
    * The MOQ publications belong to the backend and stay open, so this only
-   * rebuilds the local pipeline: the new frames simply keep flowing into the
-   * same tracks. A resolution or codec change is picked up by the fresh
-   * `track` declaration that #startVideo sends, which republishes the catalog
-   * and makes subscribers reconfigure.
+   * rebuilds the local pipeline — and only the half of it that changed. Muting
+   * the microphone leaves the camera track, its encoder and its catalog entry
+   * exactly as they were, which is what keeps a mute from costing every
+   * subscriber a decoder reconfigure and a wait for the next keyframe. A
+   * resolution change is still picked up by the fresh `track` declaration that
+   * #startVideo sends, which republishes the catalog and makes subscribers
+   * reconfigure.
    *
    * The media clock is deliberately carried across, so timestamps stay
-   * monotonic through the swap. The audio epoch is not: the new AudioContext
-   * brings a new capture clock, so #startAudio takes the epoch again on the
-   * far side, against the same media clock.
+   * monotonic through the swap. The audio epoch is not: a rebuilt audio side
+   * brings a new AudioContext and so a new capture clock, and #startAudio takes
+   * the offset again on the far side, against the same media clock.
    */
   async switchDevices(
     video: VideoSettings | null,
     audio: AudioSettings | null,
-  ): Promise<MediaStream> {
-    const epoch = this.#epochUs;
-
-    this.stop();
-
-    this.#epochUs = epoch;
-    const stream = await this.open(video, audio);
-    await this.start(video, audio);
-
-    // start() declares whichever kinds it brought up. The ones it did not
-    // have to be withdrawn explicitly, or the catalog keeps advertising a
-    // track that will never produce another frame and every subscriber sits
-    // on its last one.
-    if (!video) bridge.send({ type: 'untrack', untrack: 'video' });
-    if (!audio) bridge.send({ type: 'untrack', untrack: 'audio' });
+  ): Promise<MediaStream | null> {
+    try {
+      if (video || audio) {
+        await this.open(video, audio);
+        await this.start(video, audio);
+      } else {
+        // Both off is a state the toggles reach in two clicks, not an error:
+        // the call stays up with nothing published. The media clock is kept, so
+        // turning a kind back on continues the same timeline rather than
+        // sending timestamps backwards.
+        this.#stopVideo();
+        this.#stopAudio();
+        this.stream = null;
+      }
+    } finally {
+      // Withdraw every kind that is not publishing — switched off, or asked
+      // for and failed to open. A catalog entry with nothing behind it leaves
+      // each subscriber holding a decoder that will never be fed again, sitting
+      // on the last frame it got. Withdrawing a kind that was never declared is
+      // a no-op on the backend, so this needs no memory of what came before.
+      if (!this.#videoRunning) bridge.send({ type: 'untrack', untrack: 'video' });
+      if (!this.#audioRunning) bridge.send({ type: 'untrack', untrack: 'audio' });
+    }
 
     bridge.report('INFO', 'capture devices switched', {
-      video: video ? 'on' : 'off',
-      audio: audio ? 'on' : 'off',
+      video: this.#videoRunning ? 'on' : 'off',
+      audio: this.#audioRunning ? 'on' : 'off',
     });
-    return stream;
+    return this.stream;
   }
 
-  /** Releases the devices, encoders and audio graph. */
+  /** Releases both devices, the encoders and the audio graph. */
   stop(): void {
-    this.#running = false;
+    this.#stopVideo();
+    this.#stopAudio();
+    this.stream = null;
+    // Only a full stop re-bases the media clock: everything that was using it
+    // is gone, so the next session is free to start from zero.
+    this.#epochUs = 0;
+  }
+
+  /** Releases the camera, its encoder and the frame pump. */
+  #stopVideo(): void {
+    this.#videoRunning = false;
 
     if (this.#videoEncoder && this.#videoEncoder.state !== 'closed') this.#videoEncoder.close();
     this.#videoEncoder = null;
+    if (this.#video) {
+      this.#video.pause();
+      this.#video.srcObject = null;
+      this.#video = null;
+    }
+    this.#dropTracks('video');
+
+    // Restart the cadence, so whatever starts next opens with a keyframe: a
+    // subscriber that reconfigured on the new declaration cannot begin on a
+    // delta frame.
+    this.#frameIndex = 0;
+    this.#videoFor = null;
+  }
+
+  /** Releases the microphone, its encoder and the audio graph. */
+  #stopAudio(): void {
+    const wasSpeaking = this.#voice.speaking;
+    this.#audioRunning = false;
+
     if (this.#audioEncoder && this.#audioEncoder.state !== 'closed') this.#audioEncoder.close();
     this.#audioEncoder = null;
-
     if (this.#tap) {
       this.#tap.port.onmessage = null;
       this.#tap.disconnect();
@@ -651,21 +788,31 @@ export class Capture {
       void this.#audioCtx.close();
       this.#audioCtx = null;
     }
-    if (this.#video) {
-      this.#video.pause();
-      this.#video.srcObject = null;
-      this.#video = null;
-    }
-    this.stream?.getTracks().forEach((t) => t.stop());
-    this.stream = null;
+    this.#dropTracks('audio');
+    this.#denoiser.destroy();
 
-    this.#frameIndex = 0;
     this.#audioConfigSent = false;
-    this.#epochUs = 0;
     this.#audioEpochUs = 0;
     this.#haveAudioEpoch = false;
+    this.#skewFloorUs = 0;
+    this.#skewWindowEndUs = 0;
     this.#voice = { speaking: false, level: 0, rfc6464: 127 };
-    this.#denoiser.destroy();
+    this.#audioFor = null;
+    // Say so, rather than only recording it: a mute taken mid-word would
+    // otherwise leave the local speaking ring latched on with nothing left to
+    // clear it.
+    if (wasSpeaking) this.onVoice?.(this.#voice);
+  }
+
+  /** Stops and removes the live tracks of one kind, leaving the other alone. */
+  #dropTracks(kind: 'video' | 'audio'): void {
+    const stream = this.stream;
+    if (!stream) return;
+    const tracks = kind === 'video' ? stream.getVideoTracks() : stream.getAudioTracks();
+    tracks.forEach((track) => {
+      track.stop();
+      stream.removeTrack(track);
+    });
   }
 
   /**

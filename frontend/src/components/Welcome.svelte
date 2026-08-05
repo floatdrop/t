@@ -154,9 +154,14 @@
     </header>
 
     <div class="preview">
-      {#if store.previewStream && store.media.useVideo}
-        <!-- svelte-ignore a11y_media_has_caption -->
-        <video bind:this={previewEl} autoplay muted playsinline></video>
+      {#if store.previewVideo}
+        <!-- Keyed on the camera for the reason VideoTile is: the stream is
+             reused across a device switch, so only a fresh element is certain
+             to show the new one. -->
+        {#key store.previewVideoId}
+          <!-- svelte-ignore a11y_media_has_caption -->
+          <video bind:this={previewEl} autoplay muted playsinline></video>
+        {/key}
       {:else}
         <div class="preview-empty">
           {#if permissionError}

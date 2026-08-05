@@ -14,6 +14,14 @@
     hasAudio?: boolean;
     /** Set for the local tile; renders the capture stream directly. */
     localStream?: MediaStream | null;
+    /**
+     * Identity of the local stream's video track, or '' when it carries none.
+     *
+     * Passed rather than read off localStream, whose track list changes in
+     * place when a device is switched: the stream object stays the same, so a
+     * camera swap has nothing else to announce it.
+     */
+    localVideoId?: string;
     label?: string;
     /** Draws the voice-activity border. */
     speaking?: boolean;
@@ -24,6 +32,7 @@
     videoHandle = null,
     hasAudio = false,
     localStream = null,
+    localVideoId = '',
     label = '',
     speaking = false,
   }: Props = $props();
@@ -45,13 +54,20 @@
   });
 
   const isLocal = $derived(localStream !== null);
-  const hasVideo = $derived(isLocal ? !!localStream?.getVideoTracks().length : videoHandle !== null);
+  const hasVideo = $derived(isLocal ? localVideoId !== '' : videoHandle !== null);
 </script>
 
 <div class="tile" class:local={isLocal} class:speaking>
   {#if isLocal && hasVideo}
-    <!-- svelte-ignore a11y_media_has_caption -->
-    <video bind:this={video} autoplay muted playsinline></video>
+    <!-- Keyed on the camera, so switching one gives a fresh element to bind:
+         the stream it is attached to is reused across the swap, and re-setting
+         srcObject to the object it already holds is not guaranteed to restart
+         anything. A microphone change leaves the key alone, and with it the
+         picture. -->
+    {#key localVideoId}
+      <!-- svelte-ignore a11y_media_has_caption -->
+      <video bind:this={video} autoplay muted playsinline></video>
+    {/key}
   {:else if videoHandle !== null}
     <canvas bind:this={canvas}></canvas>
   {:else}

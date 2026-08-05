@@ -14,7 +14,7 @@
   let open = $state(false);
   let busy = $state(false);
   let error = $state('');
-  let panel = $state<HTMLDivElement | null>(null);
+  let root = $state<HTMLDivElement | null>(null);
 
   const cameras = $derived(store.devices.cameras);
   const microphones = $derived(store.devices.microphones);
@@ -32,6 +32,17 @@
     }
   }
 
+  /**
+   * Flips a capture track and republishes. Kept out of the panel because
+   * muting is the one thing you reach for mid-sentence — it should not cost a
+   * popover.
+   */
+  async function toggleTrack(kind: 'audio' | 'video'): Promise<void> {
+    if (kind === 'audio') store.media.useAudio = !store.media.useAudio;
+    else store.media.useVideo = !store.media.useVideo;
+    await apply();
+  }
+
   function toggle(): void {
     open = !open;
     // Device labels can change while a call runs — something plugged in, a
@@ -43,7 +54,7 @@
   $effect(() => {
     if (!open) return;
     const onPointerDown = (ev: PointerEvent) => {
-      if (panel && !panel.contains(ev.target as Node)) open = false;
+      if (root && !root.contains(ev.target as Node)) open = false;
     };
     const onKey = (ev: KeyboardEvent) => {
       if (ev.key === 'Escape') open = false;
@@ -62,93 +73,129 @@
   });
 </script>
 
-<div class="wrap" bind:this={panel}>
-  <button onclick={toggle} aria-expanded={open} title="Camera and microphone">
-    Devices {open ? '▾' : '▴'}
+<div class="controls" bind:this={root}>
+  {#if error && !open}
+    <span class="note err" role="status">{error}</span>
+  {/if}
+
+  <button
+    class="track"
+    class:off={!store.media.useAudio}
+    aria-pressed={store.media.useAudio}
+    disabled={busy}
+    onclick={() => toggleTrack('audio')}
+    title={store.media.useAudio ? 'Turn the microphone off' : 'Turn the microphone on'}
+  >
+    Mic {store.media.useAudio ? 'on' : 'off'}
   </button>
 
-  {#if open}
-    <div class="panel" role="group" aria-label="Camera and microphone">
-      <div class="field">
-        <label for="call-cam">
+  <button
+    class="track"
+    class:off={!store.media.useVideo}
+    aria-pressed={store.media.useVideo}
+    disabled={busy}
+    onclick={() => toggleTrack('video')}
+    title={store.media.useVideo ? 'Turn the camera off' : 'Turn the camera on'}
+  >
+    Cam {store.media.useVideo ? 'on' : 'off'}
+  </button>
+
+  <div class="wrap">
+    <button onclick={toggle} aria-expanded={open} title="Camera and microphone">
+      Devices {open ? '▾' : '▴'}
+    </button>
+
+    {#if open}
+      <div class="panel" role="group" aria-label="Camera and microphone">
+        <div class="field">
+          <label for="call-cam">Camera</label>
+          <select
+            id="call-cam"
+            bind:value={store.media.cameraId}
+            onchange={apply}
+            disabled={!store.media.useVideo || busy}
+          >
+            {#each cameras as cam (cam.deviceId)}
+              <option value={cam.deviceId}>{cam.label || 'Camera'}</option>
+            {/each}
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="call-mic">Microphone</label>
+          <select
+            id="call-mic"
+            bind:value={store.media.microphoneId}
+            onchange={apply}
+            disabled={!store.media.useAudio || busy}
+          >
+            {#each microphones as mic (mic.deviceId)}
+              <option value={mic.deviceId}>{mic.label || 'Microphone'}</option>
+            {/each}
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="call-res">Resolution</label>
+          <select
+            id="call-res"
+            bind:value={store.media.resolution}
+            onchange={apply}
+            disabled={!store.media.useVideo || busy}
+          >
+            <option value="640x360">640 × 360</option>
+            <option value="854x480">854 × 480</option>
+            <option value="1280x720">1280 × 720</option>
+            <option value="1920x1080">1920 × 1080</option>
+          </select>
+        </div>
+
+        <label class="toggle">
           <input
             type="checkbox"
-            class="inline"
-            bind:checked={store.media.useVideo}
+            bind:checked={store.media.denoise}
             onchange={apply}
-          /> Camera
+            disabled={!store.media.useAudio || busy}
+          />
+          Noise suppression
         </label>
-        <select
-          id="call-cam"
-          bind:value={store.media.cameraId}
-          onchange={apply}
-          disabled={!store.media.useVideo || busy}
-        >
-          {#each cameras as cam (cam.deviceId)}
-            <option value={cam.deviceId}>{cam.label || 'Camera'}</option>
-          {/each}
-        </select>
+
+        {#if busy}
+          <p class="note">Switching…</p>
+        {:else if error}
+          <p class="note err">{error}</p>
+        {/if}
       </div>
-
-      <div class="field">
-        <label for="call-mic">
-          <input
-            type="checkbox"
-            class="inline"
-            bind:checked={store.media.useAudio}
-            onchange={apply}
-          /> Microphone
-        </label>
-        <select
-          id="call-mic"
-          bind:value={store.media.microphoneId}
-          onchange={apply}
-          disabled={!store.media.useAudio || busy}
-        >
-          {#each microphones as mic (mic.deviceId)}
-            <option value={mic.deviceId}>{mic.label || 'Microphone'}</option>
-          {/each}
-        </select>
-      </div>
-
-      <div class="field">
-        <label for="call-res">Resolution</label>
-        <select
-          id="call-res"
-          bind:value={store.media.resolution}
-          onchange={apply}
-          disabled={!store.media.useVideo || busy}
-        >
-          <option value="640x360">640 × 360</option>
-          <option value="854x480">854 × 480</option>
-          <option value="1280x720">1280 × 720</option>
-          <option value="1920x1080">1920 × 1080</option>
-        </select>
-      </div>
-
-      <label class="toggle">
-        <input
-          type="checkbox"
-          bind:checked={store.media.denoise}
-          onchange={apply}
-          disabled={!store.media.useAudio || busy}
-        />
-        Noise suppression
-      </label>
-
-      {#if busy}
-        <p class="note">Switching…</p>
-      {:else if error}
-        <p class="note err">{error}</p>
-      {/if}
-    </div>
-  {/if}
+    {/if}
+  </div>
 </div>
 
 <style>
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: none;
+  }
+
   .wrap {
     position: relative;
     flex: none;
+  }
+
+  /* Mic and camera read as pressed-in when live, and go quiet — not alarming —
+     when off, since being muted is a normal state rather than an error. */
+  .track {
+    padding: 7px 10px;
+    font-size: 12px;
+    border-color: var(--accent);
+    background: var(--accent-dim);
+  }
+
+  .track.off {
+    border-color: var(--border-strong);
+    background: var(--bg-raised);
+    color: var(--text-faint);
   }
 
   .panel {
@@ -169,12 +216,6 @@
 
   .field {
     min-width: 0;
-  }
-
-  input.inline {
-    width: auto;
-    margin-right: 4px;
-    vertical-align: -1px;
   }
 
   .toggle {

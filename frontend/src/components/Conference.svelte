@@ -130,7 +130,8 @@
     <VideoTile
       nickname={store.session.nickname ?? 'me'}
       localStream={store.previewStream}
-      hasAudio={!!store.previewStream?.getAudioTracks().length}
+      localVideoId={store.previewVideoId}
+      hasAudio={store.previewAudio}
       speaking={store.speaking}
     />
     {#each remotes as remote (remote.id)}

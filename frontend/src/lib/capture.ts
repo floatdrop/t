@@ -102,33 +102,6 @@ function sameVideoSettings(want: VideoSettings, have: VideoSettings | null): boo
   );
 }
 
-/**
- * The bitrate to encode at, given what the source actually handed over.
- *
- * Display capture cannot be relied on to honour the size it is asked for.
- * Measured in this WebView: a 2560-wide screen constrained to
- * `width: {max: 1280}` came back at 1920×1080 — the maximum moved it, but not to
- * where it was told. A screen now asks for 1080p and gets it, so this is a guard
- * rather than the usual path: should a display hand back more than that anyway,
- * publishing those extra pixels at the budgeted rate is how a share turns to
- * mush the moment anything on it moves.
- *
- * Scaled by the square root of the pixel ratio rather than the ratio itself.
- * Screen content is mostly static between keyframes, so it does not need the
- * full linear increase, and the root is self-limiting: even a 4K grant lands at
- * a rate a call can carry rather than several times the budget.
- *
- * A camera needs none of this — it honours its constraints, and when it cannot
- * it gives back *less*, which the budget already covers.
- */
-function bitrateFor(settings: VideoSettings, width: number, height: number): number {
-  if (settings.source !== 'screen') return settings.bitrate;
-  const asked = settings.width * settings.height;
-  const granted = width * height;
-  if (!asked || granted <= asked) return settings.bitrate;
-  return Math.round(settings.bitrate * Math.sqrt(granted / asked));
-}
-
 function sameAudioSettings(want: AudioSettings, have: AudioSettings | null): boolean {
   return (
     have !== null &&
@@ -310,9 +283,11 @@ export class Capture {
     if (video?.source === 'screen') {
       const display = await navigator.mediaDevices.getDisplayMedia({
         video: {
-          // Maxima, not ideals: the point is to keep a 1440p desktop from
-          // arriving at a bitrate chosen for 720p, and a display has no
-          // business being upscaled to meet a target.
+          // Maxima, not ideals: a desktop larger than this should come down to
+          // it, so the rate in screenVideoSettings is the rate it is carrying,
+          // but a smaller one has no business being stretched up to meet a
+          // target. Measured honouring these — a 2560-wide screen asked for
+          // 1080p arrives as 1920×1080.
           width: { max: video.width },
           height: { max: video.height },
           frameRate: { max: video.framerate },
@@ -416,7 +391,6 @@ export class Capture {
     const width = actual.width ?? settings.width;
     const height = actual.height ?? settings.height;
     const framerate = actual.frameRate ?? settings.framerate;
-    const bitrate = bitrateFor(settings, width, height);
 
     // A <video> element is the only source WebKit offers for constructing
     // VideoFrames from a live track.
@@ -437,13 +411,13 @@ export class Capture {
       size: `${width}x${height}`,
       asked: `${settings.width}x${settings.height}`,
       framerate: String(Math.round(framerate)),
-      bitrate: String(bitrate),
+      bitrate: String(settings.bitrate),
     });
     encoder.configure({
       codec: VIDEO_CODEC,
       width,
       height,
-      bitrate,
+      bitrate: settings.bitrate,
       framerate,
       latencyMode: 'realtime',
       // Annex B puts SPS/PPS in the bitstream ahead of every keyframe, so
@@ -464,9 +438,7 @@ export class Capture {
         width,
         height,
         framerate,
-        // The rate actually configured, so the catalog describes the stream
-        // rather than the request behind it.
-        bitrate,
+        bitrate: settings.bitrate,
       },
     });
 

@@ -25,7 +25,18 @@ import { addTapModule, type TapBlock } from './worklets';
 /** Seconds between forced keyframes — also the video group length. */
 const KEYFRAME_INTERVAL_SEC = 2;
 
+/**
+ * Where the video comes from.
+ *
+ * One video track per participant is all the catalog carries, so a screen is
+ * not an addition to the camera but a replacement for it — which makes this a
+ * property of the video settings rather than a track of its own.
+ */
+export type VideoSource = 'camera' | 'screen';
+
 export interface VideoSettings {
+  source: VideoSource;
+  /** Which camera. Meaningless for a screen, which is not a device. */
   deviceId?: string;
   width: number;
   height: number;
@@ -41,6 +52,7 @@ export interface AudioSettings {
 }
 
 export const defaultVideoSettings: VideoSettings = {
+  source: 'camera',
   width: 1280,
   height: 720,
   framerate: 30,
@@ -53,6 +65,21 @@ export const defaultAudioSettings: AudioSettings = {
 };
 
 /**
+ * What a screen share asks for, independent of the camera's resolution.
+ *
+ * A screen is not framed like a face. Text has to stay legible, so it gets
+ * 1080p whatever the camera is set to, and a rate to carry it: the camera's
+ * 720p budget would leave anything that moves on a desktop as mush. Still
+ * modest for the content — a desktop is largely static between keyframes, which
+ * is exactly what H.264 is cheapest at.
+ */
+export const screenVideoSettings = {
+  width: 1920,
+  height: 1080,
+  bitrate: 3_000_000,
+} as const;
+
+/**
  * Whether a pipeline built for `have` already satisfies `want`.
  *
  * Any difference rebuilds that kind, including a bitrate the encoder could in
@@ -63,12 +90,43 @@ export const defaultAudioSettings: AudioSettings = {
 function sameVideoSettings(want: VideoSettings, have: VideoSettings | null): boolean {
   return (
     have !== null &&
+    // Compared first and never omitted: camera and screen at the same size and
+    // bitrate differ in nothing else, and treating them as equal would leave a
+    // request to start sharing doing nothing at all.
+    have.source === want.source &&
     have.deviceId === want.deviceId &&
     have.width === want.width &&
     have.height === want.height &&
     have.framerate === want.framerate &&
     have.bitrate === want.bitrate
   );
+}
+
+/**
+ * The bitrate to encode at, given what the source actually handed over.
+ *
+ * Display capture cannot be relied on to honour the size it is asked for.
+ * Measured in this WebView: a 2560-wide screen constrained to
+ * `width: {max: 1280}` came back at 1920×1080 — the maximum moved it, but not to
+ * where it was told. A screen now asks for 1080p and gets it, so this is a guard
+ * rather than the usual path: should a display hand back more than that anyway,
+ * publishing those extra pixels at the budgeted rate is how a share turns to
+ * mush the moment anything on it moves.
+ *
+ * Scaled by the square root of the pixel ratio rather than the ratio itself.
+ * Screen content is mostly static between keyframes, so it does not need the
+ * full linear increase, and the root is self-limiting: even a 4K grant lands at
+ * a rate a call can carry rather than several times the budget.
+ *
+ * A camera needs none of this — it honours its constraints, and when it cannot
+ * it gives back *less*, which the budget already covers.
+ */
+function bitrateFor(settings: VideoSettings, width: number, height: number): number {
+  if (settings.source !== 'screen') return settings.bitrate;
+  const asked = settings.width * settings.height;
+  const granted = width * height;
+  if (!asked || granted <= asked) return settings.bitrate;
+  return Math.round(settings.bitrate * Math.sqrt(granted / asked));
 }
 
 function sameAudioSettings(want: AudioSettings, have: AudioSettings | null): boolean {
@@ -242,8 +300,29 @@ export class Capture {
    * the device light that goes with it — untouched.
    */
   async #acquire(video: VideoSettings | null, audio: AudioSettings | null): Promise<void> {
+    const fresh: MediaStreamTrack[] = [];
+
+    // A screen cannot be asked for in the same breath as a microphone —
+    // getDisplayMedia takes only display constraints — so a screen share is two
+    // calls. It goes first: getDisplayMedia needs the transient activation from
+    // the click that asked for it, and spending it on a microphone prompt first
+    // is how that gets lost.
+    if (video?.source === 'screen') {
+      const display = await navigator.mediaDevices.getDisplayMedia({
+        video: {
+          // Maxima, not ideals: the point is to keep a 1440p desktop from
+          // arriving at a bitrate chosen for 720p, and a display has no
+          // business being upscaled to meet a target.
+          width: { max: video.width },
+          height: { max: video.height },
+          frameRate: { max: video.framerate },
+        },
+      });
+      fresh.push(...display.getTracks());
+    }
+
     const constraints: MediaStreamConstraints = {};
-    if (video) {
+    if (video && video.source === 'camera') {
       constraints.video = {
         width: { ideal: video.width },
         height: { ideal: video.height },
@@ -259,24 +338,23 @@ export class Capture {
         ...(audio.deviceId ? { deviceId: { exact: audio.deviceId } } : {}),
       };
     }
-
-    const fresh = await navigator.mediaDevices.getUserMedia(constraints);
-    if (!this.stream) this.stream = new MediaStream();
-    fresh.getTracks().forEach((track) => this.stream!.addTrack(track));
-    bridge.report('INFO', 'capture devices opened', {
-      tracks: fresh.getTracks().map((t) => `${t.kind}:${t.label}`).join(', '),
-    });
-
-    // What each pipeline is running on is remembered as the device that was
-    // granted, not the one asked for. The first open names no device at all,
-    // and the selection that follows names the one it just got — recording the
-    // request would make those two look different and rebuild for nothing.
-    const cam = fresh.getVideoTracks()[0];
-    if (video && cam) {
-      this.#videoFor = { ...video, deviceId: cam.getSettings().deviceId ?? video.deviceId };
+    if (constraints.video || constraints.audio) {
+      fresh.push(...(await navigator.mediaDevices.getUserMedia(constraints)).getTracks());
     }
 
-    const mic = fresh.getAudioTracks()[0];
+    if (!this.stream) this.stream = new MediaStream();
+    fresh.forEach((track) => this.stream!.addTrack(track));
+    bridge.report('INFO', 'capture devices opened', {
+      tracks: fresh.map((t) => `${t.kind}:${t.label}`).join(', '),
+      ...(video?.source === 'screen' ? { videoSource: 'screen' } : {}),
+    });
+
+    // What each kind is running on, for the next comparison to work against.
+    // See #rememberVideo for why the video side is not simply what was asked.
+    const cam = fresh.find((t) => t.kind === 'video');
+    if (video && cam) this.#rememberVideo(video, cam);
+
+    const mic = fresh.find((t) => t.kind === 'audio');
     if (audio && mic) {
       this.#audioFor = { ...audio, deviceId: mic.getSettings().deviceId ?? audio.deviceId };
 
@@ -320,10 +398,25 @@ export class Capture {
 
   async #startVideo(settings: VideoSettings): Promise<void> {
     const track = this.stream!.getVideoTracks()[0];
+
+    // A screen share can be ended from outside the app — macOS puts its own
+    // stop control in the menu bar, and the window being shared can simply be
+    // closed. Nothing else would notice: the track goes silent, the pump stops
+    // getting frames, and the catalog would keep advertising video while every
+    // subscriber sat on the last thing it saw. stop() does not fire this, so
+    // the only way here is a genuine end from the source.
+    if (settings.source === 'screen') {
+      track.addEventListener('ended', () => {
+        bridge.report('INFO', 'screen share ended from outside the app');
+        this.onVideoSourceLost?.();
+      });
+    }
+
     const actual = track.getSettings();
     const width = actual.width ?? settings.width;
     const height = actual.height ?? settings.height;
     const framerate = actual.frameRate ?? settings.framerate;
+    const bitrate = bitrateFor(settings, width, height);
 
     // A <video> element is the only source WebKit offers for constructing
     // VideoFrames from a live track.
@@ -340,15 +433,17 @@ export class Capture {
     });
     bridge.report('INFO', 'video encoder configured', {
       codec: VIDEO_CODEC,
+      source: settings.source,
       size: `${width}x${height}`,
+      asked: `${settings.width}x${settings.height}`,
       framerate: String(Math.round(framerate)),
-      bitrate: String(settings.bitrate),
+      bitrate: String(bitrate),
     });
     encoder.configure({
       codec: VIDEO_CODEC,
       width,
       height,
-      bitrate: settings.bitrate,
+      bitrate,
       framerate,
       latencyMode: 'realtime',
       // Annex B puts SPS/PPS in the bitstream ahead of every keyframe, so
@@ -369,7 +464,9 @@ export class Capture {
         width,
         height,
         framerate,
-        bitrate: settings.bitrate,
+        // The rate actually configured, so the catalog describes the stream
+        // rather than the request behind it.
+        bitrate,
       },
     });
 
@@ -406,13 +503,7 @@ export class Capture {
       this.#video.requestVideoFrameCallback(pump);
     };
 
-    // The running pipeline is what "unchanged" now means, so record what it was
-    // built with — encoder settings included, since a bitrate can be chosen
-    // before joining and only takes effect here. The device stays as the
-    // acquisition resolved it; the resolution stays as it was *asked* for,
-    // because a camera that cannot do 1080p grants 720p and asking again would
-    // otherwise look like a change on every comparison.
-    this.#videoFor = { ...settings, deviceId: this.#videoFor?.deviceId ?? settings.deviceId };
+    this.#rememberVideo(settings);
     this.#videoRunning = true;
     el.requestVideoFrameCallback(pump);
   }
@@ -662,6 +753,13 @@ export class Capture {
   /** Notified whenever the local speaking state changes. */
   onVoice: ((state: VoiceState) => void) | null = null;
 
+  /**
+   * Notified when the video source stops of its own accord, which in practice
+   * means a screen share ended somewhere other than in this app. The store
+   * decides what to fall back to; capture only reports the fact.
+   */
+  onVideoSourceLost: (() => void) | null = null;
+
   /** Samples the counters into per-second rates for the debug panel. */
   sampleStats(): CaptureStats {
     const now = performance.now();
@@ -802,6 +900,27 @@ export class Capture {
     // otherwise leave the local speaking ring latched on with nothing left to
     // clear it.
     if (wasSpeaking) this.onVoice?.(this.#voice);
+  }
+
+  /**
+   * Records what the video pipeline should be compared against next time.
+   *
+   * The resolution is kept as it was *asked* for, not as granted: a camera that
+   * cannot do 1080p hands back 720p, and asking again would otherwise look like
+   * a change on every comparison. The device is the opposite — the granted one,
+   * because the first open names none and the selection that follows names the
+   * one it just got.
+   *
+   * A screen is deliberately left with no device at all. WebKit does report a
+   * deviceId on a display track, but it is not a value this app can ask for, and
+   * recording it made every later comparison mismatch — which meant a mute
+   * mid-share re-opened the screen picker.
+   */
+  #rememberVideo(settings: VideoSettings, granted?: MediaStreamTrack): void {
+    const deviceId = settings.source === 'screen'
+      ? undefined
+      : granted?.getSettings().deviceId ?? this.#videoFor?.deviceId ?? settings.deviceId;
+    this.#videoFor = { ...settings, deviceId };
   }
 
   /** Stops and removes the live tracks of one kind, leaving the other alone. */

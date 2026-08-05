@@ -12,9 +12,11 @@ import {
   defaultAudioSettings,
   defaultVideoSettings,
   listDevices,
+  screenVideoSettings,
   type AudioSettings,
   type CaptureStats,
   type VideoSettings,
+  type VideoSource,
 } from './capture';
 import { playback, type PlaybackStats } from './playback';
 import type {
@@ -54,6 +56,11 @@ export interface MediaSettings {
   microphoneId: string;
   useVideo: boolean;
   useAudio: boolean;
+  /**
+   * What useVideo publishes. A screen replaces the camera rather than joining
+   * it, because a participant has one video track in the catalog.
+   */
+  videoSource: VideoSource;
   /** "WIDTHxHEIGHT", matching the welcome screen's options. */
   resolution: string;
   videoBitrate: number;
@@ -116,6 +123,7 @@ class Store {
     microphoneId: '',
     useVideo: true,
     useAudio: true,
+    videoSource: 'camera',
     resolution: '1280x720',
     videoBitrate: defaultVideoSettings.bitrate,
     audioBitrate: defaultAudioSettings.bitrate,
@@ -240,6 +248,12 @@ class Store {
     capture.onVoice = (state) => {
       this.speaking = state.speaking;
     };
+    // A screen share that ended outside the app leaves the setting claiming to
+    // share something that is gone, so put it back where it was.
+    capture.onVideoSourceLost = () => {
+      if (this.media.videoSource !== 'screen') return;
+      void this.stopScreenShare();
+    };
     playback.onVoice = (participant, speaking) => {
       this.#markSpeaking(participant, speaking);
     };
@@ -300,8 +314,24 @@ class Store {
   /** The current selection as the capture layer's video settings, or null. */
   get videoSettings(): VideoSettings | null {
     if (!this.media.useVideo) return null;
+
+    // A screen takes none of the camera's settings. Its size and rate are its
+    // own (see screenVideoSettings), and it carries no device: a display is not
+    // one, and putting the camera selection here would make picking a different
+    // camera mid-share look like a change and re-open the screen picker.
+    if (this.media.videoSource === 'screen') {
+      return {
+        source: 'screen',
+        width: screenVideoSettings.width,
+        height: screenVideoSettings.height,
+        framerate: defaultVideoSettings.framerate,
+        bitrate: screenVideoSettings.bitrate,
+      };
+    }
+
     const [width, height] = this.media.resolution.split('x').map(Number);
     return {
+      source: 'camera',
       deviceId: this.media.cameraId || undefined,
       width,
       height,
@@ -318,6 +348,50 @@ class Store {
       bitrate: this.media.audioBitrate,
       denoise: this.media.denoise,
     };
+  }
+
+  /**
+   * Whether the camera was publishing before a screen share began.
+   *
+   * Kept so that stopping a share returns things as they were. Coming back to a
+   * live camera you had deliberately switched off would be a surprise of the
+   * worst kind — the camera is not a control to turn on for someone.
+   */
+  #videoBeforeShare = false;
+
+  /** True while the screen is what gets published. */
+  get sharingScreen(): boolean {
+    return this.media.useVideo && this.media.videoSource === 'screen';
+  }
+
+  /**
+   * Starts publishing the screen in place of the camera.
+   *
+   * Must be called straight from a click: getDisplayMedia needs the transient
+   * activation that gesture carries, and the picker never appears without it.
+   */
+  async startScreenShare(): Promise<void> {
+    if (this.sharingScreen) return;
+    this.#videoBeforeShare = this.media.useVideo;
+    this.media.videoSource = 'screen';
+    this.media.useVideo = true;
+    try {
+      await this.applyMedia();
+    } catch (err) {
+      // A cancelled picker rejects, and the settings must not be left claiming
+      // to share a screen that was never granted.
+      this.media.videoSource = 'camera';
+      this.media.useVideo = this.#videoBeforeShare;
+      await this.applyMedia().catch(() => {});
+      throw err;
+    }
+  }
+
+  /** Goes back to the camera, or to no video if that is where it started. */
+  async stopScreenShare(): Promise<void> {
+    this.media.videoSource = 'camera';
+    this.media.useVideo = this.#videoBeforeShare;
+    await this.applyMedia();
   }
 
   /** Opens the selected devices and shows a preview. */
@@ -393,6 +467,17 @@ class Store {
   }
 
   leave(): void {
+    // A screen share belongs to the call and does not outlive it. Its track is
+    // stopped along with everything else here, and leaving the source set to
+    // 'screen' would have the welcome screen's own preview reach for
+    // getDisplayMedia on mount — with no gesture behind it, which fails with
+    // "must be called from a user gesture handler" and reads as the camera
+    // having been refused.
+    if (this.media.videoSource === 'screen') {
+      this.media.videoSource = 'camera';
+      this.media.useVideo = this.#videoBeforeShare;
+    }
+
     capture.stop();
     playback.clear();
     this.#syncPreview();

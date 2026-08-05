@@ -93,8 +93,42 @@
     // the store and joins — the same path a link-launched app takes.
     store.leave();
   }
+  /**
+   * Which tile has the window to itself, if any.
+   *
+   * Held here rather than in the tiles because it is a property of the layout:
+   * only one of them can be expanded, and the grid is what has to give way.
+   */
+  const SELF = '\u0000self';
+  let expandedId = $state<string | null>(null);
+
+  /**
+   * The expansion, dropped if whoever it belonged to has left. Reading through
+   * this rather than the raw id means a departure cannot leave the view stuck on
+   * a participant who is no longer there.
+   */
+  const expanded = $derived(
+    expandedId !== null && (expandedId === SELF || remotes.some((r) => r.id === expandedId))
+      ? expandedId
+      : null,
+  );
+
+  // Escape gets out, the way it does from anything that took over the window.
+  $effect(() => {
+    if (expanded === null) return;
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === 'Escape') expandedId = null;
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
   /** Column count grows with the participant count, capped so tiles stay large. */
-  const columns = $derived(Math.min(3, Math.max(1, Math.ceil(Math.sqrt(remotes.length + 1)))));
+  const columns = $derived(
+    expanded !== null
+      ? 1
+      : Math.min(3, Math.max(1, Math.ceil(Math.sqrt(remotes.length + 1)))),
+  );
 </script>
 
 <div class="conference">
@@ -141,22 +175,35 @@
     </div>
   </header>
 
-  <div class="grid" style:grid-template-columns={`repeat(${columns}, minmax(0, 1fr))`}>
-    <VideoTile
-      nickname={store.session.nickname ?? 'me'}
-      localStream={store.previewStream}
-      localVideoId={store.previewVideoId}
-      hasAudio={store.previewAudio}
-      speaking={store.speaking}
-    />
-    {#each remotes as remote (remote.id)}
+  <div
+    class="grid"
+    class:solo={expanded !== null}
+    style:grid-template-columns={`repeat(${columns}, minmax(0, 1fr))`}
+  >
+    {#if expanded === null || expanded === SELF}
       <VideoTile
-        nickname={remote.nickname}
-        videoHandle={remote.videoHandle}
-        hasAudio={remote.audioHandle !== null}
-        label={remote.id}
-        speaking={remote.speaking}
+        nickname={store.session.nickname ?? 'me'}
+        localStream={store.previewStream}
+        localVideoId={store.previewVideoId}
+        localSource={store.media.videoSource}
+        hasAudio={store.previewAudio}
+        speaking={store.speaking}
+        expanded={expanded === SELF}
+        onExpand={(want) => (expandedId = want ? SELF : null)}
       />
+    {/if}
+    {#each remotes as remote (remote.id)}
+      {#if expanded === null || expanded === remote.id}
+        <VideoTile
+          nickname={remote.nickname}
+          videoHandle={remote.videoHandle}
+          hasAudio={remote.audioHandle !== null}
+          label={remote.id}
+          speaking={remote.speaking}
+          expanded={expanded === remote.id}
+          onExpand={(want) => (expandedId = want ? remote.id : null)}
+        />
+      {/if}
     {/each}
   </div>
 
@@ -275,6 +322,14 @@
        overflowing grid still scrolls from its first row. */
     align-content: safe center;
     min-height: 0;
+  }
+
+  /* One tile, given the whole area: the row has to be allowed to stretch, which
+     centred content would not do, and nothing should scroll since there is
+     nothing below the fold. */
+  .grid.solo {
+    align-content: stretch;
+    overflow: hidden;
   }
 
   .invite-banner {

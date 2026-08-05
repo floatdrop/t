@@ -46,6 +46,13 @@
     void (async () => {
       await refreshDevices();
       if (params.get('join') === '1') {
+        // Consumed, the way a delivered invite is: it says what to do on
+        // launch, not every time this screen appears. This screen is also where
+        // Leave returns to, and an unconsumed flag walked straight back into the
+        // room — leaving no way out of a call started with it.
+        params.delete('join');
+        const rest = params.toString();
+        history.replaceState(null, '', rest ? `${location.pathname}?${rest}` : location.pathname);
         // Wait for the backend socket: join() needs it to send anything.
         await waitForBackend(10000);
         await join();

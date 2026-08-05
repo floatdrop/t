@@ -5,6 +5,10 @@
    * element bound straight to the capture stream, which avoids decoding
    * our own feed just to show it back.
    */
+  import Maximize from '@lucide/svelte/icons/maximize';
+  import Minimize from '@lucide/svelte/icons/minimize';
+  import type { VideoSource } from '../lib/capture';
+  import { ICON_SIZE } from '../lib/icons';
   import { playback } from '../lib/playback';
 
   interface Props {
@@ -22,9 +26,19 @@
      * camera swap has nothing else to announce it.
      */
     localVideoId?: string;
+    /**
+     * What the local video is showing. A screen must not be treated like a
+     * face: flipping it makes text read backwards, and cropping it hides the
+     * edges of whatever is being shared.
+     */
+    localSource?: VideoSource;
     label?: string;
     /** Draws the voice-activity border. */
     speaking?: boolean;
+    /** True when this tile has the window to itself. */
+    expanded?: boolean;
+    /** Set to offer the expand control; called with the wanted state. */
+    onExpand?: (expanded: boolean) => void;
   }
 
   let {
@@ -33,8 +47,11 @@
     hasAudio = false,
     localStream = null,
     localVideoId = '',
+    localSource = 'camera',
     label = '',
     speaking = false,
+    expanded = false,
+    onExpand,
   }: Props = $props();
 
   let canvas = $state<HTMLCanvasElement | null>(null);
@@ -57,7 +74,13 @@
   const hasVideo = $derived(isLocal ? localVideoId !== '' : videoHandle !== null);
 </script>
 
-<div class="tile" class:local={isLocal} class:speaking>
+<div
+  class="tile"
+  class:local={isLocal}
+  class:speaking
+  class:screen={localSource === 'screen'}
+  class:expanded
+>
   {#if isLocal && hasVideo}
     <!-- Keyed on the camera, so switching one gives a fresh element to bind:
          the stream it is attached to is reused across the swap, and re-setting
@@ -75,6 +98,25 @@
       <div class="initial">{nickname.slice(0, 1).toUpperCase()}</div>
       <span>camera off</span>
     </div>
+  {/if}
+
+  {#if onExpand}
+    <!-- Kept out of the overlay so it stays in the corner opposite the name,
+         and shown on hover or while expanded — a control that got you into this
+         view has to be visible enough to get you back out. -->
+    <button
+      class="expand"
+      aria-label={expanded ? 'Restore the grid' : 'Expand to the whole window'}
+      aria-pressed={expanded}
+      title={expanded ? 'Restore the grid (Esc)' : 'Expand to the whole window'}
+      onclick={() => onExpand?.(!expanded)}
+    >
+      {#if expanded}
+        <Minimize size={ICON_SIZE} />
+      {:else}
+        <Maximize size={ICON_SIZE} />
+      {/if}
+    </button>
   {/if}
 
   <div class="overlay">
@@ -135,6 +177,52 @@
   /* Mirror only our own feed — remote participants must not be flipped. */
   .tile.local video {
     transform: scaleX(-1);
+  }
+
+  /* A shared screen is not a self-view. Unflipped so text reads the right way
+     round, and contained rather than cropped so the edges of what is being
+     shared are actually in shot. */
+  .tile.local.screen video {
+    transform: none;
+    object-fit: contain;
+  }
+
+  /* Expanded, the tile stops being a thumbnail in a grid: it takes the height
+     it is given rather than holding 16/9, and nothing is cropped, since seeing
+     all of what someone is showing is the entire point of expanding it. */
+  .tile.expanded {
+    aspect-ratio: auto;
+    height: 100%;
+  }
+
+  .tile.expanded :is(video, canvas) {
+    object-fit: contain;
+  }
+
+  /* Top-right, opposite the name. Faint until the tile is hovered so a wall of
+     tiles is not a wall of buttons. */
+  .expand {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    z-index: 1;
+    padding: 5px;
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--bg-sunken) 70%, transparent);
+    border-color: transparent;
+    color: var(--text-dim);
+    opacity: 0;
+    transition: opacity 120ms ease, color 120ms ease, border-color 120ms ease;
+  }
+
+  .tile:hover .expand,
+  .expand:focus-visible,
+  .tile.expanded .expand {
+    opacity: 1;
+  }
+
+  .expand:hover:not(:disabled) {
+    color: var(--text);
   }
 
   .placeholder {

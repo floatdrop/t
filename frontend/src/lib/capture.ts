@@ -388,9 +388,22 @@ export class Capture {
     }
 
     const actual = track.getSettings();
-    const width = actual.width ?? settings.width;
-    const height = actual.height ?? settings.height;
+    const grantedWidth = actual.width ?? settings.width;
+    const grantedHeight = actual.height ?? settings.height;
     const framerate = actual.frameRate ?? settings.framerate;
+
+    // H.264 is 4:2:0, so a chroma sample covers a 2x2 block of luma and both
+    // dimensions have to be even. A camera offers standard sizes that already
+    // are; a *window* is whatever size it happens to be, and sharing one of
+    // 1279x859 — the size of this app's own window — had the encoder refuse the
+    // configuration outright ("H264 only supports even sized frames") and close
+    // before a single frame went through.
+    const width = grantedWidth - (grantedWidth % 2);
+    const height = grantedHeight - (grantedHeight % 2);
+    // Rounding down means the frames no longer match what the encoder was
+    // configured for, so they get cropped by the odd row and column. Only when
+    // something was actually rounded: the camera path is left exactly as it was.
+    const crop = width !== grantedWidth || height !== grantedHeight;
 
     // A <video> element is the only source WebKit offers for constructing
     // VideoFrames from a live track.
@@ -403,15 +416,18 @@ export class Capture {
 
     const encoder = new VideoEncoder({
       output: (chunk, meta) => this.#onVideoChunk(chunk, meta),
-      error: (err) => bridge.report('ERROR', 'video encoder failed', { err: String(err) }),
-    });
-    bridge.report('INFO', 'video encoder configured', {
-      codec: VIDEO_CODEC,
-      source: settings.source,
-      size: `${width}x${height}`,
-      asked: `${settings.width}x${settings.height}`,
-      framerate: String(Math.round(framerate)),
-      bitrate: String(settings.bitrate),
+      // Carries what it was configured for: a failure here closes the encoder
+      // for good, and the configuration is the first thing worth suspecting —
+      // isConfigSupported is willing to approve sizes the platform then refuses
+      // to encode.
+      error: (err) =>
+        bridge.report('ERROR', 'video encoder failed', {
+          err: String(err),
+          source: settings.source,
+          size: `${width}x${height}`,
+          framerate: String(Math.round(framerate)),
+          bitrate: String(settings.bitrate),
+        }),
     });
     encoder.configure({
       codec: VIDEO_CODEC,
@@ -426,6 +442,20 @@ export class Capture {
       avc: { format: 'annexb' },
     });
     this.#videoEncoder = encoder;
+
+    // Reported after the call, not before it: this line used to be written
+    // first and so claimed a configuration that had not happened yet, which is
+    // exactly the wrong thing to find in a log when configuring is what failed.
+    bridge.report('INFO', 'video encoder configured', {
+      codec: VIDEO_CODEC,
+      source: settings.source,
+      size: `${width}x${height}`,
+      asked: `${settings.width}x${settings.height}`,
+      granted: `${grantedWidth}x${grantedHeight}`,
+      framerate: String(Math.round(framerate)),
+      bitrate: String(settings.bitrate),
+      state: encoder.state,
+    });
 
     // Declare the track now rather than on first output: the backend needs
     // it in its catalog before remote participants can subscribe, and
@@ -445,6 +475,22 @@ export class Capture {
     const keyEvery = Math.max(1, Math.round(framerate * KEYFRAME_INTERVAL_SEC));
     const pump = () => {
       if (!this.#videoRunning || !this.#videoEncoder || !this.#video) return;
+
+      // An encoder that is no longer configured has been closed by its own
+      // error callback, and closing is terminal — it cannot be reconfigured, so
+      // every frame from here would throw exactly the same way. Encoding into
+      // it anyway turned one failure into a warning per frame, thirty times a
+      // second, burying the line that said what had actually gone wrong.
+      if (this.#videoEncoder.state !== 'configured') {
+        bridge.report('ERROR', 'video encoder is not configured; stopping capture', {
+          state: this.#videoEncoder.state,
+          source: settings.source,
+          size: `${width}x${height}`,
+        });
+        this.#videoRunning = false;
+        return;
+      }
+
       // Dropping frames while the encoder is backed up keeps latency
       // bounded; queueing them would only push the backlog further out.
       if (this.#videoEncoder.encodeQueueSize > 2) {
@@ -454,6 +500,7 @@ export class Capture {
         try {
           frame = new VideoFrame(this.#video, {
             timestamp: Math.round(performance.now() * 1000 - this.#epochUs),
+            ...(crop ? { visibleRect: { x: 0, y: 0, width, height } } : {}),
           });
           const forced = this.#forceKeyFrame;
           this.#forceKeyFrame = false;

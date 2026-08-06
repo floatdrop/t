@@ -5,7 +5,9 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -123,6 +125,10 @@ func dialWebTransport(
 		}
 		target = u.HTTPSURL()
 	}
+	target, err := withDefaultPort(target)
+	if err != nil {
+		return nil, err
+	}
 
 	// webtransport.Transport fills in the h3 ALPN itself. The MOQT draft
 	// version is not signalled here: over WebTransport it is the tunnel,
@@ -150,6 +156,29 @@ func dialWebTransport(
 		return nil, fmt.Errorf("moqt handshake: %w", err)
 	}
 	return sess, nil
+}
+
+// withDefaultPort gives an https URL the explicit port that dialling needs.
+//
+// webtransport-go splits the authority into host and port and refuses one that
+// has no port, so "https://relay.example/" — which is how anyone would write a
+// relay reachable on the standard port, and how the welcome screen's own
+// default is written — failed before it was ever dialled. A moqt:// URI never
+// reaches here without a port because uri.Parse applies the same §3.1.1
+// default, which is the constant reused below rather than a second 443.
+func withDefaultPort(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("parse relay address %q: %w", raw, err)
+	}
+	if u.Port() != "" {
+		return raw, nil
+	}
+	if u.Hostname() == "" {
+		return "", fmt.Errorf("relay address %q names no host", raw)
+	}
+	u.Host = net.JoinHostPort(u.Hostname(), uri.DefaultPort)
+	return u.String(), nil
 }
 
 func isWebTransport(addr string) bool {

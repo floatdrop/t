@@ -96,22 +96,40 @@
       </button>
     </nav>
 
-    <!-- Only a close affordance is needed: the tabs themselves open the
-         drawer, so a separate "Debug" button would be a second control for
-         something the tab row already does. -->
-    {#if store.debugOpen}
-      <button
-        class="ghost close"
-        onclick={() => (store.debugOpen = false)}
-        aria-label="Close debug panel"
-        title="Close debug panel"
+    <div class="right">
+      <!-- The bridge to the Go half. It lives here rather than on the welcome
+           screen because it describes the app rather than the call being set
+           up, and this header is the one strip on screen in every state. The
+           label changes with it, so the colour is never the only thing saying
+           so. -->
+      <span
+        class="backend"
+        class:on={store.connected}
+        title={store.connected
+          ? 'Connected to the Go backend'
+          : 'The bridge to the Go backend is down — reconnecting'}
       >
-        <svg viewBox="0 0 14 14" aria-hidden="true">
-          <line x1="4" y1="4" x2="10" y2="10" />
-          <line x1="10" y1="4" x2="4" y2="10" />
-        </svg>
-      </button>
-    {/if}
+        <span class="dot" aria-hidden="true"></span>
+        {store.connected ? 'backend' : 'no backend'}
+      </span>
+
+      <!-- Only a close affordance is needed: the tabs themselves open the
+           drawer, so a separate "Debug" button would be a second control for
+           something the tab row already does. -->
+      {#if store.debugOpen}
+        <button
+          class="ghost close"
+          onclick={() => (store.debugOpen = false)}
+          aria-label="Close debug panel"
+          title="Close debug panel"
+        >
+          <svg viewBox="0 0 14 14" aria-hidden="true">
+            <line x1="4" y1="4" x2="10" y2="10" />
+            <line x1="10" y1="4" x2="4" y2="10" />
+          </svg>
+        </button>
+      {/if}
+    </div>
   </header>
 
   {#if store.debugOpen}
@@ -161,6 +179,38 @@
   nav {
     display: flex;
     gap: 2px;
+  }
+
+  .right {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .backend {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    color: var(--text-faint);
+    white-space: nowrap;
+  }
+
+  .backend.on {
+    color: var(--text-dim);
+  }
+
+  .backend .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex: none;
+    background: var(--err);
+    transition: background 200ms ease;
+  }
+
+  .backend.on .dot {
+    background: var(--ok);
   }
 
   .tab {

@@ -407,6 +407,19 @@ class Store {
     await this.refreshDevices();
   }
 
+  /**
+   * Releases whatever the preview opened.
+   *
+   * The welcome screen only shows a preview while its settings are expanded,
+   * and holding the camera open behind a collapsed panel would leave the
+   * recording light on for something nobody can see. join() reopens the devices
+   * if they are needed.
+   */
+  closePreview(): void {
+    capture.stop();
+    this.#syncPreview();
+  }
+
   /** Republishes what capture is holding as observable state. */
   #syncPreview(): void {
     this.previewStream = capture.stream;

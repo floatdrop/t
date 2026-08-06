@@ -1,20 +1,28 @@
 <script lang="ts">
   /**
-   * The welcome screen: relay address, room, nickname, and camera and
-   * microphone selection with a live preview.
+   * The welcome screen: a mark, a room, a name, and a way in.
    *
-   * Device labels are blank until capture permission has been granted, so
-   * this screen opens a stream as soon as it mounts — the preview doubles
-   * as the permission prompt and as the check that the devices work
-   * before anyone joins a call.
+   * Nothing here touches the camera or microphone on its own. Opening the app
+   * used to prompt for both immediately, in order to fill in device labels and
+   * show a preview — which meant the very first thing a new user saw was two
+   * OS permission dialogs, before they had expressed any interest in a call.
+   * The preview now lives behind the settings disclosure, so the prompt arrives
+   * either when someone goes looking for their devices or when they join, both
+   * of which are moments they asked for it.
    */
+  import Settings2 from '@lucide/svelte/icons/settings-2';
   import { onMount } from 'svelte';
+  import { ICON_SIZE } from '../lib/icons';
   import { parseInviteLink } from '../lib/invite';
   import { randomNickname, randomRoom } from '../lib/nickname';
   import { store } from '../lib/session.svelte';
+  import Logo from './Logo.svelte';
 
   const RELAY_KEY = 'tlmst.relay';
   const NICK_KEY = 'tlmst.nickname';
+
+  /** Where calls go unless told otherwise. */
+  const DEFAULT_RELAY = 'https://t.tel.yandex.net/';
 
   /**
    * Query parameters prefill the form, so a room can be shared as a link
@@ -23,10 +31,19 @@
    */
   const params = new URLSearchParams(location.search);
 
-  let relay = $state(params.get('relay') ?? localStorage.getItem(RELAY_KEY) ?? 'localhost:4433');
+  let relay = $state(params.get('relay') ?? localStorage.getItem(RELAY_KEY) ?? DEFAULT_RELAY);
   let room = $state(params.get('room') ?? '');
+  /**
+   * Whoever the system says is using the machine, unless something more
+   * deliberate has said otherwise: an explicit -nickname wins, then a name kept
+   * from a previous run, then the OS account (the `user` param, set by
+   * systemUserName in main.go), and only then something made up.
+   */
   let nickname = $state(
-    params.get('nickname') ?? localStorage.getItem(NICK_KEY) ?? randomNickname(),
+    params.get('nickname') ??
+      localStorage.getItem(NICK_KEY) ??
+      params.get('user') ??
+      randomNickname(),
   );
 
   // Device and encoder choices live in the store, shared with the in-call
@@ -34,29 +51,29 @@
   const cameras = $derived(store.devices.cameras);
   const microphones = $derived(store.devices.microphones);
 
+  let settingsOpen = $state(false);
   let previewEl = $state<HTMLVideoElement | null>(null);
   let permissionError = $state('');
   let joining = $state(false);
   let joinError = $state('');
 
   const connecting = $derived(store.session.phase === 'connecting');
+  const noDevices = $derived(!store.media.useVideo && !store.media.useAudio);
 
   onMount(() => {
     if (!room) room = randomRoom();
+    if (params.get('join') !== '1') return;
     void (async () => {
-      await refreshDevices();
-      if (params.get('join') === '1') {
-        // Consumed, the way a delivered invite is: it says what to do on
-        // launch, not every time this screen appears. This screen is also where
-        // Leave returns to, and an unconsumed flag walked straight back into the
-        // room — leaving no way out of a call started with it.
-        params.delete('join');
-        const rest = params.toString();
-        history.replaceState(null, '', rest ? `${location.pathname}?${rest}` : location.pathname);
-        // Wait for the backend socket: join() needs it to send anything.
-        await waitForBackend(10000);
-        await join();
-      }
+      // Consumed, the way a delivered invite is: it says what to do on
+      // launch, not every time this screen appears. This screen is also where
+      // Leave returns to, and an unconsumed flag walked straight back into the
+      // room — leaving no way out of a call started with it.
+      params.delete('join');
+      const rest = params.toString();
+      history.replaceState(null, '', rest ? `${location.pathname}?${rest}` : location.pathname);
+      // Wait for the backend socket: join() needs it to send anything.
+      await waitForBackend(10000);
+      await join();
     })();
   });
 
@@ -119,10 +136,28 @@
   const reopen = refreshDevices;
 
   /**
+   * Shows or hides the settings, opening the devices on the way in and
+   * releasing them on the way out.
+   *
+   * Expanding this is the request for device access — it is where the labels
+   * and the preview are, and neither exists without it.
+   */
+  async function toggleSettings(): Promise<void> {
+    settingsOpen = !settingsOpen;
+    if (settingsOpen) await refreshDevices();
+    else store.closePreview();
+  }
+
+  /**
    * Fills relay and room from a pasted invite link.
    *
    * Bound to both fields because either is a plausible place to paste a link
    * that carries both values, and neither would accept it as a literal value.
+   *
+   * The settings are deliberately left closed, even though the relay inside
+   * them just changed: expanding them is what opens the camera, and a paste is
+   * no reason to prompt anyone for it. The hint under the room says what
+   * happened instead.
    */
   function onPaste(event: ClipboardEvent): void {
     const text = event.clipboardData?.getData('text') ?? '';
@@ -151,165 +186,221 @@
       joining = false;
     }
   }
+
+  /**
+   * What the button says, which is also the only place the reasons it cannot be
+   * pressed are visible. The backend indicator moved to the debug drawer, so
+   * without this a missing backend would leave a dead button and no
+   * explanation.
+   */
+  const action = $derived.by(() => {
+    if (joining || connecting) return 'Connecting…';
+    if (!store.connected) return 'Waiting for the backend…';
+    if (noDevices) return 'Turn on a camera or microphone';
+    return 'Join room';
+  });
 </script>
 
 <div class="welcome">
-  <div class="card">
-    <header>
+  <form
+    class="panel"
+    class:configuring={settingsOpen}
+    onsubmit={(ev) => {
+      ev.preventDefault();
+      void join();
+    }}
+  >
+    <div class="hero">
+      <Logo size={72} />
       <h1>tlmst</h1>
       <p>Teleconferencing over Media over QUIC</p>
-    </header>
+    </div>
 
-    <div class="preview">
-      {#if store.previewVideo}
-        <!-- Keyed on the camera for the reason VideoTile is: the stream is
-             reused across a device switch, so only a fresh element is certain
-             to show the new one. -->
-        {#key store.previewVideoId}
-          <!-- svelte-ignore a11y_media_has_caption -->
-          <video bind:this={previewEl} autoplay muted playsinline></video>
-        {/key}
-      {:else}
-        <div class="preview-empty">
-          {#if permissionError}
-            <span class="err">{permissionError}</span>
-          {:else if !store.media.useVideo}
-            <span>Camera off</span>
-          {:else}
-            <span>Starting camera…</span>
-          {/if}
-        </div>
+    <div class="field">
+      <label for="room">Room</label>
+      <div class="with-button">
+        <input id="room" bind:value={room} onpaste={onPaste} spellcheck="false" />
+        <button
+          type="button"
+          class="ghost"
+          onclick={() => (room = randomRoom())}
+          title="New room"
+        >↻</button>
+      </div>
+      {#if invitePasted}
+        <p class="hint ok-hint">Invite link applied — relay and room filled in.</p>
       {/if}
     </div>
 
-    <div class="fields">
-      <div class="field">
-        <label for="relay">Relay address</label>
-        <input
-          id="relay"
-          bind:value={relay}
-          onpaste={onPaste}
-          placeholder="localhost:4433"
-          spellcheck="false"
-        />
-        <p class="hint">
-          {#if invitePasted}
-            <span class="ok-hint">Invite link applied — relay and room filled in.</span>
-          {:else}
-            host:port, moqt://…, or https://… for WebTransport — or paste an invite link
-          {/if}
-        </p>
+    <div class="field">
+      <label for="nick">Your name</label>
+      <div class="with-button">
+        <input id="nick" bind:value={nickname} spellcheck="false" />
+        <button
+          type="button"
+          class="ghost"
+          onclick={() => (nickname = randomNickname())}
+          title="New nickname"
+        >↻</button>
       </div>
-
-      <div class="row">
-        <div class="field">
-          <label for="room">Room</label>
-          <div class="with-button">
-            <input id="room" bind:value={room} onpaste={onPaste} spellcheck="false" />
-            <button class="ghost" onclick={() => (room = randomRoom())} title="New room">↻</button>
-          </div>
-        </div>
-        <div class="field">
-          <label for="nick">Nickname</label>
-          <div class="with-button">
-            <input id="nick" bind:value={nickname} spellcheck="false" />
-            <button class="ghost" onclick={() => (nickname = randomNickname())} title="New nickname">↻</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="row">
-        <div class="field">
-          <label for="cam">
-            <input
-              type="checkbox"
-              class="inline"
-              bind:checked={store.media.useVideo}
-              onchange={reopen}
-            /> Camera
-          </label>
-          <select id="cam" bind:value={store.media.cameraId} onchange={reopen} disabled={!store.media.useVideo}>
-            {#each cameras as cam (cam.deviceId)}
-              <option value={cam.deviceId}>{cam.label || 'Camera'}</option>
-            {/each}
-          </select>
-        </div>
-        <div class="field">
-          <label for="mic">
-            <input
-              type="checkbox"
-              class="inline"
-              bind:checked={store.media.useAudio}
-              onchange={reopen}
-            /> Microphone
-          </label>
-          <select id="mic" bind:value={store.media.microphoneId} onchange={reopen} disabled={!store.media.useAudio}>
-            {#each microphones as mic (mic.deviceId)}
-              <option value={mic.deviceId}>{mic.label || 'Microphone'}</option>
-            {/each}
-          </select>
-        </div>
-      </div>
-
-      <div class="row">
-        <div class="field">
-          <label for="res">Resolution</label>
-          <select id="res" bind:value={store.media.resolution} onchange={reopen} disabled={!store.media.useVideo}>
-            <option value="640x360">640 × 360</option>
-            <option value="854x480">854 × 480</option>
-            <option value="1280x720">1280 × 720</option>
-            <option value="1920x1080">1920 × 1080</option>
-          </select>
-        </div>
-        <div class="field">
-          <label for="vbr">Video bitrate</label>
-          <select id="vbr" bind:value={store.media.videoBitrate} disabled={!store.media.useVideo}>
-            <option value={500_000}>500 kbps</option>
-            <option value={1_000_000}>1 Mbps</option>
-            <option value={1_500_000}>1.5 Mbps</option>
-            <option value={3_000_000}>3 Mbps</option>
-          </select>
-        </div>
-        <div class="field">
-          <label for="abr">Audio bitrate</label>
-          <select id="abr" bind:value={store.media.audioBitrate} disabled={!store.media.useAudio}>
-            <option value={16_000}>16 kbps</option>
-            <option value={32_000}>32 kbps</option>
-            <option value={64_000}>64 kbps</option>
-          </select>
-        </div>
-      </div>
-
-      <label class="toggle">
-        <input type="checkbox" bind:checked={store.media.denoise} disabled={!store.media.useAudio} />
-        <span>
-          Noise suppression
-          <em>
-            RNNoise, on top of the platform's own echo cancellation and
-            suppression
-          </em>
-        </span>
-      </label>
     </div>
 
     {#if joinError}
       <p class="error-box">{joinError}</p>
     {/if}
 
-    <footer>
-      <span class="status">
-        <span class="dot" class:on={store.connected}></span>
-        {store.connected ? 'backend connected' : 'waiting for backend…'}
-      </span>
-      <button
-        class="primary"
-        onclick={join}
-        disabled={joining || connecting || !store.connected || (!store.media.useVideo && !store.media.useAudio)}
-      >
-        {joining || connecting ? 'Connecting…' : 'Join room'}
-      </button>
-    </footer>
-  </div>
+    <button
+      type="submit"
+      class="primary join"
+      disabled={joining || connecting || !store.connected || noDevices}
+    >
+      {action}
+    </button>
+
+    <button
+      type="button"
+      class="ghost disclosure"
+      onclick={toggleSettings}
+      aria-expanded={settingsOpen}
+      aria-controls="welcome-settings"
+    >
+      <Settings2 size={ICON_SIZE} />
+      Settings
+      <span class="caret" aria-hidden="true">{settingsOpen ? '▴' : '▾'}</span>
+    </button>
+
+    {#if settingsOpen}
+      <div class="settings" id="welcome-settings">
+        <div class="preview">
+          {#if store.previewVideo}
+            <!-- Keyed on the camera for the reason VideoTile is: the stream is
+                 reused across a device switch, so only a fresh element is certain
+                 to show the new one. -->
+            {#key store.previewVideoId}
+              <!-- svelte-ignore a11y_media_has_caption -->
+              <video bind:this={previewEl} autoplay muted playsinline></video>
+            {/key}
+          {:else}
+            <div class="preview-empty">
+              {#if permissionError}
+                <span class="err">{permissionError}</span>
+              {:else if !store.media.useVideo}
+                <span>Camera off</span>
+              {:else}
+                <span>Starting camera…</span>
+              {/if}
+            </div>
+          {/if}
+        </div>
+
+        <div class="field">
+          <label for="relay">Relay address</label>
+          <input
+            id="relay"
+            bind:value={relay}
+            onpaste={onPaste}
+            placeholder={DEFAULT_RELAY}
+            spellcheck="false"
+          />
+          <p class="hint">
+            host:port, moqt://…, or https://… for WebTransport — or paste an invite link
+          </p>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label for="cam">
+              <input
+                type="checkbox"
+                class="inline"
+                bind:checked={store.media.useVideo}
+                onchange={reopen}
+              /> Camera
+            </label>
+            <select
+              id="cam"
+              bind:value={store.media.cameraId}
+              onchange={reopen}
+              disabled={!store.media.useVideo}
+            >
+              {#each cameras as cam (cam.deviceId)}
+                <option value={cam.deviceId}>{cam.label || 'Camera'}</option>
+              {/each}
+            </select>
+          </div>
+          <div class="field">
+            <label for="mic">
+              <input
+                type="checkbox"
+                class="inline"
+                bind:checked={store.media.useAudio}
+                onchange={reopen}
+              /> Microphone
+            </label>
+            <select
+              id="mic"
+              bind:value={store.media.microphoneId}
+              onchange={reopen}
+              disabled={!store.media.useAudio}
+            >
+              {#each microphones as mic (mic.deviceId)}
+                <option value={mic.deviceId}>{mic.label || 'Microphone'}</option>
+              {/each}
+            </select>
+          </div>
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label for="res">Resolution</label>
+            <select
+              id="res"
+              bind:value={store.media.resolution}
+              onchange={reopen}
+              disabled={!store.media.useVideo}
+            >
+              <option value="640x360">640 × 360</option>
+              <option value="854x480">854 × 480</option>
+              <option value="1280x720">1280 × 720</option>
+              <option value="1920x1080">1920 × 1080</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="vbr">Video bitrate</label>
+            <select id="vbr" bind:value={store.media.videoBitrate} disabled={!store.media.useVideo}>
+              <option value={500_000}>500 kbps</option>
+              <option value={1_000_000}>1 Mbps</option>
+              <option value={1_500_000}>1.5 Mbps</option>
+              <option value={3_000_000}>3 Mbps</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="abr">Audio bitrate</label>
+            <select id="abr" bind:value={store.media.audioBitrate} disabled={!store.media.useAudio}>
+              <option value={16_000}>16 kbps</option>
+              <option value={32_000}>32 kbps</option>
+              <option value={64_000}>64 kbps</option>
+            </select>
+          </div>
+        </div>
+
+        <label class="toggle">
+          <input
+            type="checkbox"
+            bind:checked={store.media.denoise}
+            disabled={!store.media.useAudio}
+          />
+          <span>
+            Noise suppression
+            <em>
+              RNNoise, on top of the platform's own echo cancellation and
+              suppression
+            </em>
+          </span>
+        </label>
+      </div>
+    {/if}
+  </form>
 </div>
 
 <style>
@@ -317,21 +408,35 @@
     flex: 1;
     display: grid;
     place-items: center;
-    padding: 24px;
+    padding: 18px;
     overflow-y: auto;
   }
 
-  .card {
+  /* No card around any of this. The screen has one thing to say, and a border
+     drawn around it only competes with the mark for attention. */
+  .panel {
     width: 100%;
-    max-width: 640px;
-    background: var(--bg-raised);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 18px 20px;
+    max-width: 360px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    /* Narrow while closed, because the screen has one thing to say. Wider once
+       the settings are out, or eight fields stacked in a 360px column run off
+       the bottom of the window. */
+    transition: max-width 160ms ease;
   }
 
-  header {
-    margin-bottom: 12px;
+  .panel.configuring {
+    max-width: 460px;
+  }
+
+  .hero {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: 8px;
+    margin-bottom: 4px;
   }
 
   h1 {
@@ -340,23 +445,64 @@
     letter-spacing: -0.01em;
   }
 
-  header p {
-    margin: 2px 0 0;
+  .hero p {
+    margin: -6px 0 0;
     color: var(--text-dim);
     font-size: 13px;
   }
 
+  .field {
+    min-width: 0;
+  }
+
+  .row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: 12px;
+  }
+
+  .with-button {
+    display: flex;
+    gap: 4px;
+  }
+
+  .join {
+    margin-top: 2px;
+  }
+
+  /* Quiet by design: it is the way to the things most people never need to
+     change, and should not compete with the button next to it. */
+  .disclosure {
+    align-self: center;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+
+  .caret {
+    font-size: 10px;
+    line-height: 1;
+  }
+
+  .settings {
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+  }
+
   .preview {
     aspect-ratio: 16 / 9;
-    /* Cap the height so the card as a whole clears the default window at
-       any width: the preview is the one element that would otherwise grow
-       with it and push the form into a scroll. */
-    max-height: 232px;
+    /* Capped so the expanded panel still clears the default window — this is a
+       check that the camera works, not a stage to perform on. Capping the
+       height of a 16/9 box narrows it, so it is centred too: left-aligned and
+       narrower than every field below it just reads as broken. */
+    max-height: 140px;
+    align-self: center;
     background: var(--bg-sunken);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
     overflow: hidden;
-    margin-bottom: 12px;
   }
 
   .preview video {
@@ -376,27 +522,6 @@
     font-size: 13px;
     text-align: center;
     padding: 12px;
-  }
-
-  .fields {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-
-  .row {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-    gap: 12px;
-  }
-
-  .field {
-    min-width: 0;
-  }
-
-  .with-button {
-    display: flex;
-    gap: 4px;
   }
 
   .hint {
@@ -442,39 +567,12 @@
   }
 
   .error-box {
-    margin: 14px 0 0;
+    margin: 0;
     padding: 8px 10px;
     border-radius: var(--radius-sm);
     background: color-mix(in srgb, var(--err) 12%, transparent);
     border: 1px solid color-mix(in srgb, var(--err) 40%, transparent);
     color: var(--err);
     font-size: 12px;
-  }
-
-  footer {
-    margin-top: 14px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-  }
-
-  .status {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    font-size: 12px;
-    color: var(--text-dim);
-  }
-
-  .dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--text-faint);
-  }
-
-  .dot.on {
-    background: var(--ok);
   }
 </style>

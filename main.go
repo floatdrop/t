@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/user"
 	"strings"
 	"time"
 
@@ -124,7 +125,15 @@ func main() {
 		MinWidth:         900,
 		MinHeight:        600,
 		BackgroundColour: application.NewRGB(11, 13, 18),
-		URL:              startURL(*relayFlag, *roomFlag, *nickFlag, *autoJoin, *debugOpen, *debugTab),
+		URL: startURL(launch{
+			relay:    *relayFlag,
+			room:     *roomFlag,
+			nickname: *nickFlag,
+			user:     systemUserName(),
+			join:     *autoJoin,
+			debug:    *debugOpen,
+			debugTab: *debugTab,
+		}),
 		// The window renders only this app's own bundled frontend, so a
 		// capture request can only have come from us — there is no
 		// third-party page whose request would need scrutiny. Granting
@@ -153,32 +162,72 @@ func main() {
 	}
 }
 
-// startURL turns the launch flags into the query string the welcome screen
-// reads. Empty flags yield a bare "/", which is the normal interactive case.
-func startURL(relay, room, nickname string, join, debug bool, debugTab string) string {
+// launch is what the welcome screen is told at startup: the flags that
+// prefill its form, plus the system's own idea of who is using it.
+//
+// A struct rather than a parameter list because two of these are adjacent
+// strings that mean different things — transposing nickname and user would
+// compile and quietly change behaviour.
+type launch struct {
+	relay    string
+	room     string
+	nickname string
+	// user is the OS account name, which the nickname field falls back to when
+	// nothing else has named the user. Kept separate from nickname so that an
+	// explicit -nickname, and a nickname saved from a previous run, both still
+	// take precedence over it.
+	user     string
+	join     bool
+	debug    bool
+	debugTab string
+}
+
+// startURL turns the launch values into the query string the welcome screen
+// reads. Empty values are omitted, so a bare interactive start with no system
+// account name yields "/".
+func startURL(l launch) string {
 	q := url.Values{}
-	if relay != "" {
-		q.Set("relay", relay)
+	if l.relay != "" {
+		q.Set("relay", l.relay)
 	}
-	if room != "" {
-		q.Set("room", room)
+	if l.room != "" {
+		q.Set("room", l.room)
 	}
-	if nickname != "" {
-		q.Set("nickname", nickname)
+	if l.nickname != "" {
+		q.Set("nickname", l.nickname)
 	}
-	if join {
+	if l.user != "" {
+		q.Set("user", l.user)
+	}
+	if l.join {
 		q.Set("join", "1")
 	}
-	if debug {
+	if l.debug {
 		q.Set("debug", "1")
 	}
-	if debugTab != "" {
-		q.Set("debugTab", debugTab)
+	if l.debugTab != "" {
+		q.Set("debugTab", l.debugTab)
 	}
 	if len(q) == 0 {
 		return "/"
 	}
 	return "/?" + q.Encode()
+}
+
+// systemUserName is the OS account name, for the welcome screen to offer as a
+// nickname. Empty when the account cannot be determined, which is not worth
+// failing over: the frontend falls back to a generated name.
+func systemUserName() string {
+	u, err := user.Current()
+	if err != nil {
+		return ""
+	}
+	name := u.Username
+	// Windows reports DOMAIN\user, and the domain is not part of anyone's name.
+	if i := strings.LastIndex(name, `\`); i >= 0 {
+		name = name[i+1:]
+	}
+	return strings.TrimSpace(name)
 }
 
 // parseInviteURL pulls the relay and room out of an invite link —

@@ -296,6 +296,45 @@ see them jump backwards — while the audio clock offset is deliberately taken
 again, because the new `AudioContext` starts its own clock from zero.
 `TestTrackReconfiguration` in `internal/conf` covers that wire behaviour.
 
+## Version and updates
+
+`build/config.yml` holds the version, and the binary reads the same field:
+main.go embeds the file and `internal/version` scans it, so a build reports what
+it was packaged as without a second copy of the number to keep in step. A build
+whose version cannot be read calls itself `dev`, which deliberately does not
+compare against anything — an unpackaged build is neither newer nor older than a
+release. `TestParseRealConfig` reads the actual file, so a release that renames
+or moves the field fails there rather than in the welcome screen of a shipped
+build.
+
+The welcome screen shows it under the mark, and the debug drawer's **Session**
+card repeats it. Every participant's version also travels in their catalog, as a
+`tlmstVersion` root field beside the nickname — the same §5.1 producer extension,
+for the same reason: it is the one thing every participant already reads about
+every other participant. The drawer's **Participants** table lists the room's
+builds side by side, ourselves first, which is the view that answers "is it just
+me?". A peer on a build from before this existed publishes no field and shows an
+em dash, which is itself the answer.
+
+On startup the backend asks GitHub once for the newest release. If it is newer,
+the welcome screen offers a button that opens the releases page. Three things
+that shape it:
+
+- **The check runs in Go, not the WebView.** The frontend is served from a
+  custom scheme, so a `fetch` to `api.github.com` is a cross-origin request the
+  WebView is under no obligation to allow.
+- **It is quiet.** Failure logs at debug, not warn: being unable to reach GitHub
+  is not a fault in this app, and a warning every launch for something nobody
+  asked for teaches people to ignore warnings. Prereleases and drafts are never
+  offered, and nothing blocks on the answer.
+- **The link is opened by the OS, and only if we produced it.** Navigating the
+  WebView to a web page would replace the call with it, and `target="_blank"`
+  generally does nothing here — so the frontend asks the backend, which calls
+  Wails' `Browser.OpenURL`. The backend accepts only the releases page or the
+  release it is currently offering: the bridge listens on loopback, which any
+  local process can reach, and "open an arbitrary URL" is a capability worth
+  nobody having.
+
 ## Losing the relay
 
 The relay going away is treated as a normal event, not a crash. `Room` watches

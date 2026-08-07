@@ -91,6 +91,8 @@ type ClientMessage struct {
 	// Untrack names a kind ("video"/"audio") the frontend has stopped
 	// publishing, so the catalog stops advertising it.
 	Untrack string `json:"untrack,omitempty"`
+	// OpenURL is a link to hand to the OS browser. See MsgOpenURL.
+	OpenURL string `json:"openUrl,omitempty"`
 }
 
 // Client message types.
@@ -106,6 +108,10 @@ const (
 	// subscriber holding a decoder and showing its last frame forever — so
 	// stopping has to be said, not merely done.
 	MsgUntrack = "untrack"
+	// MsgOpenURL hands a link to the OS. The WebView must not navigate to it
+	// itself — that would replace the app with a web page and there would be
+	// no way back — and a target=_blank anchor generally does nothing here.
+	MsgOpenURL = "openUrl"
 )
 
 // ClientReport is something the frontend wants in the shared log: a
@@ -171,7 +177,16 @@ type ServerMessage struct {
 	Log          *LogEntry      `json:"log,omitempty"`
 	Metrics      *Metrics       `json:"metrics,omitempty"`
 	Invite       *Invite        `json:"invite,omitempty"`
+	Update       *Update        `json:"update,omitempty"`
 	Error        string         `json:"error,omitempty"`
+}
+
+// Update is a released version newer than the one running. Sent at most once
+// per run, and only when there is something to offer — the frontend shows a
+// button when it arrives and nothing at all when it does not.
+type Update struct {
+	Version string `json:"version"`
+	URL     string `json:"url"`
 }
 
 // Invite is a relay and room the app was asked to join from outside — an
@@ -191,6 +206,7 @@ const (
 	MsgLog          = "log"
 	MsgMetrics      = "metrics"
 	MsgInvite       = "invite"
+	MsgUpdate       = "update"
 	MsgError        = "error"
 	// MsgRequestKeyFrame asks the frontend's video encoder for an immediate
 	// keyframe. A fresh session has no open group, and writeVideo will not
@@ -228,6 +244,9 @@ type SessionState struct {
 type Participant struct {
 	ID       string `json:"id"`
 	Nickname string `json:"nickname"`
+	// Version is the build they are running, or empty from a peer old
+	// enough not to publish one.
+	Version  string `json:"version,omitempty"`
 	HasVideo bool   `json:"hasVideo"`
 	HasAudio bool   `json:"hasAudio"`
 }
@@ -311,6 +330,12 @@ type TrackMetrics struct {
 type Endpoint struct {
 	URL   string `json:"url"`
 	Token string `json:"token"`
+	// Version is the build the backend is running, which is also the build
+	// the frontend is part of — they ship in one binary. Carried here rather
+	// than in a control message because the welcome screen wants to show it
+	// before any session exists, and this descriptor is already the first
+	// thing the frontend fetches.
+	Version string `json:"version,omitempty"`
 }
 
 func (e Endpoint) JSON() []byte {

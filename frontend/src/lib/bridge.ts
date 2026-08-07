@@ -37,6 +37,16 @@ export class Bridge {
   /** True while the socket is open. */
   connected = false;
 
+  /**
+   * The build this app was packaged as, from the endpoint descriptor.
+   *
+   * Empty until the descriptor has been fetched, which is the first thing the
+   * connection does. Kept here rather than in the store because it belongs to
+   * the binary rather than to any session — it does not change, and it is the
+   * same answer whether or not a room was ever joined.
+   */
+  version = '';
+
   /** Opens the connection and keeps it open until close(). */
   async start(): Promise<void> {
     this.#closed = false;
@@ -107,6 +117,10 @@ export class Bridge {
         const res = await fetch('/__bridge', { cache: 'no-store' });
         if (!res.ok) throw new Error(`bridge endpoint: HTTP ${res.status}`);
         this.#endpoint = (await res.json()) as Endpoint;
+        // Published as soon as it is known, which is before any session
+        // exists — the welcome screen shows the version without waiting for
+        // a room.
+        this.version = this.#endpoint.version ?? '';
       }
       const url = `${this.#endpoint.url}?token=${encodeURIComponent(this.#endpoint.token)}`;
       const ws = new WebSocket(url);

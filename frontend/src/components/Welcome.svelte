@@ -10,6 +10,7 @@
    * either when someone goes looking for their devices or when they join, both
    * of which are moments they asked for it.
    */
+  import Download from '@lucide/svelte/icons/download';
   import Settings2 from '@lucide/svelte/icons/settings-2';
   import { onMount } from 'svelte';
   import { RESOLUTION_AUTO, VIDEO_LADDER } from '../lib/capture';
@@ -215,7 +216,28 @@
       <Logo size={72} />
       <h1>tlmst</h1>
       <p>Teleconferencing over Media over QUIC</p>
+      <!-- Under the mark rather than tucked in a corner: the first thing
+           anyone is asked for when a call misbehaves is which build they are
+           on, and it should not take a hunt to answer. -->
+      {#if store.version}
+        <p class="version mono">{store.version}</p>
+      {/if}
     </div>
+
+    <!-- Only when there is something to say. The check is quiet by design, so
+         this is absent on every run where the app is current, unreachable, or
+         not a released build at all. -->
+    {#if store.update}
+      <button
+        type="button"
+        class="ghost update"
+        onclick={() => store.openReleasePage()}
+        title="Open the releases page on GitHub"
+      >
+        <Download size={ICON_SIZE} />
+        Version {store.update.version} is available
+      </button>
+    {/if}
 
     <div class="field">
       <label for="room">Room</label>
@@ -527,6 +549,20 @@
     font-size: 13px;
     text-align: center;
     padding: 12px;
+  }
+
+  /* Quiet: it is reference information, not part of the flow into a call. */
+  .version {
+    margin: 2px 0 0;
+    font-size: 11px;
+    color: var(--text-faint);
+  }
+
+  /* Offered, not pressed. An accent border says there is something new
+     without competing with Join for the eye. */
+  .update {
+    border-color: var(--accent);
+    color: var(--text);
   }
 
   .hint {

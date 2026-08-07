@@ -23,11 +23,44 @@
       <div><dt>Room</dt><dd>{store.session.room || '—'}</dd></div>
       <div><dt>Participant</dt><dd>{store.session.id || '—'}</dd></div>
       <div><dt>Nickname</dt><dd>{store.session.nickname || '—'}</dd></div>
+      <div><dt>Version</dt><dd>{store.version || '—'}</dd></div>
       <div><dt>Remote peers</dt><dd>{store.participants.length}</dd></div>
     </dl>
     {#if store.session.detail}
       <p class="detail">{store.session.detail}</p>
     {/if}
+  </section>
+
+  <!-- Everyone's build, side by side, us included. This is the view that
+       answers "is it just me?" — a room where one person is three releases
+       behind explains a great deal that is otherwise mystifying, and it
+       cannot be seen one tooltip at a time. Our own row is what the others
+       are being compared against, so it is first and always present. -->
+  <section>
+    <h3>Participants</h3>
+    <table>
+      <thead>
+        <tr>
+          <th scope="col">Participant</th>
+          <th scope="col">ID</th>
+          <th scope="col" class="num">Version</th>
+        </tr>
+      </thead>
+      <tbody>
+        <!-- Our own row keys on a name no participant can have: ids are hex,
+             and ours is empty until a room is joined. -->
+        {#each store.roster as peer (peer.self ? 'self' : peer.id)}
+          <tr class:self={peer.self}>
+            <td>{peer.nickname}{peer.self ? ' (you)' : ''}</td>
+            <td class="mono">{peer.id || '—'}</td>
+            <!-- An em dash rather than a guess: a peer that publishes no
+                 version is on a build from before this existed, which is
+                 itself the answer. -->
+            <td class="num mono">{peer.version || '—'}</td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
   </section>
 
   <section>
@@ -263,6 +296,13 @@
   /* A section that needs the drawer's full width rather than one grid cell. */
   .wide {
     grid-column: 1 / -1;
+  }
+
+  /* Our own row in the roster: the one everything else is compared against,
+     so it is marked rather than left to be found by reading the names. */
+  tr.self td {
+    color: var(--text);
+    font-weight: 500;
   }
 
   .scroll-x {

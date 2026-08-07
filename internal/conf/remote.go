@@ -59,6 +59,7 @@ type remote struct {
 	catalogGroup uint64
 	hasCatalog   bool
 	nickname     string
+	version      string
 	video        *remoteTrack
 	audio        *remoteTrack
 	// closed stops late catalog updates from resurrecting subscriptions
@@ -227,6 +228,7 @@ func (r *remote) onCatalog(group uint64, payload []byte) {
 	r.catalogGroup, r.hasCatalog = group, true
 	if cat.Nickname != "" {
 		r.nickname = cat.Nickname
+		r.version = cat.Version
 	}
 	r.mu.Unlock()
 
@@ -445,6 +447,7 @@ func (r *remote) participant() bridge.Participant {
 	return bridge.Participant{
 		ID:       r.id,
 		Nickname: r.nickname,
+		Version:  r.version,
 		HasVideo: r.video != nil,
 		HasAudio: r.audio != nil,
 	}

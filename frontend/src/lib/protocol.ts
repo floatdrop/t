@@ -132,6 +132,9 @@ export type ClientMessage =
   | { type: 'stats'; stats: ClientStats }
   | { type: 'logLevel'; logLevel: string }
   | { type: 'untrack'; untrack: 'video' | 'audio' }
+  // Handing a link to the OS is the backend's job: navigating this WebView to
+  // a web page would replace the app with it, with no way back to the call.
+  | { type: 'openUrl'; openUrl: string }
   | { type: 'report'; report: ClientReport };
 
 /**
@@ -153,8 +156,16 @@ export interface SessionState {
 export interface Participant {
   id: string;
   nickname: string;
+  /** The build they are running, absent from a peer old enough not to say. */
+  version?: string;
   hasVideo: boolean;
   hasAudio: boolean;
+}
+
+/** A released version newer than the one running. */
+export interface UpdateInfo {
+  version: string;
+  url: string;
 }
 
 export interface RemoteTrack {
@@ -228,6 +239,7 @@ export type ServerMessage =
   | { type: 'participants'; participants: Participant[] }
   | { type: 'remoteTrack'; track: RemoteTrack }
   | { type: 'trackGone'; trackGone: RemoteTrackID }
+  | { type: 'update'; update: UpdateInfo }
   | { type: 'log'; log: LogEntry }
   | { type: 'metrics'; metrics: Metrics }
   | { type: 'error'; error: string };
@@ -236,6 +248,8 @@ export type ServerMessage =
 export interface Endpoint {
   url: string;
   token: string;
+  /** The build the backend — and so this frontend — was packaged as. */
+  version?: string;
 }
 
 /**

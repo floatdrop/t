@@ -24,6 +24,7 @@ import { autoVideoRung } from './layout';
 import { playback, type PlaybackStats } from './playback';
 import type {
   InviteMessage,
+  UpdateInfo,
   LogEntry,
   Metrics,
   Participant,
@@ -88,6 +89,8 @@ export interface MediaSettings {
 export interface RemoteView {
   id: string;
   nickname: string;
+  /** The build they are running, empty from a peer that does not publish one. */
+  version: string;
   videoHandle: number | null;
   audioHandle: number | null;
   /** True while they are speaking, for the tile's border. */
@@ -200,6 +203,24 @@ class Store {
    */
   pendingInvite = $state<InviteMessage | null>(null);
 
+  /**
+   * A release newer than the one running, once the backend has found one.
+   *
+   * Null is the normal state and the normal outcome: the check runs once at
+   * startup and says nothing at all unless there is something to offer.
+   */
+  update = $state<UpdateInfo | null>(null);
+
+  /**
+   * The build this app is, for the welcome screen and the debug panel.
+   *
+   * State rather than a read through to the bridge: the version arrives with
+   * the endpoint descriptor, which is fetched asynchronously as the connection
+   * opens, so a plain property read renders as empty once and never corrects
+   * itself. Set from the status callback, which fires after the fetch.
+   */
+  version = $state('');
+
   /** True while the local microphone is picking up speech. */
   speaking = $state(false);
   /** Remote participant IDs currently speaking. */
@@ -226,6 +247,7 @@ class Store {
       return {
         id: p.id,
         nickname: p.nickname || video?.nickname || audio?.nickname || p.id,
+        version: p.version ?? '',
         videoHandle: video?.handle ?? null,
         audioHandle: audio?.handle ?? null,
         speaking: this.speakingPeers.includes(p.id),
@@ -233,10 +255,36 @@ class Store {
     });
   }
 
+  /**
+   * Everyone in the room with a version to report, us first.
+   *
+   * Ourselves included because the question this answers is "who is on what",
+   * and an answer that omits the person asking is one subtraction away from
+   * useless — comparing your own build against the room is the entire point.
+   */
+  get roster(): { id: string; nickname: string; version: string; self: boolean }[] {
+    return [
+      {
+        id: this.session.id ?? '',
+        nickname: this.session.nickname || 'me',
+        version: this.version,
+        self: true,
+      },
+      ...this.remotes.map((r) => ({
+        id: r.id,
+        nickname: r.nickname,
+        version: r.version,
+        self: false,
+      })),
+    ];
+  }
+
   /** Wires the bridge into this store. Call once at startup. */
   attach(): void {
     bridge.onStatus((connected) => {
       this.connected = connected;
+      // The descriptor has been fetched by the time the socket is open.
+      if (connected && bridge.version) this.version = bridge.version;
       if (!connected) {
         // The backend is gone: its session and every decoder that fed
         // from it are void.
@@ -291,6 +339,10 @@ class Store {
 
         case 'invite':
           this.pendingInvite = msg.invite;
+          break;
+
+        case 'update':
+          this.update = msg.update;
           break;
 
         case 'error':
@@ -631,6 +683,17 @@ class Store {
     this.#speakingTimers.forEach(clearTimeout);
     this.#speakingTimers.clear();
     bridge.send({ type: 'leave' });
+  }
+
+  /**
+   * Opens the release page in the OS browser.
+   *
+   * Sent to the backend rather than opened here: this WebView has no notion of
+   * a second window, so navigating to the page would replace the call with it.
+   */
+  openReleasePage(): void {
+    if (!this.update) return;
+    bridge.send({ type: 'openUrl', openUrl: this.update.url });
   }
 
   setLogLevel(level: string): void {

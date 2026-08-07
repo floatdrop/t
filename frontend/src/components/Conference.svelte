@@ -192,6 +192,7 @@
     {#if expanded === null || expanded === SELF}
       <VideoTile
         nickname={store.session.nickname ?? 'me'}
+        version={store.version}
         localStream={store.previewStream}
         localVideoId={store.previewVideoId}
         localSource={store.media.videoSource}
@@ -205,6 +206,7 @@
       {#if expanded === null || expanded === remote.id}
         <VideoTile
           nickname={remote.nickname}
+          version={remote.version}
           videoHandle={remote.videoHandle}
           hasAudio={remote.audioHandle !== null}
           label={remote.id}

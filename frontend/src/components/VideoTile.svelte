@@ -33,6 +33,12 @@
      */
     localSource?: VideoSource;
     label?: string;
+    /**
+     * The build this participant is running. Shown on hover rather than as a
+     * badge: it matters on the day two people see different things and nowhere
+     * else, and a version on every tile is a permanent tax for that day.
+     */
+    version?: string;
     /** Draws the voice-activity border. */
     speaking?: boolean;
     /** True when this tile has the window to itself. */
@@ -49,6 +55,7 @@
     localVideoId = '',
     localSource = 'camera',
     label = '',
+    version = '',
     speaking = false,
     expanded = false,
     onExpand,

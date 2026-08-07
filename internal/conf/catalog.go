@@ -18,6 +18,16 @@ import (
 // there rather than being forced into a track label.
 const catalogNicknameKey = "tlmstNickname"
 
+// catalogVersionKey is the catalog-root extra field carrying the build the
+// publisher is running, on the same §5.1 producer-extension footing as the
+// nickname above.
+//
+// In the catalog rather than anywhere else because that is the one thing every
+// participant already reads about every other participant, and because it costs
+// nothing when absent: a peer on an older build simply omits the field, and the
+// roster shows no version for them rather than a wrong one.
+const catalogVersionKey = "tlmstVersion"
+
 // audioInitRef is the initDataList ID linking the audio track to its
 // codec configuration payload (§5.1.7).
 const audioInitRef = "audio-config"
@@ -26,7 +36,7 @@ const audioInitRef = "audio-config"
 // audio may each be nil, which is how a participant that publishes only
 // one of the two (or neither, before its encoders have started) is
 // described.
-func buildCatalog(nickname string, video, audio *bridge.TrackConfig) (msf.Catalog, error) {
+func buildCatalog(nickname, version string, video, audio *bridge.TrackConfig) (msf.Catalog, error) {
 	live := true
 	// Both media tracks belong to one render group so a player knows
 	// they are meant to be presented together (§5.2.10).
@@ -80,6 +90,11 @@ func buildCatalog(nickname string, video, audio *bridge.TrackConfig) (msf.Catalo
 	cat := msf.BeginBroadcast(tracks, time.Time{})
 	cat.InitDataList = initData
 	cat.Extras = map[string]any{catalogNicknameKey: nickname}
+	// Omitted rather than sent empty when unknown, so that a reader cannot
+	// tell an unversioned build from one claiming to be nothing.
+	if version != "" {
+		cat.Extras[catalogVersionKey] = version
+	}
 
 	if err := cat.Validate(); err != nil {
 		return msf.Catalog{}, fmt.Errorf("conf: build catalog: %w", err)
@@ -101,8 +116,11 @@ func encodeCatalog(cat msf.Catalog) ([]byte, error) {
 // publisher's name plus a decoder config per media track it declares.
 type parsedCatalog struct {
 	Nickname string
-	Video    *bridge.TrackConfig
-	Audio    *bridge.TrackConfig
+	// Version is the build the publisher is running, or empty from a peer
+	// old enough not to say.
+	Version string
+	Video   *bridge.TrackConfig
+	Audio   *bridge.TrackConfig
 	// Complete reports the §11.3 terminator catalog — the publisher has
 	// ended the broadcast and every track is done.
 	Complete bool
@@ -121,6 +139,9 @@ func parseCatalog(payload []byte) (parsedCatalog, error) {
 	out := parsedCatalog{Complete: cat.IsComplete}
 	if name, ok := cat.Extras[catalogNicknameKey].(string); ok {
 		out.Nickname = name
+	}
+	if v, ok := cat.Extras[catalogVersionKey].(string); ok {
+		out.Version = v
 	}
 
 	// initDataList entries are referenced by ID from the tracks below.

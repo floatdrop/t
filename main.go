@@ -29,10 +29,19 @@ import (
 	"tlmst/internal/app"
 	"tlmst/internal/bridge"
 	"tlmst/internal/telemetry"
+	"tlmst/internal/version"
 )
 
 //go:embed all:frontend/dist
 var assets embed.FS
+
+// buildConfig is the file the packaging reads to stamp the bundle and name the
+// release archives. Embedded so the running binary can report the same version
+// it was packaged as, without a second copy of the number to keep in step —
+// see internal/version.
+//
+//go:embed build/config.yml
+var buildConfig []byte
 
 // bridgeEndpointPath is where the frontend reads the WebSocket URL and
 // token. Serving it from the asset handler means the WebView needs no
@@ -70,7 +79,10 @@ func main() {
 	// the transport's own diagnostics into the debug panel.
 	slog.SetDefault(logger)
 
-	backend := app.New(logger, sink)
+	appVersion := version.Parse(buildConfig)
+	logger.Info("starting tlmst", "version", appVersion)
+
+	backend := app.New(logger, sink, appVersion)
 	server, err := bridge.NewServer(logger, backend)
 	if err != nil {
 		log.Fatal(err)
@@ -85,6 +97,9 @@ func main() {
 		}
 	}()
 	endpoint := server.Endpoint()
+	// The frontend reads this before anything else, which makes it the
+	// earliest place the welcome screen can learn what build it is part of.
+	endpoint.Version = appVersion
 	logger.Info("bridge listening", "url", endpoint.URL)
 
 	// grantWebViewMediaCapture must run before any window exists: it
@@ -102,6 +117,15 @@ func main() {
 			ApplicationShouldTerminateAfterLastWindowClosed: true,
 		},
 	})
+
+	// Opening a link is the OS's job, not the WebView's: navigating the
+	// WebView to a release page would replace the app with a web page and
+	// leave no way back to the call.
+	backend.SetOpenURL(wailsApp.Browser.OpenURL)
+
+	// Asked once, in the background, and never waited on — the answer is a
+	// button that may or may not appear on the welcome screen.
+	go backend.CheckForUpdate(ctx)
 
 	// Invite links. Wails already installs the macOS Apple Event handler for
 	// custom URL schemes and republishes it as this event, so registering

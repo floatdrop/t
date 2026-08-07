@@ -16,6 +16,7 @@ import (
 	"tlmst/internal/bridge"
 	"tlmst/internal/conf"
 	"tlmst/internal/telemetry"
+	"tlmst/internal/update"
 )
 
 // metricsInterval is how often a joined session samples transport and
@@ -49,6 +50,17 @@ type App struct {
 	// pendingInvite holds an invite link that arrived before the frontend
 	// was ready to receive it.
 	pendingInvite *bridge.Invite
+	// version is the build this process is, published to the room in the
+	// catalog and compared against GitHub's newest release.
+	version string
+	// offer is the release worth telling the frontend about, once the check
+	// has found one. Held because the check finishes on its own schedule and
+	// the WebView may not be listening yet — and because a WebView that
+	// reconnects should not have to wait for the next run to hear about it.
+	offer *bridge.Update
+	// openURL hands a link to the OS. Supplied by main, which owns the Wails
+	// application; nil in tests, where nothing should be opening anything.
+	openURL func(string) error
 }
 
 // Reconnect backoff. Short enough that a relay restart is barely noticed,
@@ -60,14 +72,21 @@ const (
 
 // New returns an App. The caller must set its bridge server with
 // SetServer before serving, and call Shutdown on exit.
-func New(log *slog.Logger, sink *telemetry.LogSink) *App {
+func New(log *slog.Logger, sink *telemetry.LogSink, version string) *App {
 	return &App{
 		log:      log,
 		sink:     sink,
+		version:  version,
 		counters: telemetry.NewRegistry(),
 		declared: map[string]*bridge.TrackConfig{},
 	}
 }
+
+// SetOpenURL supplies the means of opening a link outside the WebView.
+func (a *App) SetOpenURL(open func(string) error) { a.openURL = open }
+
+// Version is the build this process is running.
+func (a *App) Version() string { return a.version }
 
 // SetServer attaches the bridge the App reports through. Called once,
 // before Serve, because Server and Handler are mutually referential.
@@ -107,6 +126,9 @@ func (a *App) HandleControl(ctx context.Context, msg *bridge.ClientMessage) erro
 			return errors.New("app: untrack message names no kind")
 		}
 		return a.untrackKind(msg.Untrack)
+
+	case bridge.MsgOpenURL:
+		return a.openLink(msg.OpenURL)
 
 	case bridge.MsgReport:
 		if msg.Report == nil {
@@ -156,8 +178,11 @@ func (a *App) HandleConnect() {
 	}
 	a.server.SendControl(&bridge.ServerMessage{Type: bridge.MsgState, State: state})
 
-	// A link that launched the app has been waiting for this moment.
+	// A link that launched the app has been waiting for this moment, and so
+	// has any release the startup check turned up before the WebView was
+	// listening.
 	a.flushInvite()
+	a.sendOffer()
 }
 
 // HandleDisconnect tears the session down when the WebView goes away: its
@@ -196,6 +221,7 @@ func (a *App) join(ctx context.Context, req *bridge.JoinRequest) error {
 		Room:     room,
 		Nickname: req.Nickname,
 		ID:       id,
+		Version:  a.version,
 		// Development relays run self-signed certificates, and the app
 		// has no UI for trusting one. Revisit before any deployment
 		// where the relay identity matters.
@@ -545,6 +571,73 @@ func (a *App) flushInvite() {
 	if invite != nil {
 		a.server.SendControl(&bridge.ServerMessage{Type: bridge.MsgInvite, Invite: invite})
 	}
+}
+
+// CheckForUpdate asks GitHub whether there is a newer release and, if so,
+// remembers it and tells the frontend.
+//
+// Called once at startup from its own goroutine. Nothing waits on it and
+// nothing retries it: the result is a button that may or may not appear, so a
+// relay that is slow, an address that is rate-limited or a machine with no
+// network at all should all produce the same thing — no button, and a line in
+// the log for whoever goes looking.
+func (a *App) CheckForUpdate(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, update.Timeout)
+	defer cancel()
+
+	release, err := update.Check(ctx, nil, a.version)
+	if err != nil {
+		// Debug, not warn. Being unable to reach GitHub is not a fault in
+		// this app, and a conference that logs a warning every launch for
+		// something nobody asked for teaches people to ignore warnings.
+		a.log.Debug("update check failed", "err", err)
+		return
+	}
+	if release.Version == "" {
+		a.log.Info("running the newest release", "version", a.version)
+		return
+	}
+
+	a.log.Info("a newer release is available",
+		"running", a.version, "latest", release.Version, "url", release.URL)
+
+	offer := &bridge.Update{Version: release.Version, URL: release.URL}
+	a.mu.Lock()
+	a.offer = offer
+	a.mu.Unlock()
+	a.sendOffer()
+}
+
+// sendOffer tells the frontend about a release, if one has been found and a
+// frontend is there to hear it.
+func (a *App) sendOffer() {
+	a.mu.Lock()
+	offer := a.offer
+	a.mu.Unlock()
+	if offer == nil || !a.server.Connected() {
+		return
+	}
+	a.server.SendControl(&bridge.ServerMessage{Type: bridge.MsgUpdate, Update: offer})
+}
+
+// openLink hands a URL to the OS browser.
+//
+// Only links this app produced: the frontend can ask for the releases page and
+// nothing else. The message crosses a loopback socket that any local process
+// could in principle reach, and "open an arbitrary URL" is a capability worth
+// exactly nobody having.
+func (a *App) openLink(url string) error {
+	if url == "" {
+		return errors.New("app: openUrl message names no link")
+	}
+	if url != update.ReleasesURL && (a.offer == nil || url != a.offer.URL) {
+		return fmt.Errorf("app: refusing to open an unrecognised link %q", url)
+	}
+	if a.openURL == nil {
+		return errors.New("app: no way to open a link on this platform")
+	}
+	a.log.Info("opening a link outside the app", "url", url)
+	return a.openURL(url)
 }
 
 // Shutdown leaves any joined room. Safe to call more than once.

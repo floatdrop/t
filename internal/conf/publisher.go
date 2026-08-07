@@ -33,7 +33,10 @@ type publisher struct {
 	sess     *session.Session
 	counters *telemetry.Registry
 	nickname string
-	ns       wire.TrackNamespace
+	// version is the build this participant is running, published in the
+	// catalog so the room can see who is on what.
+	version string
+	ns      wire.TrackNamespace
 
 	catalog *session.Publication
 	video   *trackPublisher
@@ -78,6 +81,7 @@ func newPublisher(
 		sess:     sess,
 		counters: counters,
 		nickname: cfg.Nickname,
+		version:  cfg.Version,
 		ns:       ns,
 	}
 
@@ -203,7 +207,7 @@ func (p *publisher) undeclareConfig(kind string) error {
 // availability changes, which is exactly when this is called.
 func (p *publisher) republishCatalog() error {
 	p.mu.Lock()
-	cat, err := buildCatalog(p.nickname, p.videoConfig, p.audioConfig)
+	cat, err := buildCatalog(p.nickname, p.version, p.videoConfig, p.audioConfig)
 	group := p.catalogGroup
 	p.catalogGroup++
 	p.mu.Unlock()

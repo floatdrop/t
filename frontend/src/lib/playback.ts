@@ -33,6 +33,17 @@ const LIMITER = {
 } as const;
 
 /**
+ * Most times a decoder may be rebuilt without ever producing a frame.
+ *
+ * A decoder error is terminal, so recovery means building a new one — but a
+ * stream this decoder simply cannot handle would otherwise be rebuilt for every
+ * frame that arrives, forever. The counter resets on output, so this only
+ * counts failures that never got anywhere: a decoder that recovers has its
+ * whole allowance back.
+ */
+const MAX_DECODER_RESTARTS = 5;
+
+/**
  * Hard cap on the presentation queue, as a backstop rather than a working
  * limit: the sync arithmetic keeps it a handful of frames deep. It matters when
  * the render loop is not running at all — requestAnimationFrame stops while the
@@ -90,6 +101,20 @@ interface VideoSink {
   width: number;
   height: number;
   /**
+   * What the decoder was configured with, kept so it can be built again.
+   *
+   * A WebCodecs decoder error is terminal — the decoder closes and cannot be
+   * reconfigured — so recovering means constructing a new one, and that needs
+   * the config the catalog described.
+   */
+  config: VideoDecoderConfig;
+  /**
+   * Consecutive rebuilds since the last frame came out. Reset by output, so a
+   * decoder that recovers starts its allowance again and only a decoder that
+   * fails repeatedly without ever decoding anything runs out.
+   */
+  restarts: number;
+  /**
    * Decoded frames awaiting their presentation time, oldest first. Painting
    * on decode is what left the picture unsynchronised: it ran as fast as the
    * decoder emitted, with nothing tying it to the sound.
@@ -113,6 +138,10 @@ interface AudioSink {
   dropped: number;
   buffered: number;
   underruns: number;
+  /** What the decoder was configured with, kept so it can be built again. */
+  config: AudioDecoderConfig;
+  /** Consecutive rebuilds since the last frame came out. See the video sink. */
+  restarts: number;
   /** Trims seen so far, so only an increase is reported. */
   trimmed: number;
   /**
@@ -150,6 +179,72 @@ export class Playback {
     }
   }
 
+  /**
+   * Builds (or rebuilds) a video sink's decoder. Returns false if it could not
+   * be configured at all, which is not recoverable and leaves no sink.
+   *
+   * Recovery matters more than it looks. A WebCodecs decoder error closes the
+   * decoder for good, and push() then skips every later frame because the state
+   * is no longer "configured" — silently, for the rest of the call. One decode
+   * error used to freeze that participant's tile permanently, on whatever frame
+   * happened to be last, with a single line in the log to say why.
+   */
+  #buildVideoDecoder(sink: VideoSink): boolean {
+    const decoder = new VideoDecoder({
+      output: (frame) => {
+        // Proof the decoder works, so the restart allowance is restored.
+        sink.restarts = 0;
+        this.#enqueue(sink, frame);
+      },
+      error: (err) => this.#onVideoDecoderError(sink, err),
+    });
+    try {
+      decoder.configure(sink.config);
+    } catch (err) {
+      bridge.report('ERROR', 'video decoder configure failed', {
+        participant: sink.track.participant,
+        codec: sink.track.config.codec,
+        err: String(err),
+      });
+      return false;
+    }
+    sink.decoder = decoder;
+    // Whatever the old decoder held is gone, and H.264 cannot resume on a
+    // delta: wait for the next keyframe before feeding this one anything.
+    // Every group opens on one, so the wait is at most a group.
+    sink.sawKeyFrame = false;
+    return true;
+  }
+
+  /** Replaces a decoder that has failed, while it is still worth trying. */
+  #onVideoDecoderError(sink: VideoSink, err: unknown): void {
+    if (this.#sinks.get(sink.track.handle) !== sink) return; // already retired
+
+    sink.restarts++;
+    if (sink.restarts > MAX_DECODER_RESTARTS) {
+      bridge.report('ERROR', 'video decoder failed repeatedly; giving up', {
+        participant: sink.track.participant,
+        restarts: String(sink.restarts),
+        err: String(err),
+      });
+      return;
+    }
+
+    bridge.report('WARN', 'video decoder failed; rebuilding it', {
+      participant: sink.track.participant,
+      restarts: String(sink.restarts),
+      err: String(err),
+    });
+
+    // Queued frames belong to the decoder that just died.
+    for (const frame of sink.queue) frame.close();
+    sink.queue.length = 0;
+    sink.pending?.close();
+    sink.pending = null;
+
+    if (!this.#buildVideoDecoder(sink)) this.#sinks.delete(sink.track.handle);
+  }
+
   #addVideo(track: RemoteTrack): void {
     const sink: VideoSink = {
       kind: 'video',
@@ -164,16 +259,10 @@ export class Playback {
       height: 0,
       queue: [],
       avOffsetMs: null,
+      restarts: 0,
+      config: null as unknown as VideoDecoderConfig,
       decoder: null as unknown as VideoDecoder,
     };
-    sink.decoder = new VideoDecoder({
-      output: (frame) => this.#enqueue(sink, frame),
-      error: (err) =>
-        bridge.report('ERROR', 'video decoder failed', {
-          participant: track.participant,
-          err: String(err),
-        }),
-    });
 
     const config: VideoDecoderConfig = {
       codec: track.config.codec,
@@ -184,16 +273,9 @@ export class Playback {
     if (track.config.description) {
       config.description = fromBase64(track.config.description);
     }
-    try {
-      sink.decoder.configure(config);
-    } catch (err) {
-      bridge.report('ERROR', 'video decoder configure failed', {
-        participant: track.participant,
-        codec: track.config.codec,
-        err: String(err),
-      });
-      return;
-    }
+    sink.config = config;
+
+    if (!this.#buildVideoDecoder(sink)) return;
     this.#sinks.set(track.handle, sink);
     this.#startRender();
     bridge.report('INFO', 'video decoder ready', {
@@ -215,6 +297,8 @@ export class Playback {
       buffered: 0,
       underruns: 0,
       trimmed: 0,
+      restarts: 0,
+      config: null as unknown as AudioDecoderConfig,
       clock: null,
       decoder: null as unknown as AudioDecoder,
     };
@@ -257,15 +341,6 @@ export class Playback {
     sink.node = node;
     sink.gain = gain;
 
-    sink.decoder = new AudioDecoder({
-      output: (data) => this.#play(sink, data),
-      error: (err) =>
-        bridge.report('ERROR', 'audio decoder failed', {
-          participant: track.participant,
-          err: String(err),
-        }),
-    });
-
     const config: AudioDecoderConfig = {
       codec: track.config.codec,
       sampleRate: track.config.sampleRate ?? 48000,
@@ -274,14 +349,9 @@ export class Playback {
     if (track.config.description) {
       config.description = fromBase64(track.config.description);
     }
-    try {
-      sink.decoder.configure(config);
-    } catch (err) {
-      bridge.report('ERROR', 'audio decoder configure failed', {
-        participant: track.participant,
-        codec: track.config.codec,
-        err: String(err),
-      });
+    sink.config = config;
+
+    if (!this.#buildAudioDecoder(sink)) {
       node.disconnect();
       gain.disconnect();
       return;
@@ -293,6 +363,56 @@ export class Playback {
       codec: track.config.codec,
       descriptionBytes: String(track.config.description ? 1 : 0),
     });
+  }
+
+  /**
+   * Builds (or rebuilds) an audio sink's decoder. Same reasoning as the video
+   * one: the error is terminal, and without a rebuild that participant goes
+   * silent for the rest of the call while everything still looks connected.
+   *
+   * No keyframe gate on the way back — every Opus packet stands on its own, so
+   * the next one to arrive decodes.
+   */
+  #buildAudioDecoder(sink: AudioSink): boolean {
+    const decoder = new AudioDecoder({
+      output: (data) => {
+        sink.restarts = 0;
+        this.#play(sink, data);
+      },
+      error: (err) => this.#onAudioDecoderError(sink, err),
+    });
+    try {
+      decoder.configure(sink.config);
+    } catch (err) {
+      bridge.report('ERROR', 'audio decoder configure failed', {
+        participant: sink.track.participant,
+        codec: sink.track.config.codec,
+        err: String(err),
+      });
+      return false;
+    }
+    sink.decoder = decoder;
+    return true;
+  }
+
+  #onAudioDecoderError(sink: AudioSink, err: unknown): void {
+    if (this.#sinks.get(sink.track.handle) !== sink) return; // already retired
+
+    sink.restarts++;
+    if (sink.restarts > MAX_DECODER_RESTARTS) {
+      bridge.report('ERROR', 'audio decoder failed repeatedly; giving up', {
+        participant: sink.track.participant,
+        restarts: String(sink.restarts),
+        err: String(err),
+      });
+      return;
+    }
+    bridge.report('WARN', 'audio decoder failed; rebuilding it', {
+      participant: sink.track.participant,
+      restarts: String(sink.restarts),
+      err: String(err),
+    });
+    if (!this.#buildAudioDecoder(sink)) this.#sinks.delete(sink.track.handle);
   }
 
   /**

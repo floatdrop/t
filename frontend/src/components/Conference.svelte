@@ -9,6 +9,7 @@
   import { bridge } from '../lib/bridge';
   import { ICON_SIZE } from '../lib/icons';
   import { buildInviteLink, copyText } from '../lib/invite';
+  import { GRID_GAP, GRID_PADDING, tileColumns } from '../lib/layout';
   import { store } from '../lib/session.svelte';
   import DeviceMenu from './DeviceMenu.svelte';
   import VideoTile from './VideoTile.svelte';
@@ -123,12 +124,16 @@
     return () => window.removeEventListener('keydown', onKey);
   });
 
-  /** Column count grows with the participant count, capped so tiles stay large. */
-  const columns = $derived(
-    expanded !== null
-      ? 1
-      : Math.min(3, Math.max(1, Math.ceil(Math.sqrt(remotes.length + 1)))),
-  );
+  /**
+   * Column count grows with the participant count, capped so tiles stay large.
+   *
+   * The arithmetic lives in layout.ts because Auto resolution needs the same
+   * answer: how wide a tile ends up is what decides how big a picture is worth
+   * sending. Two copies of it would drift, and the drift would be invisible —
+   * a slightly wrong idea of the tile size only ever shows up as a stream
+   * that is quietly the wrong size.
+   */
+  const columns = $derived(expanded !== null ? 1 : tileColumns(remotes.length + 1));
 </script>
 
 <div class="conference">
@@ -175,10 +180,14 @@
     </div>
   </header>
 
+  <!-- Padding and gap come from the same constants, since the width they leave
+       for a tile is exactly what Auto resolution measures against. -->
   <div
     class="grid"
     class:solo={expanded !== null}
     style:grid-template-columns={`repeat(${columns}, minmax(0, 1fr))`}
+    style:gap={`${GRID_GAP}px`}
+    style:padding={`${GRID_PADDING}px`}
   >
     {#if expanded === null || expanded === SELF}
       <VideoTile
@@ -312,16 +321,24 @@
     color: var(--text-dim);
   }
 
+  /* Gap and padding are set inline from layout.ts — see the markup. */
   .grid {
     flex: 1;
     display: grid;
-    gap: 10px;
-    padding: 12px;
     overflow-y: auto;
     /* Centre the tiles when they fit, but fall back to top-aligned so an
        overflowing grid still scrolls from its first row. */
     align-content: safe center;
     min-height: 0;
+    /* Each row is as tall as the tile it holds, and nothing else.
+       Left to `auto`, WebKit sizes these rows by sharing out the grid's own
+       height instead — and a tile's height comes from its aspect-ratio, which
+       that arithmetic does not consult. With three participants and the debug
+       drawer open, the rows came out 93px against tiles 594px tall, so the
+       second row was drawn straight over the first: the third tile covered
+       half of the first. Measured in this WebView; min-content is what makes
+       the row consult the tile. */
+    grid-auto-rows: min-content;
   }
 
   /* One tile, given the whole area: the row has to be allowed to stretch, which
@@ -330,6 +347,10 @@
   .grid.solo {
     align-content: stretch;
     overflow: hidden;
+    /* The one case where the row must not follow the tile: an expanded tile
+       drops its aspect-ratio and takes the height it is given, so the row has
+       to be the one stretching to the window. */
+    grid-auto-rows: auto;
   }
 
   .invite-banner {

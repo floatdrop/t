@@ -12,6 +12,7 @@
    */
   import Settings2 from '@lucide/svelte/icons/settings-2';
   import { onMount } from 'svelte';
+  import { RESOLUTION_AUTO, VIDEO_LADDER } from '../lib/capture';
   import { ICON_SIZE } from '../lib/icons';
   import { parseInviteLink } from '../lib/invite';
   import { randomNickname, randomRoom } from '../lib/nickname';
@@ -353,16 +354,20 @@
         <div class="row">
           <div class="field">
             <label for="res">Resolution</label>
+            <!-- Auto is where every call starts, and is the only choice here
+                 that can still be right once the room fills up: it sizes the
+                 picture to the tile it will be shown in. A fixed size is an
+                 override, and leaving the call gives it back up. -->
             <select
               id="res"
               bind:value={store.media.resolution}
               onchange={reopen}
               disabled={!store.media.useVideo}
             >
-              <option value="640x360">640 × 360</option>
-              <option value="854x480">854 × 480</option>
-              <option value="1280x720">1280 × 720</option>
-              <option value="1920x1080">1920 × 1080</option>
+              <option value={RESOLUTION_AUTO}>Auto</option>
+              {#each VIDEO_LADDER as rung (rung.label)}
+                <option value={`${rung.width}x${rung.height}`}>{rung.label}</option>
+              {/each}
             </select>
           </div>
           <div class="field">

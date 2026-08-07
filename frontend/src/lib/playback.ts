@@ -113,6 +113,8 @@ interface AudioSink {
   dropped: number;
   buffered: number;
   underruns: number;
+  /** Trims seen so far, so only an increase is reported. */
+  trimmed: number;
   /**
    * Latest playout position reported by the worklet — the master clock for
    * this participant's video. Null until audio actually starts playing.
@@ -212,6 +214,7 @@ export class Playback {
       dropped: 0,
       buffered: 0,
       underruns: 0,
+      trimmed: 0,
       clock: null,
       decoder: null as unknown as AudioDecoder,
     };
@@ -232,6 +235,18 @@ export class Playback {
     node.port.onmessage = (ev: MessageEvent<PlayerReport>) => {
       sink.buffered = ev.data.available;
       sink.underruns = ev.data.underruns;
+      // Said out loud, and only on the edge: one trim is a transient the
+      // listener hears as a skip, but a stream of them means this participant's
+      // audio is arriving faster than it can be played and something upstream
+      // is wrong. Silence about it is what hid two seconds of delay.
+      if (ev.data.trimmed > sink.trimmed) {
+        sink.trimmed = ev.data.trimmed;
+        bridge.report('WARN', 'trimmed the audio buffer to bound its latency', {
+          participant: track.participant,
+          trims: String(sink.trimmed),
+          bufferedMs: String(Math.round((ev.data.available / 48000) * 1000)),
+        });
+      }
       // Only a playing buffer has a meaningful position; a prerolling or
       // starved one would report a clock that is not advancing, and video
       // scheduled against it would stall.

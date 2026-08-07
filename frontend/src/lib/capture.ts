@@ -26,6 +26,34 @@ import { addTapModule, type TapBlock } from './worklets';
 const KEYFRAME_INTERVAL_SEC = 2;
 
 /**
+ * Most frames a second this will publish, whatever the camera offers.
+ *
+ * A ceiling rather than a target: a camera that can only manage 24 is left at
+ * 24. Above 30 the extra frames cost bitrate in proportion and buy nothing a
+ * conversation makes use of, and the budget is far better spent on the picture
+ * being sharp than on it being smooth.
+ */
+const MAX_FRAMERATE = 30;
+
+/**
+ * How close to a full frame interval two presentations may be and still count
+ * as two frames.
+ *
+ * requestVideoFrameCallback fires per *presentation*, and a WebView is free to
+ * present the same camera frame twice — on a 60 Hz display showing a 30 fps
+ * camera, every second callback carries a picture already encoded. Duplicates
+ * arrive half an interval apart and real frames a whole one, so anything
+ * between the two separates them.
+ *
+ * Three quarters, not nine tenths. Measured: at 0.9 the threshold sat 3 ms
+ * under a 33 ms frame interval, ordinary capture jitter pushed real frames the
+ * wrong side of it, and each rejection cost a whole frame period — a 30 fps
+ * camera published at 18. Three quarters leaves a quarter of an interval of
+ * slack either way.
+ */
+const FRAME_GAP_TOLERANCE = 0.75;
+
+/**
  * Where the video comes from.
  *
  * One video track per participant is all the catalog carries, so a screen is
@@ -76,8 +104,54 @@ export const defaultAudioSettings: AudioSettings = {
 export const screenVideoSettings = {
   width: 1920,
   height: 1080,
+  /**
+   * Slower than the camera, deliberately.
+   *
+   * A desktop is not a face: it holds still for seconds at a time and then
+   * changes all at once, so frames a second buy far less here than pixels do,
+   * and 1080p is the whole point of sharing a screen — text that cannot be read
+   * is a share that failed. At half the camera's rate the whole 3 Mbps goes on
+   * keeping that text sharp, which is the right trade for a window of it; 15 is
+   * enough for a cursor to track and a page to scroll without tearing, and it
+   * is the smoothness rather than the legibility that a viewer forgives.
+   */
+  framerate: 15,
   bitrate: 3_000_000,
 } as const;
+
+/** One camera size the picker offers. */
+export interface VideoRung {
+  width: number;
+  height: number;
+  /** How the size is written in the picker. */
+  label: string;
+  /**
+   * The bitrate below which this size stops being worth asking for.
+   *
+   * What keeps "Auto" honest. A rung is only a candidate once the selected
+   * bitrate can actually feed it: 1080p carried at 1.5 Mbps is mush where the
+   * same budget carries 720p cleanly, so a big tile on a small budget should
+   * come down to a size the budget can hold rather than up to the one it looks
+   * like it wants.
+   */
+  minBitrate: number;
+}
+
+/** The sizes on offer, smallest first. Auto reads this in order. */
+export const VIDEO_LADDER: readonly VideoRung[] = [
+  { width: 640, height: 360, label: '640 × 360', minBitrate: 400_000 },
+  { width: 854, height: 480, label: '854 × 480', minBitrate: 700_000 },
+  { width: 1280, height: 720, label: '1280 × 720', minBitrate: 1_200_000 },
+  { width: 1920, height: 1080, label: '1920 × 1080', minBitrate: 2_500_000 },
+];
+
+/**
+ * The resolution setting that names no size, and instead follows the grid.
+ *
+ * Not a rung: it resolves to one, and which one changes as people join and
+ * leave. See autoVideoRung in layout.ts.
+ */
+export const RESOLUTION_AUTO = 'auto';
 
 /**
  * Whether a pipeline built for `have` already satisfies `want`.
@@ -143,6 +217,22 @@ const SAMPLE_RATE = 48000;
 const AUDIO_BLOCK_US = (DENOISE_FRAME / SAMPLE_RATE) * 1e6;
 
 /**
+ * How much audio goes into one Opus packet, in samples and microseconds.
+ *
+ * Two denoiser frames, because RNNoise is defined at 480 samples and Opus is
+ * cheapest at 20 ms. Feeding the encoder one denoiser frame at a time, as this
+ * used to, is a 10 ms packet: WebKit emits one packet per AudioData handed to
+ * it, so the call published a hundred packets a second per participant. Each
+ * one carries its own Opus header, its own LOC object and its own frame across
+ * the bridge, and the measured cost was 66 kbps for a stream configured at 32 —
+ * the overhead was larger than the audio. It also halved the group length the
+ * backend sizes its audio groups by (see audioGroupObjects in conf.go, which
+ * says 20 ms outright).
+ */
+const OPUS_FRAME_SAMPLES = DENOISE_FRAME * 2;
+const OPUS_FRAME_US = (OPUS_FRAME_SAMPLES / SAMPLE_RATE) * 1e6;
+
+/**
  * How long a captured block may wait before it is dropped rather than encoded.
  *
  * Loose enough that ordinary main-thread jitter — a garbage collection, a
@@ -195,6 +285,8 @@ export class Capture {
   #audioFor: AudioSettings | null = null;
 
   #frameIndex = 0;
+  /** When the last frame was encoded, for holding the rate to the configured one. */
+  #lastEncodeMs = 0;
   /** Set by forceKeyFrame; consumed by the next captured frame. */
   #forceKeyFrame = false;
   /** Shared epoch so audio and video timestamps sit on one clock. */
@@ -234,6 +326,36 @@ export class Capture {
   };
 
   /**
+   * Runs one pipeline change at a time.
+   *
+   * Every entry point here decides what to do by comparing the request against
+   * what is already running — and every one of them then awaits getUserMedia,
+   * an AudioWorklet module, or a <video> starting to play before it records
+   * what it built. Two callers overlapping in that window both see nothing
+   * running and both build it.
+   *
+   * Which is not hypothetical: join() starts the pipeline the moment the
+   * backend reports the room joined, and the settings that follow the grid are
+   * applied by an effect on that same transition. They raced, and the call went
+   * out with two microphone taps feeding one encoder — a hundred packets a
+   * second each carrying 20 ms of audio, so every listener received two seconds
+   * of sound for every second that passed and their buffers sat permanently
+   * full. Two seconds of delay, from two lines of code that both looked right.
+   *
+   * A queue rather than a flag per kind: the flags are what was already being
+   * raced, and there is nothing here worth doing concurrently.
+   */
+  #queue: Promise<unknown> = Promise.resolve();
+
+  #serial<T>(work: () => Promise<T>): Promise<T> {
+    // Settled either way, so one failed change does not wedge every change
+    // after it.
+    const next = this.#queue.then(work, work);
+    this.#queue = next.catch(() => {});
+    return next;
+  }
+
+  /**
    * Opens the requested devices, keeping any already open on the settings
    * asked for. Call before start(). Returns the stream so the caller can show
    * a local preview.
@@ -244,7 +366,11 @@ export class Capture {
    * swap has nothing to announce it from the outside, which is why the local
    * tile keys itself on the video track's id instead of the stream's.
    */
-  async open(video: VideoSettings | null, audio: AudioSettings | null): Promise<MediaStream> {
+  open(video: VideoSettings | null, audio: AudioSettings | null): Promise<MediaStream> {
+    return this.#serial(() => this.#open(video, audio));
+  }
+
+  async #open(video: VideoSettings | null, audio: AudioSettings | null): Promise<MediaStream> {
     // Checked before anything is released, so a call that asks for nothing
     // leaves what is running alone.
     if (!video && !audio) {
@@ -354,7 +480,11 @@ export class Capture {
    * already running. A kind that is running is left as it is — that is what
    * keeps a mute from costing the picture anything.
    */
-  async start(video: VideoSettings | null, audio: AudioSettings | null): Promise<void> {
+  start(video: VideoSettings | null, audio: AudioSettings | null): Promise<void> {
+    return this.#serial(() => this.#start(video, audio));
+  }
+
+  async #start(video: VideoSettings | null, audio: AudioSettings | null): Promise<void> {
     if (!this.stream) throw new Error('capture: open() must run before start()');
     // Set once per session, not per start: a device switch rebuilds a
     // pipeline, and re-basing the clock would send timestamps backwards
@@ -390,7 +520,18 @@ export class Capture {
     const actual = track.getSettings();
     const grantedWidth = actual.width ?? settings.width;
     const grantedHeight = actual.height ?? settings.height;
-    const framerate = actual.frameRate ?? settings.framerate;
+    // Capped here rather than at the pump, so that the encoder's rate control,
+    // the keyframe cadence and what the catalog advertises all describe the
+    // same stream as the one actually being sent.
+    //
+    // What was asked for is a ceiling as much as the global one is: a screen
+    // asks for 15 and a source that hands back 30 anyway should not be
+    // published at 30 — the rate was chosen to pay for the resolution.
+    const framerate = Math.min(
+      actual.frameRate ?? settings.framerate,
+      settings.framerate,
+      MAX_FRAMERATE,
+    );
 
     // H.264 is 4:2:0, so a chroma sample covers a 2x2 block of luma and both
     // dimensions have to be even. A camera offers standard sizes that already
@@ -473,6 +614,10 @@ export class Capture {
     });
 
     const keyEvery = Math.max(1, Math.round(framerate * KEYFRAME_INTERVAL_SEC));
+
+    /** Least time between encoded frames — see FRAME_GAP_TOLERANCE. */
+    const minFrameGapMs = (1000 / framerate) * FRAME_GAP_TOLERANCE;
+
     const pump = () => {
       if (!this.#videoRunning || !this.#videoEncoder || !this.#video) return;
 
@@ -491,11 +636,20 @@ export class Capture {
         return;
       }
 
+      // A frame the camera has not produced yet. Not counted as dropped —
+      // nothing was lost, the display simply painted the same picture again.
+      const nowMs = performance.now();
+      if (nowMs - this.#lastEncodeMs < minFrameGapMs) {
+        this.#video.requestVideoFrameCallback(pump);
+        return;
+      }
+
       // Dropping frames while the encoder is backed up keeps latency
       // bounded; queueing them would only push the backlog further out.
       if (this.#videoEncoder.encodeQueueSize > 2) {
         this.#dropped++;
       } else {
+        this.#lastEncodeMs = nowMs;
         let frame: VideoFrame | null = null;
         try {
           frame = new VideoFrame(this.#video, {
@@ -576,6 +730,10 @@ export class Capture {
       sampleRate: ctx.sampleRate,
       numberOfChannels: 1,
       bitrate: settings.bitrate,
+      // Stated rather than left to the default, so the packet length is not
+      // something the platform gets to decide: it is what the backend's group
+      // sizing and the whole audio budget are built on.
+      opus: { frameDuration: OPUS_FRAME_US },
     });
     this.#audioEncoder = encoder;
 
@@ -686,7 +844,14 @@ export class Capture {
     this.#skewWindowEndUs = wallUs + SKEW_WINDOW_US;
   }
 
-  /** Denoises one frame, tracks voice activity, and encodes it. */
+  /**
+   * Denoises one frame, tracks voice activity, and encodes it once a whole
+   * Opus packet's worth has accumulated.
+   *
+   * Voice activity is still per denoiser frame — it drives an indicator, and
+   * halving its rate to suit the encoder would only make the border slower to
+   * light. Only the encoding waits.
+   */
   #emitAudioFrame(frame: Float32Array, captureUs: number): void {
     if (!this.#audioEncoder || this.#audioEncoder.state !== 'configured') return;
 
@@ -697,18 +862,27 @@ export class Capture {
       this.onVoice?.(this.#voice);
     }
 
-    const timestamp = Math.round(this.#audioEpochUs + captureUs);
+    // The packet is timed from its first sample, not its last: it is the
+    // moment the audio was captured, and dating it from the end would put
+    // every packet 20 ms into the future.
+    if (this.#opusLength === 0) this.#opusStartUs = captureUs;
+    this.#opusFrame.set(frame, this.#opusLength);
+    this.#opusLength += frame.length;
+    if (this.#opusLength < OPUS_FRAME_SAMPLES) return;
+    this.#opusLength = 0;
+
+    const timestamp = Math.round(this.#audioEpochUs + this.#opusStartUs);
     try {
       const data = new AudioData({
         format: 'f32-planar',
         sampleRate: SAMPLE_RATE,
-        numberOfFrames: frame.length,
+        numberOfFrames: this.#opusFrame.length,
         numberOfChannels: 1,
         timestamp,
         // AudioData copies on construction, so handing it the reused
         // accumulation buffer is safe. The DOM types widen this slot to
         // the SharedArrayBuffer-backed case we never hit.
-        data: frame as unknown as BufferSource,
+        data: this.#opusFrame as unknown as BufferSource,
       });
       this.#audioEncoder.encode(data);
       data.close();
@@ -716,6 +890,16 @@ export class Capture {
       bridge.report('WARN', 'audio encode failed', { err: String(err) });
     }
   }
+
+  /**
+   * One Opus packet under construction, filled a denoiser frame at a time.
+   *
+   * Exactly two frames fit, so a block never straddles the boundary and there
+   * is no partial remainder to carry.
+   */
+  #opusFrame = new Float32Array(OPUS_FRAME_SAMPLES);
+  #opusLength = 0;
+  #opusStartUs = 0;
 
   #onAudioChunk(chunk: EncodedAudioChunk, meta?: EncodedAudioChunkMetadata): void {
     const payload = new Uint8Array(chunk.byteLength);
@@ -825,14 +1009,24 @@ export class Capture {
    * brings a new AudioContext and so a new capture clock, and #startAudio takes
    * the offset again on the far side, against the same media clock.
    */
-  async switchDevices(
+  switchDevices(
+    video: VideoSettings | null,
+    audio: AudioSettings | null,
+  ): Promise<MediaStream | null> {
+    // Taken once around the pair, not once each: opening and starting are one
+    // change, and letting another change in between them would leave devices
+    // open that nothing had started.
+    return this.#serial(() => this.#switchDevices(video, audio));
+  }
+
+  async #switchDevices(
     video: VideoSettings | null,
     audio: AudioSettings | null,
   ): Promise<MediaStream | null> {
     try {
       if (video || audio) {
-        await this.open(video, audio);
-        await this.start(video, audio);
+        await this.#open(video, audio);
+        await this.#start(video, audio);
       } else {
         // Both off is a state the toggles reach in two clicks, not an error:
         // the call stays up with nothing published. The media clock is kept, so
@@ -886,6 +1080,7 @@ export class Capture {
     // subscriber that reconfigured on the new declaration cannot begin on a
     // delta frame.
     this.#frameIndex = 0;
+    this.#lastEncodeMs = 0;
     this.#videoFor = null;
   }
 
@@ -909,6 +1104,9 @@ export class Capture {
     this.#denoiser.destroy();
 
     this.#audioConfigSent = false;
+    // A half-filled packet belongs to the pipeline that was collecting it; the
+    // next one starts its own, on its own clock.
+    this.#opusLength = 0;
     this.#audioEpochUs = 0;
     this.#haveAudioEpoch = false;
     this.#skewFloorUs = 0;

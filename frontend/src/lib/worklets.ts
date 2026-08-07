@@ -92,6 +92,26 @@ const PLAYER_SOURCE = `
 // enough that the buffer can never hide a real stall.
 const CAPACITY = 96000;
 
+// How much audio may queue before the buffer is trimmed back, and what it is
+// trimmed back to.
+//
+// Without this the buffer had no way back down. Nothing drains it: the reader
+// takes exactly one sample per output sample, so any moment where the writer
+// got ahead — a stall in the audio thread, a burst off the network, a decoder
+// backlog flushing — stayed ahead for the rest of the call. Measured on a
+// five-way call, every participant's buffer sat pinned at CAPACITY, which is
+// two full seconds of delay between someone speaking and anyone hearing it.
+// The overrun path in pushSamples does not help: by the time it engages the
+// latency is already the whole buffer, and dropping one sample per sample
+// written is exactly what holds it there.
+//
+// So the queue is bounded instead, on the same reasoning capture.ts drops
+// audio that is already late: a gap is audible once, and permanent latency is
+// audible for the rest of the call. The high-water mark is four times the
+// preroll, so ordinary jitter never reaches it.
+const MAX_BUFFER = 12000; // 250 ms
+const TRIM_TO = 2880;     // 60 ms, the preroll depth
+
 // A chunk whose timestamp misses the expected one by more than this is
 // treated as a new reference rather than a continuation.
 const RESYNC_US = 5000;
@@ -109,6 +129,10 @@ class PCMPlayer extends AudioWorkletProcessor {
     this.write = 0;
     this.available = 0;
     this.underruns = 0;
+    // Counted rather than done quietly: a buffer that keeps needing trimming
+    // is a real fault, and silence about it is what let two seconds of delay
+    // go unnoticed in the first place.
+    this.trimmed = 0;
     // Hold output until this much audio has queued, so playback does not
     // start on the very first packet and then immediately starve.
     this.prerollFrames = 2880; // 60 ms
@@ -131,6 +155,7 @@ class PCMPlayer extends AudioWorkletProcessor {
     this.port.postMessage({
       available: this.available,
       underruns: this.underruns,
+      trimmed: this.trimmed,
       playing: this.playing,
       haveClock: this.haveClock,
       playoutUs: this.writeUs - (this.available / sampleRate) * 1e6,
@@ -146,6 +171,19 @@ class PCMPlayer extends AudioWorkletProcessor {
     }
     this.writeUs += (samples.length / sampleRate) * 1e6;
     this.pushSamples(samples);
+    this.trim();
+  }
+
+  // Drops the oldest audio when too much has queued, which is the only thing
+  // that actually shortens the queue. The playout clock needs no correction:
+  // it is derived from what is still buffered, so skipping ahead in the buffer
+  // is skipping ahead in time, and the video scheduled against it follows.
+  trim() {
+    if (this.available <= MAX_BUFFER) return;
+    const drop = this.available - TRIM_TO;
+    this.read = (this.read + drop) % CAPACITY;
+    this.available -= drop;
+    this.trimmed++;
   }
 
   pushSamples(samples) {
@@ -209,6 +247,8 @@ export interface PlayerReport {
   /** Samples still queued in the ring buffer. */
   available: number;
   underruns: number;
+  /** How many times the queue has been trimmed back to bound its latency. */
+  trimmed: number;
   /** False while prerolling or after a starve, when the clock is not moving. */
   playing: boolean;
   /** False until a timestamped chunk has arrived. */

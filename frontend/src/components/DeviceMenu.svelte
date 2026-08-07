@@ -18,6 +18,7 @@
   import Settings2 from '@lucide/svelte/icons/settings-2';
   import Video from '@lucide/svelte/icons/video';
   import VideoOff from '@lucide/svelte/icons/video-off';
+  import { RESOLUTION_AUTO, VIDEO_LADDER } from '../lib/capture';
   import { ICON_SIZE } from '../lib/icons';
   import { store } from '../lib/session.svelte';
 
@@ -241,10 +242,13 @@
             onchange={apply}
             disabled={!cameraLive || busy}
           >
-            <option value="640x360">640 × 360</option>
-            <option value="854x480">854 × 480</option>
-            <option value="1280x720">1280 × 720</option>
-            <option value="1920x1080">1920 × 1080</option>
+            <!-- Auto says what it currently comes to, because in a call it is
+                 a live value: it moves as people join and leave, and a picker
+                 that only said "Auto" would leave that invisible. -->
+            <option value={RESOLUTION_AUTO}>Auto ({store.autoLabel})</option>
+            {#each VIDEO_LADDER as rung (rung.label)}
+              <option value={`${rung.width}x${rung.height}`}>{rung.label}</option>
+            {/each}
           </select>
         </div>
 

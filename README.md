@@ -124,6 +124,31 @@ every call, invisibly, because nothing compared the two timelines. The **A/V**
 column in the decoders table now does: it shows how far the last presented frame
 was from the audio clock, which is normally under a frame interval.
 
+The playback queue is bounded for the same reason the capture one is. Nothing
+drains a ring buffer — the reader takes exactly one sample per output sample —
+so any moment where the writer got ahead stays ahead for the rest of the call.
+Measured on a five-way call, every buffer sat pinned at its two-second capacity:
+two full seconds between someone speaking and anyone hearing it, with the
+**BUFFERED** column reading 1995 ms and **A/V** reading +1969 ms. So `pcm-player`
+drops the oldest audio once more than 250 ms has queued, back to the 60 ms
+preroll depth, and reports the count. A gap is audible once; permanent latency
+is audible for the whole call. The playout clock needs no correction — it is
+derived from what is still buffered, so skipping ahead in the buffer is skipping
+ahead in time, and the video scheduled against it follows.
+
+That buffer filling is a symptom worth chasing rather than absorbing, so a trim
+is logged at WARN. The one that prompted the bound turned out to be two capture
+pipelines running at once: `open` and `start` both decide what to do by
+comparing the request against what is already running, and both then await
+`getUserMedia`, an `AudioWorklet` module or a `<video>` starting to play before
+recording what they built. `join()` starts the pipeline the moment the room is
+joined, and the effect that follows the grid applies its settings on that same
+transition — they raced through that window, and the call went out with two
+microphone taps feeding one encoder, publishing two seconds of audio for every
+second that passed. `Capture` now runs one pipeline change at a time
+(`#serial`), which is a queue rather than a flag per kind because the flags were
+what was being raced.
+
 Mixing is Web Audio summation, but not the accidental kind: each participant
 gets a `GainNode` feeding a shared `DynamicsCompressorNode` before the
 destination. Connecting every player straight to the destination sums at unity
@@ -214,6 +239,46 @@ joining, and **Devices** in the call header changes them without leaving the
 room. That control is not a convenience: joining by an invite link skips the
 welcome screen entirely, so it is the only place those choices can be made on
 that path.
+
+Resolution defaults to **Auto**, and every call is joined on it — a fixed size
+is an override that lasts until you leave. Auto sizes the picture to the tile it
+will be shown in, which is the only thing that decides how much of it anyone
+sees: the grid puts `ceil(sqrt(n))` tiles across, capped at three columns, so
+each additional participant makes every tile narrower, and a 1080p stream drawn
+into a 400 px tile spends its bitrate on pixels that are thrown away before they
+reach a screen. `autoVideoRung` in `frontend/src/lib/layout.ts` takes the tile
+width the grid arrives at, scales it by the display's pixel ratio (capped at 2x,
+beyond which the extra pixels cost real bitrate and buy nothing visible), and
+picks the smallest rung of `VIDEO_LADDER` wide enough to fill it — never below
+360p, which is where a face stops being a face.
+
+The selected bitrate caps that independently, because a size has to be carried
+as well as chosen: each rung carries the bitrate below which it stops being
+worth asking for, and 1080p at 1.5 Mbps is mush where the same budget carries
+720p cleanly. So the default 1.5 Mbps means a one-to-one call publishes 720p and
+a call of five comes down to 480p, while 3 Mbps reaches 1080p and 500 kbps stays
+at the 360p floor throughout. The size follows the room as people join and
+leave, and follows the window as it is resized — settling for 300 ms first,
+since a resize arrives per frame while a window is dragged and crossing a rung
+boundary rebuilds the whole video pipeline. The grid's own padding and gap come
+from the same constants in `layout.ts` that the measurement uses, so the two
+cannot drift apart; a wrong idea of the tile size would show up only as a stream
+that is quietly the wrong size.
+
+Frame rate is capped at 30 wherever it comes from, and a screen share runs at
+15. `requestVideoFrameCallback` fires once per *presentation*, not once per
+camera frame, so the rate has to be held rather than assumed: a frame arriving
+sooner than three quarters of the configured interval is a picture already
+encoded and is skipped. The cap is applied where the rate is read off the track,
+so the encoder's rate control, the keyframe cadence and what the catalog
+advertises all describe the stream actually being sent. A screen is read rather
+than watched — it holds still for seconds and then changes all at once — so it
+spends its 3 Mbps on staying at 1080p and legible instead of on smoothness.
+
+Auto resolution is a camera setting and stops at the camera. A share is 1080p
+whatever the grid is doing: sizing a picture to its tile is the right question
+for a face and the wrong one for a desktop, which is usually being read in the
+expanded tile where the grid's arithmetic does not apply at all.
 
 Turning a device off withdraws the track rather than just stopping the frames.
 A catalog that still declares video leaves every subscriber holding a decoder

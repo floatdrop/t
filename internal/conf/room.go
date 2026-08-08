@@ -82,6 +82,10 @@ type Room struct {
 	// publisher's smaller encoding will do.
 	videoLowWant map[string]bool
 	videoWantAll bool
+	// interestPoke wakes the goroutine that brings subscriptions in line with
+	// the want set. Buffered by one and never blocked on, so a burst of
+	// changes coalesces into one pass.
+	interestPoke chan struct{}
 }
 
 // Join dials the relay, announces the local participant, and starts
@@ -159,6 +163,7 @@ func Join(ctx context.Context, log *slog.Logger, sink Sink, counters *telemetry.
 		remotes:  make(map[string]*remote),
 
 		videoWantAll: true,
+		interestPoke: make(chan struct{}, 1),
 	}
 	r.handles.Store(bridge.HandleRemoteBase)
 	r.router = newRouter(r.log)
@@ -192,6 +197,7 @@ func Join(ctx context.Context, log *slog.Logger, sink Sink, counters *telemetry.
 	// arrived before this point, so nothing is lost by being late.
 	res.sess.OnGoaway(r.onGoaway)
 
+	go r.applyInterest()
 	go r.runRouter()
 	go r.watchAnnouncements(watch)
 	go r.watchSession()
@@ -329,21 +335,48 @@ func (r *Room) SetVideoInterest(ids, low []string) {
 	r.videoWant = want
 	r.videoLowWant = lowWant
 	r.videoWantAll = false
-	remotes := make([]*remote, 0, len(r.remotes))
-	for _, rem := range r.remotes {
-		if rem != nil {
-			remotes = append(remotes, rem)
-		}
-	}
 	r.mu.Unlock()
 
-	// Outside the lock: applying reconciles subscriptions, which reads the
-	// want set back and would deadlock against a lock still held here.
-	for _, rem := range remotes {
-		rem.applyInterest()
+	// Recorded here and reconciled elsewhere. Reconciling means a SUBSCRIBE
+	// and a FETCH round trip per newly wanted tile, and this is called from
+	// the bridge's read loop — the single goroutine that also carries captured
+	// media to the publisher. Doing the work here stopped this participant
+	// publishing for as long as those round trips took, which in a nine-way
+	// call is over a second; and the thing that most often changes the answer
+	// is the congestion detector, so it stalled the uplink exactly when round
+	// trips were longest.
+	select {
+	case r.interestPoke <- struct{}{}:
+	default: // a pass is already pending; it will read the current set
 	}
-	r.log.Debug("video interest updated",
-		"wanted", len(want), "small", len(lowWant), "participants", len(remotes))
+}
+
+// applyInterest brings every remote in line with the want set, once per poke,
+// for the room's lifetime.
+func (r *Room) applyInterest() {
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-r.interestPoke:
+		}
+
+		r.mu.Lock()
+		remotes := make([]*remote, 0, len(r.remotes))
+		for _, rem := range r.remotes {
+			if rem != nil {
+				remotes = append(remotes, rem)
+			}
+		}
+		wanted, small := len(r.videoWant), len(r.videoLowWant)
+		r.mu.Unlock()
+
+		for _, rem := range remotes {
+			rem.applyInterest()
+		}
+		r.log.Debug("video interest applied",
+			"wanted", wanted, "small", small, "participants", len(remotes))
+	}
 }
 
 // wantsVideo reports whether a participant's video should be subscribed.

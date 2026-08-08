@@ -49,6 +49,13 @@ type SkewTracker struct {
 	// blindUntil is when measuring resumes after something this client did
 	// itself. See Suspend.
 	blindUntil time.Time
+	// carried is the slip accumulated before the current baseline. A
+	// suspension throws the baseline away so the slope is not fitted across
+	// the gap, but the lag is a running total and must survive it — the whole
+	// point of Lag is that it accumulates, and the events that suspend this
+	// (a video subscription being rebuilt) happen far more often than the slip
+	// it is meant to catch.
+	carried float64
 }
 
 type skewSample struct {
@@ -88,6 +95,11 @@ func (s *SkewTracker) Suspend(now time.Time, d time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.blindUntil = now.Add(d)
+	// Banked before the baseline goes, so the total is not reset by an event
+	// that has nothing to do with how late anything is.
+	if n := len(s.samples); n > 0 {
+		s.carried += s.samples[n-1].skew
+	}
 	// Dropped rather than kept: the samples either side of the burst differ by
 	// however long it took, and a line through both would find the slope this
 	// exists to ignore.
@@ -147,9 +159,11 @@ func (s *SkewTracker) Lag() (float64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.samples) == 0 {
-		return 0, false
+		// Nothing since the last suspension, but what was banked before it
+		// still stands.
+		return s.carried, s.carried != 0
 	}
-	return s.samples[len(s.samples)-1].skew, true
+	return s.carried + s.samples[len(s.samples)-1].skew, true
 }
 
 // Slope returns the trend in milliseconds of accumulated delay per second of

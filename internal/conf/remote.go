@@ -96,11 +96,16 @@ const resyncCooldown = 15 * time.Second
 // carry. Long enough to cover the burst and the queue it leaves behind.
 const backfillBlind = 4 * time.Second
 
-// lagCheckObjects is how often the slip is examined, in audio objects. At the
-// 20 ms cadence audio is produced on, fifty of them is about a second — often
-// enough to catch a slip while it is still seconds rather than minutes, rare
-// enough to be free.
-const lagCheckObjects = 50
+// backfillWait is how long a live subgroup waits for the group in progress to
+// be delivered before going ahead without it. Above the keyframe interval, so
+// a backfill that is merely slow is waited for rather than abandoned.
+const backfillWait = 3 * time.Second
+
+// audioRebuildCooldown is the shortest gap between rebuilding audio after the
+// relay has refused it. Audio is never demoted — there is nothing smaller and
+// it is not what filled the link — so the only response is to ask again, and
+// the only protection against asking forever is to ask less often.
+const audioRebuildCooldown = 5 * time.Second
 
 // videoRecovery is how long a demotion holds before this client tries one step
 // back up.
@@ -180,6 +185,11 @@ type remote struct {
 	// each of them, so the same verdict lands more than once; without this
 	// every stream of a dead subscription would demote another step.
 	demotedFor uint32
+	// audioRebuiltAt is when audio was last rebuilt after an overload verdict.
+	// Under sustained overload the relay refuses again a lag window later, and
+	// without a floor the cycle repeats for the whole call — each turn costing
+	// this participant a gap in the sound and a fresh decoder.
+	audioRebuiltAt time.Time
 	// resyncedAt is when this participant's subscriptions were last rebuilt to
 	// escape a slip, so a link that cannot hold the live edge does not rebuild
 	// them continuously.
@@ -206,7 +216,20 @@ type remoteTrack struct {
 	// this track was subscribed. Nil on audio, and on video whose backfill was
 	// refused.
 	fetch *session.FetchRequest
-	label string
+	// backfilled closes once the group in progress has been delivered, or once
+	// it is established that none is coming. Live objects wait for it: the two
+	// ranges are adjacent by construction, so delivering the backfill first and
+	// the subscription second is correct ordering with no reordering buffer —
+	// but only if something makes them happen in that order.
+	backfilled   chan struct{}
+	backfillOnce sync.Once
+	label        string
+}
+
+// doneBackfilling releases the live reader. Safe to call from either side and
+// more than once.
+func (t *remoteTrack) doneBackfilling() {
+	t.backfillOnce.Do(func() { close(t.backfilled) })
 }
 
 // newRemote subscribes to a newly discovered participant's catalog. The
@@ -522,17 +545,21 @@ func (r *remote) remember(video, videoLow, audio *bridge.TrackConfig) {
 // room's lock and calls into each remote, so a remote that reached back into
 // the room while holding its own would close the cycle.
 func (r *remote) missing() bool {
-	wantsVideo := r.room.wantsVideo(r.id)
-
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	wantsSomeVideo := r.wantVideo != nil || r.wantVideoLow != nil
-	// A demotion all the way off is deliberate, exactly as declining video is,
-	// and reading it as a failed subscription would send the retry loop after
-	// the very track the relay could not carry — and then tell the user this
-	// participant could not be reached.
-	return (wantsSomeVideo && r.video == nil && wantsVideo && r.level != videoNone) ||
-		(r.wantAudio != nil && r.audio == nil)
+	video, videoLow, audio := r.wantVideo, r.wantVideoLow, r.wantAudio
+	haveVideo, haveAudio := r.video != nil, r.audio != nil
+	r.mu.Unlock()
+
+	// Asked of the chooser rather than inferred from the ladder, because there
+	// is more than one way to decline a track deliberately: demoted to none,
+	// not visible to the frontend, or demoted one step against a publisher who
+	// offers nothing smaller — which resolves to no video at all. Reading only
+	// the first of those left the third looking like a subscription that
+	// failed, so the retry loop spent all five attempts chasing a track this
+	// client had decided not to take, and then told the user the participant
+	// could not be reached while their audio was working.
+	_, wantedVideo := r.chooseVideoLayer(video, videoLow)
+	return (wantedVideo != nil && !haveVideo) || (audio != nil && !haveAudio)
 }
 
 // scheduleResubscribe starts the retry loop, unless one is already running.
@@ -752,12 +779,17 @@ func (r *remote) subscribeTrack(slot **remoteTrack, name string, kind uint8, cfg
 	handle := r.room.nextHandle()
 	label := telemetry.InPrefix + r.id + "/" + name
 	track := &remoteTrack{
-		handle: handle,
-		kind:   kind,
-		name:   name,
-		config: *cfg,
-		sub:    sub,
-		label:  label,
+		handle:     handle,
+		kind:       kind,
+		name:       name,
+		config:     *cfg,
+		sub:        sub,
+		label:      label,
+		backfilled: make(chan struct{}),
+	}
+	if kind != bridge.KindVideo {
+		// Only video is backfilled; audio has nothing to wait behind.
+		track.doneBackfilling()
 	}
 
 	r.mu.Lock()
@@ -826,12 +858,29 @@ func (r *remote) backfillGroup(
 			JoiningRequestID: subscribeID,
 			JoiningStart:     0,
 		},
+		// Not what makes the ordering correct — awaitBackfill does that, and a
+		// priority could not: it is a scheduling hint, and two streams read by
+		// two goroutines can interleave at the receiver whatever order they
+		// were sent in. Measured, the gate alone passes and this alone does
+		// not.
+		//
+		// What it is for is making the gate cheap. Live objects now wait for
+		// the backfill, so a backfill left at the 128 default — behind every
+		// other participant's live video — would stall this tile for up to
+		// backfillWait. Level with live video is where it belongs, since it is
+		// the same pictures and they are needed first. Unmeasured: telling 60
+		// from 128 needs several publishers on a squeezed downlink, which
+		// nothing here sets up.
+		Parameters: message.Parameters{
+			message.SubscriberPriorityParam(videoPriority),
+		},
 	}
 	fetch, err := r.room.sess.Fetch(r.ctx, fetchMsg)
 	if err != nil {
 		// Degraded, not fatal: without it the tile stays blank until the next
 		// keyframe, which is exactly what it did before this existed.
 		r.log.Debug("video backfill FETCH refused", "handle", track.handle, "err", err)
+		track.doneBackfilling()
 		return
 	}
 
@@ -839,6 +888,7 @@ func (r *remote) backfillGroup(
 	if r.closed {
 		r.mu.Unlock()
 		fetch.Close()
+		track.doneBackfilling()
 		return
 	}
 	track.fetch = fetch
@@ -862,6 +912,10 @@ func (r *remote) readMediaFetch(
 	track *remoteTrack,
 	counter *telemetry.TrackCounter,
 ) {
+	// However this ends — delivered, refused, reset — the live stream stops
+	// waiting on it here.
+	defer track.doneBackfilling()
+
 	counter.AddGroup()
 	for {
 		obj, err := s.ReadDecoded()
@@ -923,8 +977,14 @@ func (r *remote) readMedia(
 	track *remoteTrack,
 	counter *telemetry.TrackCounter,
 ) {
+	if !r.awaitBackfill(track) {
+		return
+	}
+	// After the stream, not during it: this can rebuild the subscription, and
+	// there is nothing left to read by then.
+	defer r.checkLagForStream(track, counter)
+
 	counter.AddGroup()
-	var seen int
 	for {
 		obj, err := s.ReadDecoded()
 		if err != nil {
@@ -958,14 +1018,64 @@ func (r *remote) readMedia(
 			// produced on a fixed 20 ms cadence and is the one track never
 			// dropped, so the measurement survives whatever else gets shed.
 			counter.AddArrival(time.Now(), frame.Timestamp)
-			if seen++; seen%lagCheckObjects == 0 {
-				r.checkLag(counter)
-			}
 		}
 
 		counter.AddObject(len(decoded.Payload))
 		r.room.sink.SendMedia(&frame)
 	}
+}
+
+// checkLagForStream examines the slip once per audio subgroup.
+//
+// It used to count objects inside the read loop, which could never fire: that
+// loop runs once per stream, one stream is one group, and an audio group is
+// twenty-five objects — so a counter looking for fifty never got there and the
+// whole escape hatch was unreachable. A group is the natural unit anyway; at
+// the 500 ms cadence audio groups run on, this looks about twice a second.
+func (r *remote) checkLagForStream(track *remoteTrack, counter *telemetry.TrackCounter) {
+	if track.kind != bridge.KindAudio {
+		return
+	}
+	r.checkLag(counter)
+}
+
+// awaitBackfill holds a live subgroup until the group in progress has been
+// delivered, reporting whether it is still worth reading.
+//
+// Both arrive on their own stream and the router reads streams concurrently,
+// so without this they interleave — and they interleave *most* on the link
+// where the backfill takes longest, which is the one it exists for. The
+// subscriber then hands its decoder the keyframe, then live frames whose
+// reference frames have not arrived, then older frames with timestamps going
+// backwards. Playback does not reorder and only gates on the first keyframe,
+// so the picture smears and the tile jumps forward and back for the length of
+// the backfill.
+//
+// Bounded, because a backfill that never completes must not silence the track
+// for good: past the deadline the live objects go through and the picture is
+// whatever the pre-backfill behaviour was — blank until the next keyframe.
+func (r *remote) awaitBackfill(track *remoteTrack) bool {
+	select {
+	case <-track.backfilled:
+		return true
+	case <-r.ctx.Done():
+		return false
+	default:
+	}
+
+	timer := time.NewTimer(backfillWait)
+	defer timer.Stop()
+	select {
+	case <-track.backfilled:
+	case <-r.ctx.Done():
+		return false
+	case <-timer.C:
+		r.log.Debug("backfill did not finish in time; taking the live stream",
+			"handle", track.handle)
+		// Latched so later groups of this track do not wait again.
+		track.doneBackfilling()
+	}
+	return true
 }
 
 // reportMediaEnd says why one media stream stopped.
@@ -1016,6 +1126,18 @@ func (r *remote) demote(track *remoteTrack, code string) {
 	}
 
 	if track.kind == bridge.KindAudio {
+		// Guarded the way the video path below is. One verdict is reset once
+		// per open stream, so it lands more than once; unguarded, a late copy
+		// tears down the healthy subscription the first copy just rebuilt.
+		r.mu.Lock()
+		if r.closed || r.audio == nil || r.audio.handle != track.handle ||
+			time.Since(r.audioRebuiltAt) < audioRebuildCooldown {
+			r.mu.Unlock()
+			return
+		}
+		r.audioRebuiltAt = time.Now()
+		r.mu.Unlock()
+
 		r.log.Warn("the relay stopped forwarding audio: we are not keeping up",
 			"handle", track.handle, "code", code, "action", "rebuilding it unchanged")
 		r.dropTrack(&r.audio)

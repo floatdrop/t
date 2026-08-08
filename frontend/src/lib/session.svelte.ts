@@ -128,7 +128,7 @@ class Store {
 
   captureStats = $state<CaptureStats>({
     videoFps: 0, videoKbps: 0, encodeQueue: 0,
-    audioFps: 0, audioKbps: 0, audioEncodeQueue: 0, keyFrames: 0, dropped: 0,
+    audioFps: 0, audioKbps: 0, audioEncodeQueue: 0, lowDropped: 0, keyFrames: 0, dropped: 0,
     echoCancellation: false, noiseSuppression: false, autoGainControl: false,
     denoiseActive: false,
   });
@@ -872,9 +872,20 @@ class Store {
    * visibility never fires and the answer would go stale exactly when someone
    * made the window smaller.
    */
+  /**
+   * Which tile has the window to itself, mirrored from the conference view.
+   *
+   * The grid renders exactly one tile when something is expanded, and the
+   * arithmetic below has to be told: left to the participant count it kept
+   * computing a multi-column tile width while a single full-width tile was on
+   * screen, so double-clicking a face to look at it asked for the 640-wide
+   * layer and made it softer.
+   */
+  expandedTile = $state<string | null>(null);
+
   tilesAreSmall = $derived(
     tilesTakeSmallVideo({
-      tiles: this.participants.length + 1,
+      tiles: this.expandedTile !== null ? 1 : this.participants.length + 1,
       viewportWidth: this.viewportWidth,
       pixelRatio: this.pixelRatio,
     }),

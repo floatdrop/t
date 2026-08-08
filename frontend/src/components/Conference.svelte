@@ -161,6 +161,23 @@
    */
   const INTEREST_SETTLE_MS = 250;
 
+  /**
+   * How often visibility is worked out from the layout instead of waited for.
+   *
+   * Everything below rides on IntersectionObserver callbacks, and a callback
+   * chain that stops is this WebView's signature failure — the presentation
+   * loop, the capture tap and the worklet ports have all done it, which is why
+   * each of them has a watchdog. This one has the worst possible resting
+   * state: if the callbacks stop while nothing is on screen, every peer's
+   * video stays unsubscribed, no counter moves, no line is logged, and the
+   * empty set is faithfully replayed across reconnects. A tile plainly on
+   * screen showing nothing, for the rest of the call.
+   *
+   * So the answer is recomputed from the geometry on a slow timer, which needs
+   * no callback to arrive. Slow because it is a floor, not the mechanism.
+   */
+  const INTEREST_SWEEP_MS = 10_000;
+
   let gridEl = $state<HTMLDivElement | undefined>();
 
   /**
@@ -195,6 +212,12 @@
    * expanded are read: solo view renders exactly one tile, and everyone else
    * stops being visible in the most literal sense.
    */
+  // The store decides which layer to ask for, and that arithmetic needs to
+  // know when one tile has the window to itself.
+  $effect(() => {
+    store.expandedTile = expanded;
+  });
+
   // The tiles can stop being worth the full picture without any of them
   // moving: making the window smaller changes every tile's size and none of
   // their visibility, so the observer below never fires for it.
@@ -233,8 +256,28 @@
     for (const tile of root.querySelectorAll('[data-participant]')) {
       observer.observe(tile);
     }
+
+    // The floor. Measures the same band the observer watches — the grid's own
+    // box grown by INTEREST_MARGIN — so a sweep agrees with the callbacks
+    // rather than fighting them.
+    const sweep = setInterval(() => {
+      const box = root.getBoundingClientRect();
+      const margin = box.height;
+      const seen: string[] = [];
+      for (const tile of root.querySelectorAll<HTMLElement>('[data-participant]')) {
+        const id = tile.dataset.participant;
+        if (!id) continue;
+        const r = tile.getBoundingClientRect();
+        if (r.bottom >= box.top - margin && r.top <= box.bottom + margin) seen.push(id);
+      }
+      visible.clear();
+      for (const id of seen) visible.add(id);
+      store.setVisibleTiles(seen);
+    }, INTEREST_SWEEP_MS);
+
     return () => {
       clearTimeout(settle);
+      clearInterval(sweep);
       observer.disconnect();
     };
   });

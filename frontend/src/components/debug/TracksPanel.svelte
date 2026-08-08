@@ -163,9 +163,14 @@
               <td>{t.groups}</td>
               <td>
                 {#if t.skewMillisPerSec !== undefined}
-                  <!-- 1 ms/s is where clock drift between two machines stops
-                       being a plausible explanation. -->
-                  <span class={t.skewMillisPerSec > 1 ? 'warn' : ''}>
+                  <!-- Above the publisher's own clock, not just above two
+                       machines drifting apart. capture.ts steers its audio
+                       epoch back by up to 1 ms per second while recovering
+                       from a stall, and documents a stall on every launch — so
+                       1 ms/s of apparent drift is a healthy publisher
+                       correcting itself, and warning there painted this cell
+                       yellow for minutes after every call started. -->
+                  <span class={t.skewMillisPerSec > 2 ? 'warn' : ''}>
                     {t.skewMillisPerSec > 0 ? '+' : ''}{t.skewMillisPerSec.toFixed(1)} ms/s
                   </span>
                 {:else}

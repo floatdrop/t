@@ -183,3 +183,56 @@ func TestSkewLagStaysFlatWhenKeepingUp(t *testing.T) {
 		t.Errorf("lag = %v ms on a path that is keeping up, want ~0", lag)
 	}
 }
+
+// A suspension exists so the slope is not fitted across a burst this client
+// caused. It must not take the running total with it: the events that suspend
+// this — a video subscription being rebuilt — happen far more often than the
+// slip it is meant to catch, so a lag that reset on every one of them could
+// never reach the threshold that acts on it.
+func TestSkewCarriesLagAcrossASuspension(t *testing.T) {
+	var s SkewTracker
+	feed(&s, 200, 0.01) // ~40 ms of slip
+
+	before, ok := s.Lag()
+	if !ok {
+		t.Fatal("no lag before the suspension")
+	}
+
+	s.Suspend(epoch.Add(5*time.Second), time.Second)
+
+	after, ok := s.Lag()
+	if !ok {
+		t.Fatal("the suspension threw the accumulated lag away")
+	}
+	if math.Abs(after-before) > 0.01 {
+		t.Errorf("lag went from %v to %v ms across a suspension, want it kept", before, after)
+	}
+
+	// And it keeps accumulating from there rather than restarting at zero.
+	saved := mediaEpoch
+	mediaEpoch = uint64(600_000_000)
+	defer func() { mediaEpoch = saved }()
+	for i := range 200 {
+		media := mediaEpoch + uint64(i)*20_000
+		elapsed := time.Duration(float64(i) * float64(20*time.Millisecond) * 1.01)
+		s.Add(epoch.Add(10*time.Second+elapsed), media)
+	}
+
+	total, _ := s.Lag()
+	if total < before+30 {
+		t.Errorf("lag = %v ms after a second slipping stretch, want it to have "+
+			"grown past the %v ms banked before", total, before)
+	}
+}
+
+// The slope, by contrast, must not see across the gap — that is what the
+// suspension is for.
+func TestSkewSlopeIgnoresTheSuspendedWindow(t *testing.T) {
+	var s SkewTracker
+	feed(&s, 200, 0.01)
+	s.Suspend(epoch.Add(5*time.Second), time.Second)
+
+	if _, ok := s.Slope(); ok {
+		t.Error("reported a slope straight after a suspension, with no samples to fit")
+	}
+}

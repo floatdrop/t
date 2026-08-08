@@ -206,6 +206,8 @@ export interface CaptureStats {
   audioKbps: number;
   /** Packets waiting inside the audio encoder — see MAX_AUDIO_ENCODE_QUEUE. */
   audioEncodeQueue: number;
+  /** Frames the small video layer shed because its encoder was backed up. */
+  lowDropped: number;
   keyFrames: number;
   dropped: number;
   /** What the browser actually applied to the microphone track. */
@@ -434,6 +436,16 @@ export class Capture {
   #lowCanvas: OffscreenCanvas | null = null;
   /** Alternates, so the small layer takes every second frame. */
   #lowSkip = false;
+  /**
+   * Small-layer frames shed because its encoder was backed up.
+   *
+   * Counted separately from the primary's `dropped`: this layer's output is
+   * deliberately left out of the capture stats, so without its own counter a
+   * small layer shedding most of its frames is invisible — the only trace
+   * would be out/video-low carrying less than it advertises, which nothing
+   * compares.
+   */
+  #lowDropped = 0;
   #lowCtx: OffscreenCanvasRenderingContext2D | null = null;
   #audioEncoder: AudioEncoder | null = null;
   #audioCtx: AudioContext | null = null;
@@ -512,7 +524,7 @@ export class Capture {
   #lastSample = 0;
   #stats: CaptureStats = {
     videoFps: 0, videoKbps: 0, encodeQueue: 0,
-    audioFps: 0, audioKbps: 0, audioEncodeQueue: 0, keyFrames: 0, dropped: 0,
+    audioFps: 0, audioKbps: 0, audioEncodeQueue: 0, lowDropped: 0, keyFrames: 0, dropped: 0,
     echoCancellation: false, noiseSuppression: false, autoGainControl: false,
     denoiseActive: false,
   };
@@ -1160,7 +1172,7 @@ export class Capture {
       // Only the small layer is withdrawn. The primary is a separate encoder
       // and a separate track, and a call that has lost its thumbnail is still
       // a call.
-      error: (err) => this.#failLowLayer('small video layer failed', { err: String(err) }),
+      error: (err) => this.#failLowLayer(encoder, 'small video layer failed', { err: String(err) }),
     });
     try {
       encoder.configure({
@@ -1201,26 +1213,33 @@ export class Capture {
 
   /** Scales one frame down and encodes it into the small layer. */
   #encodeLowLayer(frame: VideoFrame, keyFrame: boolean): void {
-    // Half the primary's rate. A tile small enough to want this layer is not a
-    // tile anyone is reading motion off, and both costs it carries — the scale
-    // down and the encode — are paid per frame. A keyframe is never skipped:
-    // it is the only frame a subscriber can start from, and dropping one would
-    // strand anyone switching to this layer until the next.
-    if (!keyFrame) {
-      this.#lowSkip = !this.#lowSkip;
-      if (this.#lowSkip) return;
-    } else {
-      this.#lowSkip = false;
-    }
-
     const encoder = this.#lowEncoder;
     const canvas = this.#lowCanvas;
     const ctx = this.#lowCtx;
     if (!encoder || !canvas || !ctx) return;
     if (encoder.state !== 'configured') return;
-    // The same bound the primary uses: a backed-up encoder is shed from
-    // rather than queued into, and the small layer is the one to shed first.
-    if (encoder.encodeQueueSize > 2) return;
+
+    // Both ways of sending less are for delta frames only. A keyframe is the
+    // only frame a subscriber can start from, and there is no way to ask this
+    // publisher for another — drop one and the group silently runs to double
+    // length, which strands anyone switching to this layer and doubles the
+    // backfill they pay for when they arrive. The keyframe alignment between
+    // the two layers is the guarantee being protected here.
+    if (!keyFrame) {
+      // Shed when the encoder is backed up, which is exactly when the machine
+      // is busy running two of them.
+      if (encoder.encodeQueueSize > 2) {
+        this.#lowDropped++;
+        return;
+      }
+      // Half the primary's rate. A tile small enough to want this layer is not
+      // one anyone reads motion off, and both costs — the scale down and the
+      // encode — are paid per frame.
+      this.#lowSkip = !this.#lowSkip;
+      if (this.#lowSkip) return;
+    } else {
+      this.#lowSkip = false;
+    }
 
     let scaled: VideoFrame | null = null;
     try {
@@ -1228,7 +1247,7 @@ export class Capture {
       scaled = new VideoFrame(canvas, { timestamp: frame.timestamp });
       encoder.encode(scaled, { keyFrame });
     } catch (err) {
-      this.#failLowLayer('small video layer encode failed', { err: String(err) });
+      this.#failLowLayer(encoder, 'small video layer encode failed', { err: String(err) });
     } finally {
       scaled?.close();
     }
@@ -1248,9 +1267,17 @@ export class Capture {
     });
   }
 
-  /** Gives up on the small layer, leaving the primary running. */
-  #failLowLayer(reason: string, attrs: Record<string, string>): void {
-    if (!this.#lowEncoder) return;
+  /**
+   * Gives up on the small layer, leaving the primary running.
+   *
+   * Guarded on the encoder still being the current one, for the reason
+   * #failVideo is: a failure reported by an encoder that has since been
+   * replaced belongs to a layer that is already gone, and withdrawing on its
+   * behalf would take down the live one — after which a subscriber demoted to
+   * the small layer would get nothing at all.
+   */
+  #failLowLayer(encoder: VideoEncoder, reason: string, attrs: Record<string, string>): void {
+    if (this.#lowEncoder !== encoder) return;
     bridge.report('WARN', reason, attrs);
     this.#withdrawLowLayer();
   }
@@ -1271,6 +1298,7 @@ export class Capture {
     this.#lowEncoder = null;
     this.#lowCanvas = null;
     this.#lowCtx = null;
+    this.#lowDropped = 0;
     if (encoder && encoder.state !== 'closed') {
       try {
         encoder.close();
@@ -1636,6 +1664,7 @@ export class Capture {
         audioFps: this.#audioFrames / elapsed,
         audioKbps: (this.#audioBytes * 8) / 1000 / elapsed,
         audioEncodeQueue: this.#audioEncoder?.encodeQueueSize ?? 0,
+        lowDropped: this.#lowDropped,
         keyFrames: this.#stats.keyFrames + this.#keyFrames,
         dropped: this.#stats.dropped + this.#dropped,
         echoCancellation: this.#stats.echoCancellation,

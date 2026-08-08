@@ -19,6 +19,30 @@ import (
 	"tlmst/internal/telemetry"
 )
 
+// SUBSCRIBER_PRIORITY (§10.2.7) per track kind: what this client wants the
+// relay to send first when it cannot send everything at once.
+//
+// The relay schedules a subscriber's streams by this before anything else
+// (EffectiveStreamPriority, then SetSendPriority on the outgoing stream), and
+// the implicit default when the parameter is omitted is 128 — which is what
+// every subscription here used to carry, so audio, video and catalogs were
+// ranked equally and drained round-robin. Under congestion that spends the
+// scarce capacity evenly on the stream nobody can do without and the stream
+// that costs fifty times as much.
+//
+// The order is what a participant would miss most. A catalog is tiny and is
+// how a subscriber learns what exists at all. Audio is what a call is; it is
+// also 32 kbps against video's 1.5 Mbps, so protecting it costs almost
+// nothing. Video comes last and is the only thing there is meaningfully less
+// of when the link is tight.
+//
+// Well below the 128 default, so anything left unset sorts behind all of it.
+const (
+	catalogPriority = 10
+	audioPriority   = 20
+	videoPriority   = 60
+)
+
 // remote is one other participant in the room: their catalog
 // subscription, whichever media subscriptions their catalog declares, and
 // the bridge handles their frames travel under.
@@ -115,9 +139,12 @@ func newRemote(parent context.Context, room *Room, id string, ns wire.TrackNames
 // backfills the current group, which is exactly that catalog object.
 func (r *remote) subscribeCatalog() error {
 	subMsg := &message.Subscribe{
-		Namespace:  r.ns,
-		Name:       []byte(msf.CatalogTrackName),
-		Parameters: message.Parameters{message.LargestObjectFilter()},
+		Namespace: r.ns,
+		Name:      []byte(msf.CatalogTrackName),
+		Parameters: message.Parameters{
+			message.LargestObjectFilter(),
+			message.SubscriberPriorityParam(catalogPriority),
+		},
 	}
 	sub, err := r.room.sess.Subscribe(r.ctx, subMsg)
 	if err != nil {
@@ -505,10 +532,17 @@ func (r *remote) syncTrack(slot **remoteTrack, name string, kind uint8, want *br
 }
 
 func (r *remote) subscribeTrack(slot **remoteTrack, name string, kind uint8, cfg *bridge.TrackConfig) error {
+	priority := uint8(videoPriority)
+	if kind == bridge.KindAudio {
+		priority = audioPriority
+	}
 	sub, err := r.room.sess.Subscribe(r.ctx, &message.Subscribe{
-		Namespace:  r.ns,
-		Name:       []byte(name),
-		Parameters: message.Parameters{message.LargestObjectFilter()},
+		Namespace: r.ns,
+		Name:      []byte(name),
+		Parameters: message.Parameters{
+			message.LargestObjectFilter(),
+			message.SubscriberPriorityParam(priority),
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("conf: SUBSCRIBE %s %s: %w", r.id, name, err)

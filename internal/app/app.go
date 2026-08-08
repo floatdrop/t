@@ -296,6 +296,18 @@ func (a *App) join(ctx context.Context, req *bridge.JoinRequest) error {
 	return nil
 }
 
+// stopMetrics ends the sampler for a session that is over, so nothing keeps
+// reporting a closed connection's gauges.
+func (a *App) stopMetrics() {
+	a.mu.Lock()
+	stop := a.stopMet
+	a.stopMet = nil
+	a.mu.Unlock()
+	if stop != nil {
+		stop()
+	}
+}
+
 // installRoom makes room the current one and restarts the metrics sampler
 // against its QUIC trace, which is per-session and does not survive a
 // reconnect.
@@ -347,6 +359,14 @@ func (a *App) superviseSession(ctx context.Context, room *conf.Room) {
 		// publish the same tracks twice, and peers would see one participant
 		// as two — worse than the momentary gap that closing first costs.
 		room.Close()
+
+		// Stopped before redialling, not after. The sampler reads the QUIC
+		// trace of the session that just died, and it goes on doing so for the
+		// whole backoff — reporting a frozen RTT and congestion window as
+		// though they were live, on a connection that is closed. Counters are
+		// reset per attempt; these gauges were not, and a stale number
+		// presented as current is worse than a missing one.
+		a.stopMetrics()
 
 		next := a.redial(ctx, detail, preferred)
 		if next == nil {

@@ -737,7 +737,27 @@ export class Capture {
   async #startAudio(settings: AudioSettings): Promise<void> {
     const track = this.stream!.getAudioTracks()[0];
     const ctx = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: 'interactive' });
-    await addTapModule(ctx);
+    try {
+      await addTapModule(ctx);
+    } catch (err) {
+      // No tap means no PCM at all: WebKit has no MediaStreamTrackProcessor,
+      // so this worklet is the only path from the microphone to the encoder.
+      // There is nothing to degrade to, unlike the denoiser — so the call goes
+      // on without a microphone rather than failing a join that has already
+      // been reported as successful and left the user looking at the call.
+      //
+      // It has to say so, though. A microphone that was never published looks
+      // exactly like one nobody is speaking into, and this is the one failure
+      // the person it happened to cannot see: their own tile is drawn from the
+      // capture stream, which is fine, and their speaking ring is driven from
+      // the denoiser, which never runs.
+      void ctx.close();
+      bridge.report('ERROR', 'microphone capture unavailable: the tap worklet would not load', {
+        err: String(err),
+      });
+      bridge.send({ type: 'untrack', untrack: 'audio' });
+      return;
+    }
     this.#audioCtx = ctx;
 
     const encoder = new AudioEncoder({

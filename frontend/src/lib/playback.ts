@@ -435,7 +435,14 @@ export class Playback {
         this.#limiter = limiter;
         this.#audioCtx = ctx;
         return ctx;
-      })();
+      })().catch((err) => {
+        // Forgotten rather than memoised. Every audio sink waits on this one
+        // context and nothing else ever builds another, so a rejection cached
+        // here is every remote participant silent for the rest of the call —
+        // and silent without a symptom, since the tiles keep painting.
+        this.#audioReady = null;
+        throw err;
+      });
     }
     return this.#audioReady;
   }

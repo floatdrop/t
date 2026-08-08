@@ -318,7 +318,16 @@ class Store {
         case 'remoteTrack': {
           const track = msg.track;
           this.tracks = [...this.tracks.filter((t) => t.handle !== track.handle), track];
-          void playback.add(track);
+          // Said out loud rather than dropped on the floor. A sink that fails
+          // to build is a participant nobody can hear or see, and a bare `void`
+          // leaves that as an unhandled rejection nobody is reading.
+          void playback.add(track).catch((err) => {
+            bridge.report('ERROR', 'could not start playback for a remote track', {
+              participant: track.participant,
+              kind: track.config.kind,
+              err: String(err),
+            });
+          });
           break;
         }
 

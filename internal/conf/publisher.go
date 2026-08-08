@@ -26,6 +26,35 @@ var ErrNoPublication = errors.New("conf: no publication for track")
 // has arrived yet — a group must open on one.
 var ErrAwaitingKeyFrame = errors.New("conf: waiting for first keyframe")
 
+// SUBGROUP_DELIVERY_TIMEOUT (§8) per track: how long after a group has been
+// closed we keep trying to get the rest of it there.
+//
+// Without one, QUIC's reliability is applied to media that has no use for it.
+// A group whose tail is still being retransmitted is spending capacity on
+// frames whose moment has passed, on the same connection as the frames that
+// have not — so the retransmission of stale media is what makes the next media
+// stale. The timer starts at Close, when the group is complete and every byte
+// of it is already in the send buffer, so this bounds how long a *finished*
+// group may keep occupying the link and nothing else.
+//
+// Both values are the point past which a subscriber would not use the data
+// anyway. Audio: the player trims its buffer back to 60 ms once more than
+// 250 ms has queued, so a 500 ms group still undelivered a second after it
+// closed would be dropped on arrival. Video: a group is one GOP, and the next
+// keyframe — which is where a subscriber recovers to regardless — is due two
+// seconds after this one opened.
+//
+// The matching OBJECT_DELIVERY_TIMEOUT is deliberately left off. It reads as
+// "how stale may an object be" but moq-go implements it as elapsed time since
+// the *first* object of the subgroup, which makes it a cap on how long a group
+// may stay open: any value below the keyframe interval would reset every video
+// group on a healthy link. The keyframe interval is the frontend's, and this
+// side does not know it.
+const (
+	audioSubgroupTimeout = 1 * time.Second
+	videoSubgroupTimeout = 2 * time.Second
+)
+
 // publisher owns the local participant's three publications: the MSF
 // catalog and the two LOC media tracks.
 type publisher struct {
@@ -92,10 +121,10 @@ func newPublisher(
 	if p.catalog, err = p.publish(ctx, msf.CatalogTrackName); err != nil {
 		return nil, err
 	}
-	if p.video, err = p.newTrack(ctx, VideoTrack); err != nil {
+	if p.video, err = p.newTrack(ctx, VideoTrack, videoSubgroupTimeout); err != nil {
 		return nil, err
 	}
-	if p.audio, err = p.newTrack(ctx, AudioTrack); err != nil {
+	if p.audio, err = p.newTrack(ctx, AudioTrack, audioSubgroupTimeout); err != nil {
 		return nil, err
 	}
 
@@ -139,7 +168,11 @@ func (p *publisher) publish(ctx context.Context, name string) (*session.Publicat
 	return pub, nil
 }
 
-func (p *publisher) newTrack(ctx context.Context, name string) (*trackPublisher, error) {
+func (p *publisher) newTrack(
+	ctx context.Context,
+	name string,
+	subgroupTimeout time.Duration,
+) (*trackPublisher, error) {
 	pub, err := p.publish(ctx, name)
 	if err != nil {
 		return nil, err
@@ -148,6 +181,9 @@ func (p *publisher) newTrack(ctx context.Context, name string) (*trackPublisher,
 		log:     p.log.With("track", name),
 		pub:     pub,
 		counter: p.counters.Track(telemetry.OutPrefix + name),
+		timeouts: message.DeliveryTimeouts{
+			Subgroup: subgroupTimeout,
+		},
 	}, nil
 }
 
@@ -347,6 +383,9 @@ type trackPublisher struct {
 	log     *slog.Logger
 	pub     *session.Publication
 	counter *telemetry.TrackCounter
+	// timeouts is applied to every subgroup this track opens — see the
+	// delivery-timeout constants.
+	timeouts message.DeliveryTimeouts
 
 	// mu serializes writes: the bridge read loop is the only caller
 	// today, but a group boundary spans two operations (close the old
@@ -429,7 +468,9 @@ func (t *trackPublisher) rotateGroup() error {
 	if err != nil {
 		return fmt.Errorf("conf: open subgroup group=%d: %w", t.group, err)
 	}
-	t.subgroup = sg
+	// Returns a copy rather than configuring in place, so the timeout only
+	// applies if the result is what gets kept.
+	t.subgroup = sg.WithDeliveryTimeouts(t.timeouts)
 	t.object = 0
 	t.objectsInGroup = 0
 	t.started = true

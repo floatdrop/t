@@ -123,7 +123,16 @@ func (r *remote) subscribeCatalog() error {
 	if err != nil {
 		return fmt.Errorf("conf: SUBSCRIBE catalog %s: %w", r.id, err)
 	}
+	// Guarded, because this is no longer written only once during setup:
+	// resubscribeCatalog replaces it from the liveness goroutine while close
+	// may be reading it from another.
+	r.mu.Lock()
+	previous := r.catalogSub
 	r.catalogSub = sub
+	r.mu.Unlock()
+	if previous != nil {
+		previous.Close()
+	}
 	r.log.Info("subscribed to catalog", "alias", sub.TrackAlias())
 
 	r.room.router.HandleSubgroups(sub.TrackAlias(), r.readCatalogStream)
@@ -165,8 +174,27 @@ func (r *remote) watchLiveness(sub *session.Subscription) {
 			if r.ctx.Err() != nil {
 				return // we tore the subscription down ourselves
 			}
-			r.log.Info("catalog subscription ended, treating participant as gone",
-				"err", err)
+			// A dead session takes every subscription with it, and the
+			// supervisor is already rebuilding: removing the participant here
+			// would be reporting the session's death once per participant.
+			select {
+			case <-r.room.sess.Done():
+				r.log.Debug("catalog subscription ended with the session")
+				return
+			default:
+			}
+			// The session is alive, so this is one request stream that ended —
+			// a reset, or something unparseable — and the participant may be
+			// perfectly present. Departure is the last conclusion to reach,
+			// not the first: removing them here is permanent, because the
+			// relay will not re-announce a namespace it has already announced,
+			// so they would be gone from this client alone until the next full
+			// reconnect while everyone else still sees them.
+			if r.resubscribeCatalog(err) {
+				return
+			}
+			r.log.Info("catalog subscription could not be re-established, "+
+				"treating participant as gone", "err", err)
 			r.room.removeRemote(r.id)
 			return
 		}
@@ -177,6 +205,40 @@ func (r *remote) watchLiveness(sub *session.Subscription) {
 		}
 		r.log.Debug("catalog request stream message", "type", msg.Type().String())
 	}
+}
+
+// resubscribeCatalog rebuilds the catalog subscription after its request
+// stream ended while the session was still usable. It reports whether it took
+// over the watch — true means a fresh watchLiveness is running and this one
+// should stand down.
+func (r *remote) resubscribeCatalog(cause error) bool {
+	delay := trackRetryDelay
+	for attempt := 1; attempt <= trackRetryLimit; attempt++ {
+		select {
+		case <-r.ctx.Done():
+			return true // torn down deliberately; nothing to report
+		case <-r.room.sess.Done():
+			return true // the supervisor has this
+		case <-time.After(delay):
+		}
+
+		r.mu.Lock()
+		closed := r.closed
+		r.mu.Unlock()
+		if closed {
+			return true
+		}
+
+		if err := r.subscribeCatalog(); err != nil {
+			r.log.Warn("could not re-subscribe to a catalog",
+				"attempt", attempt, "cause", cause, "err", err)
+			delay = min(delay*2, trackRetryMax)
+			continue
+		}
+		r.log.Info("catalog subscription re-established", "attempt", attempt)
+		return true
+	}
+	return false
 }
 
 func (r *remote) readCatalogStream(s *session.IncomingSubgroupStream) {
@@ -529,11 +591,18 @@ func (r *remote) close() {
 
 	r.dropTrack(&r.video)
 	r.dropTrack(&r.audio)
-	if r.catalogFetch != nil {
-		r.catalogFetch.Close()
+
+	// Copied under the lock rather than closed under it: a resubscribe can be
+	// replacing catalogSub concurrently, and Close is not something to hold a
+	// mutex across.
+	r.mu.Lock()
+	fetch, sub := r.catalogFetch, r.catalogSub
+	r.mu.Unlock()
+	if fetch != nil {
+		fetch.Close()
 	}
-	if r.catalogSub != nil {
-		r.catalogSub.Close()
+	if sub != nil {
+		sub.Close()
 	}
 	r.cancel()
 }

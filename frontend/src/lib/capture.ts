@@ -299,6 +299,28 @@ const MAX_AUDIO_ENCODE_QUEUE = Math.max(1, Math.round(MAX_AUDIO_LATE_US / OPUS_F
 const PLAY_TIMEOUT_MS = 3000;
 
 /**
+ * How long the frame pump may go without a callback before it is taken to have
+ * stopped rather than to be running slowly.
+ *
+ * A second is thirty frames at the camera's rate and fifteen at a screen
+ * share's, so a source that is merely struggling is never mistaken for a chain
+ * that has ended. See #startCaptureWatchdog.
+ */
+const CAPTURE_STALL_MS = 1000;
+
+/** How often to check that the frame pump is still being called. */
+const CAPTURE_WATCHDOG_MS = 500;
+
+/**
+ * How many times the pump may be re-armed before the track is withdrawn.
+ *
+ * Re-arming answers a dropped callback. If several in a row change nothing,
+ * the fault is elsewhere and the honest thing is to stop advertising video
+ * nobody is receiving.
+ */
+const MAX_PUMP_RESTARTS = 5;
+
+/**
  * Resolves when work does, or after ms — whichever comes first, saying which.
  *
  * For the promises the platform hands back from a media element, where "it
@@ -363,6 +385,11 @@ export class Capture {
    */
   #videoRunning = false;
   #audioRunning = false;
+  /** The live frame pump, so the watchdog can re-arm the chain it drives. */
+  #pump: (() => void) | null = null;
+  #lastPumpMs = 0;
+  #pumpRestarts = 0;
+  #captureWatchdog: ReturnType<typeof setInterval> | null = null;
   #videoFor: VideoSettings | null = null;
   #audioFor: AudioSettings | null = null;
 
@@ -717,6 +744,11 @@ export class Capture {
 
     const pump = () => {
       if (!this.#videoRunning || !this.#videoEncoder || !this.#video) return;
+      // Proof the chain is alive, for the watchdog below. Recorded on every
+      // callback rather than only on an encode, so a camera that has gone
+      // quiet is not mistaken for a chain that has ended.
+      this.#lastPumpMs = performance.now();
+      this.#pumpRestarts = 0;
 
       // An encoder that is no longer configured has been closed by its own
       // error callback, and closing is terminal — it cannot be reconfigured, so
@@ -774,7 +806,73 @@ export class Capture {
 
     this.#rememberVideo(settings);
     this.#videoRunning = true;
+    this.#pump = pump;
+    this.#lastPumpMs = performance.now();
+    this.#pumpRestarts = 0;
     el.requestVideoFrameCallback(pump);
+    this.#startCaptureWatchdog();
+  }
+
+  /**
+   * Restarts the capture pump if it stops being called.
+   *
+   * The same shape as the presentation loop in playback.ts, and the same
+   * failure: requestVideoFrameCallback re-arms only from inside itself, so one
+   * undelivered callback ends the chain with nothing left to notice. Every
+   * other signal still reads healthy — the encoder is configured, the track is
+   * declared, encodeQueueSize is zero so no drop is counted, and #failVideo is
+   * never reached.
+   *
+   * It is worse here than in playback, because this is the half nobody can
+   * see. The local tile is drawn from the capture stream rather than the
+   * encode path, so it keeps moving; the person whose picture has stopped is
+   * the only one in the call still watching themselves move. Everyone else
+   * sits on a last frame that looks exactly like a peer still connecting.
+   *
+   * A timer, deliberately, because it is a different clock and survives what
+   * stopped the thing it is watching. Re-arming is cheap and harmless if the
+   * chain was merely slow: the pump's own gap check discards a frame that
+   * arrives too soon. Only while the page is visible — a hidden page is
+   * supposed to stop presenting frames, and re-arming into one is a request
+   * per tick that buys nothing.
+   */
+  #startCaptureWatchdog(): void {
+    if (this.#captureWatchdog !== null) return;
+    this.#captureWatchdog = setInterval(() => {
+      if (!this.#videoRunning || !this.#video || !this.#pump) return;
+      if (document.visibilityState !== 'visible') return;
+      const sinceMs = performance.now() - this.#lastPumpMs;
+      if (sinceMs < CAPTURE_STALL_MS) return;
+
+      this.#pumpRestarts++;
+      if (this.#pumpRestarts > MAX_PUMP_RESTARTS && this.#videoEncoder) {
+        // Re-arming has not taken, repeatedly. Whatever is wrong is not a
+        // dropped callback, and a track that advertises video nobody is
+        // sending is worse than one that admits it stopped.
+        this.#failVideo(this.#videoEncoder, 'capture pump will not restart; withdrawing video', {
+          restarts: String(this.#pumpRestarts),
+          stalledMs: String(Math.round(sinceMs)),
+        });
+        return;
+      }
+
+      bridge.report('WARN', 'capture pump stalled; restarting it', {
+        stalledMs: String(Math.round(sinceMs)),
+        attempt: String(this.#pumpRestarts),
+      });
+      // Played again as well as re-armed: a paused element delivers no frame
+      // callbacks at all, and play() on one already playing is a no-op.
+      void this.#video.play().catch(() => {});
+      this.#lastPumpMs = performance.now();
+      this.#video.requestVideoFrameCallback(this.#pump);
+    }, CAPTURE_WATCHDOG_MS);
+  }
+
+  #stopCaptureWatchdog(): void {
+    if (this.#captureWatchdog === null) return;
+    clearInterval(this.#captureWatchdog);
+    this.#captureWatchdog = null;
+    this.#pump = null;
   }
 
   /**
@@ -1229,6 +1327,7 @@ export class Capture {
   /** Releases the camera, its encoder and the frame pump. */
   #stopVideo(): void {
     this.#videoRunning = false;
+    this.#stopCaptureWatchdog();
 
     if (this.#videoEncoder && this.#videoEncoder.state !== 'closed') this.#videoEncoder.close();
     this.#videoEncoder = null;

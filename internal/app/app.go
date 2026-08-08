@@ -374,8 +374,22 @@ func (a *App) redial(ctx context.Context, detail, preferred string) *conf.Room {
 			cfg.Relay = attemptCfg.Relay
 		}
 
+		// Declared before the reconnect is called one, because a session whose
+		// catalog does not describe our tracks is not a recovered call: the
+		// publications exist, so frames go out and the debug panel reads
+		// healthy, but no peer ever subscribes to a track the catalog never
+		// mentioned. Nobody can see or hear us, and everything on our own
+		// screen says otherwise.
+		if err := a.restoreDeclarations(room); err != nil {
+			a.log.Warn("could not restore declarations; retrying the reconnect",
+				"attempt", attempt, "err", err)
+			room.Close()
+			detail = err.Error()
+			delay = min(delay*2, reconnectMaxDelay)
+			continue
+		}
+
 		a.installRoom(ctx, room)
-		a.restoreDeclarations(room)
 		a.reportState(bridge.PhaseJoined, &cfg, "")
 		// A new session has no open group, and the publisher will not start
 		// one on a delta frame, so ask for a keyframe rather than waiting
@@ -406,7 +420,14 @@ func relayForAttempt(configured, preferred string, attempt int) string {
 
 // restoreDeclarations replays the encoder configurations the frontend has
 // already sent, so the new session's catalog describes the same tracks.
-func (a *App) restoreDeclarations(room *conf.Room) {
+//
+// Returns the first failure rather than logging past it. This used to warn and
+// carry on, and the reconnect was then reported as joined regardless — which
+// is the worst of the available outcomes, because everything downstream of it
+// works. The publications are open so writeFrame succeeds, bytes leave, the
+// panel shows healthy publish throughput, and the catalog says this
+// participant has no tracks. Every peer correctly subscribes to nothing.
+func (a *App) restoreDeclarations(room *conf.Room) error {
 	a.mu.Lock()
 	declared := make([]*bridge.TrackConfig, 0, len(a.declared))
 	for _, cfg := range a.declared {
@@ -416,10 +437,10 @@ func (a *App) restoreDeclarations(room *conf.Room) {
 
 	for _, cfg := range declared {
 		if err := room.DeclareTrack(cfg); err != nil {
-			a.log.Warn("could not restore a track declaration",
-				"kind", cfg.Kind, "err", err)
+			return fmt.Errorf("restore %s declaration: %w", cfg.Kind, err)
 		}
 	}
+	return nil
 }
 
 // reportState pushes one session-state update to the frontend.

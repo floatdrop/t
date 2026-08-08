@@ -82,6 +82,24 @@ const RENDER_STALL_MS = 500;
  */
 const CANVAS_RESIZE_INTERVAL_MS = 500;
 
+/**
+ * How long one bitmap conversion may be outstanding before another is allowed.
+ *
+ * A conversion takes about a millisecond, so this is not a deadline it should
+ * ever reach — it is there because "one at a time" was a latch with nothing to
+ * release it. A promise that never settles left the flag raised and every
+ * frame after it was dropped: not a stutter, a tile frozen for the rest of the
+ * call, with data still arriving and every other number healthy. The main
+ * thread being blocked — dragging a window is the documented case, and it is
+ * the same blockage the presentation loop already keeps a watchdog for — is
+ * exactly when a promise is most likely not to come back.
+ *
+ * So the latch expires. A conversion outstanding longer than this is abandoned
+ * rather than waited on, and a later result that arrives after being written
+ * off is discarded instead of painting a stale picture over a fresh one.
+ */
+const PAINT_STUCK_MS = 250;
+
 /** Picks the best available way to paint into a canvas. See [Painter]. */
 function painterFor(canvas: HTMLCanvasElement): Painter | null {
   const bitmap = canvas.getContext('bitmaprenderer');
@@ -196,6 +214,17 @@ interface VideoSink {
    * fresher one anyway.
    */
   painting: boolean;
+  /** When the outstanding conversion started — see PAINT_STUCK_MS. */
+  paintingSince: number;
+  /**
+   * Which conversion is the current one.
+   *
+   * Bumped for each attempt, so a conversion that was abandoned as stuck and
+   * then resolves late can tell that it has been superseded: it must neither
+   * paint its stale frame nor clear the flag belonging to the attempt that
+   * replaced it.
+   */
+  paintSeq: number;
   /**
    * Frames dropped because a bitmap conversion was still in flight.
    *
@@ -409,6 +438,8 @@ export class Playback {
       pending: null,
       sawKeyFrame: false,
       painting: false,
+      paintingSince: 0,
+      paintSeq: 0,
       paintSkipped: 0,
       decoded: 0,
       dropped: 0,
@@ -905,19 +936,28 @@ export class Playback {
     }
 
     if (painter.kind === 'bitmap') {
-      // One conversion at a time — see VideoSink.painting.
-      if (sink.painting) {
+      const now = performance.now();
+      // One conversion at a time, but not for ever — see PAINT_STUCK_MS.
+      if (sink.painting && now - sink.paintingSince < PAINT_STUCK_MS) {
         sink.paintSkipped++;
         frame.close();
         return;
       }
+      if (sink.painting) {
+        this.#paintStuck(sink, now - sink.paintingSince);
+      }
+
+      const seq = ++sink.paintSeq;
       sink.painting = true;
+      sink.paintingSince = now;
+
       createImageBitmap(frame)
         .then((bitmap) => {
-          // The canvas may have gone while this was in flight: a tile
-          // unmounted, a layer switched. Nothing to transfer into, and an
-          // ImageBitmap that is not transferred has to be released by hand.
-          if (sink.painter?.kind === 'bitmap') {
+          // Superseded while in flight, or the canvas has gone — a tile
+          // unmounted, a layer switched. Either way this bitmap must not be
+          // painted, and one that is not transferred has to be released by
+          // hand.
+          if (seq === sink.paintSeq && sink.painter?.kind === 'bitmap') {
             // Takes ownership of the bitmap rather than copying out of it.
             sink.painter.ctx.transferFromImageBitmap(bitmap);
           } else {
@@ -926,7 +966,9 @@ export class Playback {
         })
         .catch((err: unknown) => this.#paintFailed(sink, err))
         .finally(() => {
-          sink.painting = false;
+          // Only the current attempt owns the flag. An abandoned one that
+          // finally comes back must not release a conversion still running.
+          if (seq === sink.paintSeq) sink.painting = false;
           frame.close();
         });
       return;
@@ -954,6 +996,17 @@ export class Playback {
    * every other reason a tile stops moving. Latched, because a failure that
    * repeats at the frame rate would bury the log.
    */
+  /** Reports a conversion abandoned for taking too long, once. */
+  #paintStuck(sink: VideoSink, heldMs: number): void {
+    if (sink.paintFailed) return;
+    sink.paintFailed = true;
+    bridge.report('WARN', 'a frame conversion did not come back; going on without it', {
+      participant: sink.track.participant,
+      handle: String(sink.track.handle),
+      heldMs: String(Math.round(heldMs)),
+    });
+  }
+
   #paintFailed(sink: VideoSink, err: unknown): void {
     if (sink.paintFailed) return;
     sink.paintFailed = true;

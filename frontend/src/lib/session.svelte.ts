@@ -60,6 +60,21 @@ const SPEAKING_TIMEOUT_MS = 400;
  */
 const RESIZE_SETTLE_MS = 300;
 
+/**
+ * How long a layer decision holds before another is allowed.
+ *
+ * Dragging a window past the threshold and back cost a layer change each way,
+ * and each one is a fresh SUBSCRIBE, a new handle, a new decoder and a
+ * backfilled group its live stream waits behind — four of them from one drag,
+ * measured. The resize settle is 300 ms because rebuilding an encoder is what
+ * it was sized for; a layer change is dearer than that and deserves its own,
+ * longer, floor.
+ *
+ * Congestion is exempt. It has its own hold already, and taking the picture
+ * down is the direction that cannot wait.
+ */
+const LAYER_DWELL_MS = 4000;
+
 /** How many times to try building a sink before giving up on a participant. */
 const PLAYBACK_ADD_ATTEMPTS = 3;
 
@@ -393,6 +408,11 @@ class Store {
     };
     // What capture cannot recover from. It reports these to the log as well,
     // but the log is not where someone in a call is looking.
+    // A fault that has been recovered from should stop being on screen: the
+    // banner said others could not see you, and now they can.
+    capture.onRecovered = () => {
+      this.errors = [];
+    };
     capture.onFailure = (detail) => {
       this.reportFault(detail);
     };
@@ -482,6 +502,12 @@ class Store {
     // everything until told otherwise; the observer re-reports as soon as the
     // grid rebuilds.
     this.#visibleTiles = [];
+    this.tilesAreSmall = false;
+    this.#smallChangedAt = 0;
+    if (this.#layerTimer !== null) {
+      clearTimeout(this.#layerTimer);
+      this.#layerTimer = null;
+    }
     this.linkCongested = false;
     this.#congestion.reset();
   }
@@ -886,13 +912,65 @@ class Store {
    */
   expandedTile = $state<string | null>(null);
 
-  tilesAreSmall = $derived(
-    tilesTakeSmallVideo({
-      tiles: this.expandedTile !== null ? 1 : this.participants.length + 1,
-      viewportWidth: this.viewportWidth,
-      pixelRatio: this.pixelRatio,
-    }),
+  /**
+   * Everything the layer decision is made from, as one value.
+   *
+   * The decision itself cannot be derived, because it depends on what was
+   * decided last time — both thresholds and dwell need the previous answer —
+   * so what is derived is the question rather than the answer, and the view
+   * watches this to know when to ask again.
+   */
+  geometryKey = $derived(
+    [
+      this.expandedTile !== null ? 1 : this.participants.length + 1,
+      Math.round(this.viewportWidth),
+      this.pixelRatio,
+    ].join('x'),
   );
+
+  /** The layer decision in force, and when it was last changed. */
+  tilesAreSmall = $state(false);
+  #smallChangedAt = 0;
+  #layerTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * Settles whether the smaller encoding will do, holding the last answer
+   * until the dwell has passed.
+   *
+   * A change that arrives too soon is not discarded, it is deferred: the timer
+   * re-asks once the floor has elapsed, so a drag that ends on the other side
+   * of the threshold still gets there — once, at the end, instead of at every
+   * pause along the way.
+   */
+  #settleLayer(): void {
+    const geometric = tilesTakeSmallVideo(
+      {
+        tiles: this.expandedTile !== null ? 1 : this.participants.length + 1,
+        viewportWidth: this.viewportWidth,
+        pixelRatio: this.pixelRatio,
+      },
+      this.tilesAreSmall,
+    );
+    const want = geometric || this.linkCongested;
+    if (want === this.tilesAreSmall) return;
+
+    // Going down under congestion skips the floor: that path has held for two
+    // seconds already, and it is the one where waiting costs the call.
+    const urgent = want && this.linkCongested;
+    const since = performance.now() - this.#smallChangedAt;
+    if (!urgent && since < LAYER_DWELL_MS) {
+      if (this.#layerTimer === null) {
+        this.#layerTimer = setTimeout(() => {
+          this.#layerTimer = null;
+          this.#sendInterest();
+        }, LAYER_DWELL_MS - since);
+      }
+      return;
+    }
+
+    this.tilesAreSmall = want;
+    this.#smallChangedAt = performance.now();
+  }
 
   /** Re-sends interest after something other than the visible set changed. */
   refreshInterest(): void {
@@ -913,6 +991,7 @@ class Store {
    * remote reconsider its subscriptions for nothing.
    */
   #sendInterest(): void {
+    this.#settleLayer();
     const wanted = [...this.#visibleTiles].sort();
     const small = this.tilesAreSmall || this.linkCongested ? wanted : [];
     const key = `${wanted.join(',')}|${small.join(',')}`;

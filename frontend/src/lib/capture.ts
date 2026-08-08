@@ -379,6 +379,21 @@ const CAPTURE_WATCHDOG_MS = 500;
 const MAX_PUMP_RESTARTS = 5;
 
 /**
+ * How long to wait before offering the camera again, and the ceiling.
+ *
+ * Withdrawing video used to be the end of it: a camera that went quiet for six
+ * seconds was gone for the rest of the call, however long that was, and the
+ * only way back was to leave and rejoin. Which is the failure this codebase
+ * keeps writing down — detected, reported, and then never retried.
+ *
+ * The wait doubles so a device that is genuinely gone is not hammered, and
+ * stops at a minute so one that comes back is picked up while anyone still
+ * cares.
+ */
+const VIDEO_RECOVERY_MS = 2000;
+const VIDEO_RECOVERY_MAX_MS = 60_000;
+
+/**
  * Resolves when work does, or after ms — whichever comes first, saying which.
  *
  * For the promises the platform hands back from a media element, where "it
@@ -502,6 +517,13 @@ export class Capture {
   #audioRestarts = 0;
   #captureWatchdog: ReturnType<typeof setInterval> | null = null;
   #videoFor: VideoSettings | null = null;
+  /** Pending attempt to bring a withdrawn camera back, and how long it waits. */
+  #videoRecovery: ReturnType<typeof setTimeout> | null = null;
+  #videoRecoveryWait = 0;
+  /** Detaches the camera track's own state listeners. */
+  #detachTrackWatch: (() => void) | null = null;
+  /** Latched so a muted camera is reported once, not twice a second. */
+  #reportedMute = false;
   #audioFor: AudioSettings | null = null;
 
   #frameIndex = 0;
@@ -940,6 +962,8 @@ export class Capture {
     };
 
     this.#rememberVideo(settings);
+    const camera = this.#videoTrack();
+    if (camera) this.#watchTrack(camera);
     this.#videoRunning = true;
     this.#pump = pump;
     this.#lastPumpMs = performance.now();
@@ -979,6 +1003,32 @@ export class Capture {
       if (document.visibilityState !== 'visible') return;
       const sinceMs = performance.now() - this.#lastPumpMs;
       if (sinceMs < CAPTURE_STALL_MS) return;
+
+      // Which fault is this? Re-arming answers exactly one of the three, and
+      // counting attempts without asking spent the whole budget on the two it
+      // cannot touch — then withdrew the camera for good.
+      const track = this.#videoTrack();
+      if (track && track.readyState === 'ended') {
+        // The device is gone. No number of re-arms reaches a track that has
+        // ended; only opening it again does.
+        this.#failVideo(this.#videoEncoder, 'the camera was disconnected', {
+          stalledMs: String(Math.round(sinceMs)),
+        });
+        return;
+      }
+      if (track?.muted) {
+        // The source is temporarily dry — another application has the camera,
+        // or the system suspended it. There are no frames to be had and no
+        // callback was dropped, so this must not spend a restart: it ends when
+        // the track unmutes, which it says itself.
+        if (!this.#reportedMute) {
+          this.#reportedMute = true;
+          bridge.report('WARN', 'the camera has gone quiet; waiting for it to come back', {
+            stalledMs: String(Math.round(sinceMs)),
+          });
+        }
+        return;
+      }
 
       this.#pumpRestarts++;
       if (this.#pumpRestarts > MAX_PUMP_RESTARTS && this.#videoEncoder) {
@@ -1052,6 +1102,115 @@ export class Capture {
     });
   }
 
+  /**
+   * Offers the camera again after it has been withdrawn, and keeps offering.
+   *
+   * Rebuilt the same way the audio pipeline is: the device is opened again as
+   * well as restarted, so this covers a track that ended and not only one that
+   * stalled. Each failure lengthens the wait, so a camera that is genuinely
+   * gone costs one attempt a minute rather than a spin.
+   */
+  #scheduleVideoRecovery(): void {
+    if (this.#videoRecovery !== null || !this.#videoFor) return;
+    this.#videoRecoveryWait = this.#videoRecoveryWait
+      ? Math.min(this.#videoRecoveryWait * 2, VIDEO_RECOVERY_MAX_MS)
+      : VIDEO_RECOVERY_MS;
+    const wait = this.#videoRecoveryWait;
+    this.#videoRecovery = setTimeout(() => {
+      this.#videoRecovery = null;
+      this.#recoverVideoNow();
+    }, wait);
+  }
+
+  /** Tries once, now, and schedules the next attempt if it did not take. */
+  #recoverVideoNow(): void {
+    const settings = this.#videoFor;
+    if (!settings || this.#videoRunning) return;
+
+    if (this.#videoRecovery !== null) {
+      clearTimeout(this.#videoRecovery);
+      this.#videoRecovery = null;
+    }
+    bridge.report('INFO', 'trying the camera again', {
+      afterMs: String(this.#videoRecoveryWait),
+    });
+
+    void this.#serial(async () => {
+      if (this.#videoRunning) return;
+      this.#stopVideo();
+      await this.#open(settings, null);
+      await this.#start(settings, null);
+    })
+      .then(() => {
+        if (this.#videoRunning) {
+          this.#videoRecoveryWait = 0;
+          this.#reportedMute = false;
+          bridge.report('INFO', 'the camera is publishing again');
+          this.onRecovered?.();
+          return;
+        }
+        this.#scheduleVideoRecovery();
+      })
+      .catch((err: unknown) => {
+        bridge.report('WARN', 'the camera did not come back', { err: String(err) });
+        this.#scheduleVideoRecovery();
+      });
+  }
+
+  /** The camera track behind the capture element, if there is one. */
+  #videoTrack(): MediaStreamTrack | null {
+    return this.stream?.getVideoTracks()[0] ?? null;
+  }
+
+  /**
+   * Watches the camera track's own account of itself.
+   *
+   * Polling can see that frames stopped; only the track can say why, and it
+   * says so exactly: mute when the source has nothing to give, unmute when it
+   * does again, ended when the device is gone. Before this, a camera that came
+   * back was indistinguishable from one that never left — nothing was
+   * listening, so nothing acted on it.
+   */
+  #watchTrack(track: MediaStreamTrack): void {
+    this.#detachTrackWatch?.();
+
+    const onMute = () => {
+      bridge.report('WARN', 'the camera stopped giving frames', { device: track.label });
+    };
+    const onUnmute = () => {
+      bridge.report('INFO', 'the camera is giving frames again', { device: track.label });
+      this.#reportedMute = false;
+      this.#pumpRestarts = 0;
+      if (this.#videoRunning && this.#video && this.#pump) {
+        // Nothing was rebuilt, so the pump only has to be pointed at the
+        // element again — it stopped being called when the frames stopped.
+        this.#lastPumpMs = performance.now();
+        this.#video.requestVideoFrameCallback(this.#pump);
+        return;
+      }
+      // It was withdrawn while the camera was away, so bring it back now
+      // rather than waiting out a backoff that was sized for a device that
+      // might never return.
+      this.#recoverVideoNow();
+    };
+    const onEnded = () => {
+      bridge.report('WARN', 'the camera was disconnected', { device: track.label });
+      this.#failVideo(this.#videoEncoder, 'the camera was disconnected', {
+        device: track.label,
+      });
+    };
+
+    track.addEventListener('mute', onMute);
+    track.addEventListener('unmute', onUnmute);
+    track.addEventListener('ended', onEnded);
+    this.#detachTrackWatch = () => {
+      track.removeEventListener('mute', onMute);
+      track.removeEventListener('unmute', onUnmute);
+      track.removeEventListener('ended', onEnded);
+      this.#detachTrackWatch = null;
+    };
+  }
+
   #stopCaptureWatchdogIfIdle(): void {
     this.#pump = this.#videoRunning ? this.#pump : null;
     if (this.#captureWatchdog === null) return;
@@ -1078,7 +1237,16 @@ export class Capture {
    * an encoder that has since been replaced belongs to a pipeline that is
    * already gone, and untracking on its behalf would withdraw the live one.
    */
-  #failVideo(encoder: VideoEncoder, reason: string, attrs: Record<string, string>): void {
+  #failVideo(
+    // Nullable, because the faults the watchdog now names — a track that
+    // ended, a device disconnected — are about the camera rather than the
+    // encoder, and can be true when there is no encoder left to blame. The
+    // identity check still holds: null matches null, which is exactly "this is
+    // still the pipeline that failed".
+    encoder: VideoEncoder | null,
+    reason: string,
+    attrs: Record<string, string>,
+  ): void {
     if (this.#videoEncoder !== encoder) return;
     this.#videoRunning = false;
     bridge.report('ERROR', reason, attrs);
@@ -1089,7 +1257,13 @@ export class Capture {
     // never receives another frame — the same freeze this withdrawal exists
     // to prevent, one track along.
     this.#withdrawLowLayer();
-    this.onFailure?.('Your camera stopped publishing — the encoder failed. Others cannot see you.');
+    // Withdrawing says what is true now, not what will be true for the rest of
+    // the call. A camera taken by another application, suspended by the system
+    // or unplugged and plugged back in should cost the seconds it was away.
+    this.#scheduleVideoRecovery();
+    this.onFailure?.(
+      'Your camera stopped publishing. Others cannot see you — trying to bring it back.',
+    );
   }
 
   /**
@@ -1698,6 +1872,13 @@ export class Capture {
    * driven by a denoiser that is no longer being fed.
    */
   onFailure: ((detail: string) => void) | null = null;
+  /**
+   * Called when capture recovers from a failure it has already reported.
+   *
+   * Without it the banner outlives the fault: "others cannot see you" stays on
+   * screen after they can, which is worse than never having said it.
+   */
+  onRecovered: (() => void) | null = null;
 
   /** Samples the counters into per-second rates for the debug panel. */
   sampleStats(): CaptureStats {
@@ -1802,11 +1983,19 @@ export class Capture {
     // Only a full stop re-bases the media clock: everything that was using it
     // is gone, so the next session is free to start from zero.
     this.#epochUs = 0;
+    // Leaving the call is not a fault to recover from.
+    if (this.#videoRecovery !== null) {
+      clearTimeout(this.#videoRecovery);
+      this.#videoRecovery = null;
+    }
+    this.#videoRecoveryWait = 0;
+    this.#reportedMute = false;
   }
 
   /** Releases the camera, its encoder and the frame pump. */
   #stopVideo(): void {
     this.#videoRunning = false;
+    this.#detachTrackWatch?.();
     this.#stopCaptureWatchdogIfIdle();
 
     this.#stopLowLayer();

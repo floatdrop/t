@@ -901,6 +901,34 @@ export class Capture {
     this.onFailure?.('Your camera stopped publishing — the encoder failed. Others cannot see you.');
   }
 
+  /**
+   * Gives up on the audio pipeline once its encoder has failed.
+   *
+   * The twin of #failVideo, and it was missing while that existed: an encoder
+   * error logged a line and changed nothing, so emitAudioFrame's state check
+   * turned every block away for the rest of the call. The catalog kept
+   * declaring audio, so every listener held a decoder that would never be fed
+   * again, and nobody was told.
+   *
+   * It hides better than the video case. The early return happens before the
+   * denoiser runs, so the local speaking ring freezes wherever it last was —
+   * and if that was silent, which it usually is, the speaker's own screen
+   * looks exactly like a working microphone nobody is talking into.
+   */
+  #failAudio(encoder: AudioEncoder, reason: string, attrs: Record<string, string>): void {
+    if (this.#audioEncoder !== encoder) return;
+    this.#audioRunning = false;
+    bridge.report('ERROR', reason, attrs);
+    bridge.send({ type: 'untrack', untrack: 'audio' });
+    // Cleared so the ring does not stay latched on a participant who has
+    // stopped publishing anything to be speaking with.
+    if (this.#voice.speaking) {
+      this.#voice = { speaking: false, level: 0, rfc6464: 127 };
+      this.onVoice?.(this.#voice);
+    }
+    this.onFailure?.('Your microphone stopped publishing — the encoder failed. Others cannot hear you.');
+  }
+
   #onVideoChunk(chunk: EncodedVideoChunk, meta?: EncodedVideoChunkMetadata): void {
     const payload = new Uint8Array(chunk.byteLength);
     chunk.copyTo(payload);
@@ -959,7 +987,11 @@ export class Capture {
 
     const encoder = new AudioEncoder({
       output: (chunk, meta) => this.#onAudioChunk(chunk, meta),
-      error: (err) => bridge.report('ERROR', 'audio encoder failed', { err: String(err) }),
+      error: (err) =>
+        this.#failAudio(encoder, 'audio encoder failed', {
+          err: String(err),
+          bitrate: String(settings.bitrate),
+        }),
     });
     bridge.report('INFO', 'audio encoder configured', {
       codec: AUDIO_CODEC,

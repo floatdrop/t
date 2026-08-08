@@ -35,8 +35,10 @@ type recorder struct {
 
 	frames []bridge.MediaFrame
 	tracks []bridge.RemoteTrack
-	peers  []bridge.Participant
-	errs   []string
+	// gone are the tracks the backend has told the frontend to retire.
+	gone  []bridge.RemoteTrackID
+	peers []bridge.Participant
+	errs  []string
 	// objects counts frames per handle, and bytes their payloads.
 	objects map[uint32]int
 	bytes   map[uint32]int
@@ -63,6 +65,11 @@ func (r *recorder) SendControl(msg *bridge.ServerMessage) {
 	switch msg.Type {
 	case bridge.MsgRemoteTrack:
 		r.tracks = append(r.tracks, *msg.Track)
+	case bridge.MsgTrackGone:
+		// Recorded alongside rather than removed from tracks, which stays
+		// append-only: tests that count subscriptions are counting how many
+		// were announced, and a retirement is its own event.
+		r.gone = append(r.gone, *msg.TrackGone)
 	case bridge.MsgParticipants:
 		r.peers = msg.Participants
 	case bridge.MsgError:

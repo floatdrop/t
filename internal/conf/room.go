@@ -72,6 +72,13 @@ type Room struct {
 	mu      sync.Mutex
 	remotes map[string]*remote
 	closed  bool
+	// videoWant is which participants' video the frontend has asked for, and
+	// videoWantAll is whether it has asked at all. Until it does, every
+	// declared track is subscribed — the behaviour before any of this — so a
+	// frontend that never reports what it can see is over-served rather than
+	// left with a room of blank tiles.
+	videoWant    map[string]bool
+	videoWantAll bool
 }
 
 // Join dials the relay, announces the local participant, and starts
@@ -147,6 +154,8 @@ func Join(ctx context.Context, log *slog.Logger, sink Sink, counters *telemetry.
 		lost:     make(chan struct{}),
 		migrate:  make(chan struct{}),
 		remotes:  make(map[string]*remote),
+
+		videoWantAll: true,
 	}
 	r.handles.Store(bridge.HandleRemoteBase)
 	r.router = newRouter(r.log)
@@ -293,6 +302,46 @@ func (r *Room) UndeclareTrack(kind string) error {
 // WriteFrame publishes one encoded frame captured by the frontend.
 func (r *Room) WriteFrame(f *bridge.MediaFrame) error {
 	return r.pub.writeFrame(f)
+}
+
+// SetVideoInterest records which participants' video is worth receiving and
+// brings every subscription in line with it.
+//
+// The frontend is the only thing that knows this: the grid scrolls, so a
+// nine-person call draws nine tiles and shows perhaps six, and the video for
+// the other three is a megabit each of pictures nobody can see. Discarding
+// them at the decoder would still have paid for them on the wire; not asking
+// is the only saving there is.
+func (r *Room) SetVideoInterest(ids []string) {
+	want := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+
+	r.mu.Lock()
+	r.videoWant = want
+	r.videoWantAll = false
+	remotes := make([]*remote, 0, len(r.remotes))
+	for _, rem := range r.remotes {
+		if rem != nil {
+			remotes = append(remotes, rem)
+		}
+	}
+	r.mu.Unlock()
+
+	// Outside the lock: applying reconciles subscriptions, which reads the
+	// want set back and would deadlock against a lock still held here.
+	for _, rem := range remotes {
+		rem.applyInterest()
+	}
+	r.log.Debug("video interest updated", "wanted", len(want), "participants", len(remotes))
+}
+
+// wantsVideo reports whether a participant's video should be subscribed.
+func (r *Room) wantsVideo(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.videoWantAll || r.videoWant[id]
 }
 
 // watchRoom opens the SUBSCRIBE_NAMESPACE that reports participants

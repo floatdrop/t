@@ -81,8 +81,12 @@
   const hasVideo = $derived(isLocal ? localVideoId !== '' : videoHandle !== null);
 </script>
 
+<!-- data-participant is what the grid's visibility observer keys on, so a tile
+     scrolled out of view can stop being paid for. Absent on the local tile,
+     which is drawn from the camera and was never subscribed to. -->
 <div
   class="tile"
+  data-participant={label || undefined}
   class:local={isLocal}
   class:speaking
   class:screen={localSource === 'screen'}

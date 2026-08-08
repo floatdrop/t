@@ -47,6 +47,9 @@ type App struct {
 	// kind. A reconnect rebuilds the catalog from these, so the frontend
 	// does not have to notice the session was replaced.
 	declared map[string]*bridge.TrackConfig
+	// interest is what the frontend last said it could make use of, replayed
+	// onto a reconnect's fresh Room — see setInterest.
+	interest *bridge.Interest
 	// pendingInvite holds an invite link that arrived before the frontend
 	// was ready to receive it.
 	pendingInvite *bridge.Invite
@@ -146,6 +149,13 @@ func (a *App) HandleControl(ctx context.Context, msg *bridge.ClientMessage) erro
 
 	case bridge.MsgOpenURL:
 		return a.openLink(msg.OpenURL)
+
+	case bridge.MsgInterest:
+		if msg.Interest == nil {
+			return errors.New("app: interest message has no payload")
+		}
+		a.setInterest(msg.Interest)
+		return nil
 
 	case bridge.MsgReport:
 		if msg.Report == nil {
@@ -283,6 +293,7 @@ func (a *App) holdRoom() {
 	// Forgotten so a relay reconnect inside this window does not restore
 	// declarations for encoders that no longer exist.
 	a.declared = map[string]*bridge.TrackConfig{}
+	a.interest = nil
 	if a.reattach != nil {
 		a.reattach.Stop()
 	}
@@ -350,6 +361,7 @@ func (a *App) join(ctx context.Context, req *bridge.JoinRequest) error {
 	a.mu.Lock()
 	a.joined = &cfg
 	a.declared = map[string]*bridge.TrackConfig{}
+	a.interest = nil
 	a.stopSession = stopSession
 	a.mu.Unlock()
 
@@ -510,6 +522,10 @@ func (a *App) redial(ctx context.Context, detail, preferred string) *conf.Room {
 			continue
 		}
 
+		// Not fatal the way the declarations are: over-subscribing costs
+		// bandwidth, where a catalog that describes nothing costs the call.
+		a.restoreInterest(room)
+
 		a.installRoom(ctx, room)
 		a.reportState(bridge.PhaseJoined, &cfg, "")
 		// A new session has no open group, and the publisher will not start
@@ -537,6 +553,34 @@ func relayForAttempt(configured, preferred string, attempt int) string {
 		return preferred
 	}
 	return configured
+}
+
+// setInterest records which remote video the frontend can use and passes it to
+// the live session.
+//
+// Remembered for the same reason the track declarations are: a reconnect
+// builds a fresh Room, which starts out subscribing to everything, and the
+// frontend has no reason to send this again until the next time someone
+// scrolls. Without the replay a reconnect would quietly go back to paying for
+// every tile in the room.
+func (a *App) setInterest(in *bridge.Interest) {
+	a.mu.Lock()
+	a.interest = in
+	room := a.room
+	a.mu.Unlock()
+	if room != nil {
+		room.SetVideoInterest(in.Video)
+	}
+}
+
+// restoreInterest replays what the frontend last said it could see.
+func (a *App) restoreInterest(room *conf.Room) {
+	a.mu.Lock()
+	in := a.interest
+	a.mu.Unlock()
+	if in != nil {
+		room.SetVideoInterest(in.Video)
+	}
 }
 
 // restoreDeclarations replays the encoder configurations the frontend has
@@ -588,6 +632,7 @@ func (a *App) leave() {
 	a.room, a.stopMet, a.stopSession = nil, nil, nil
 	a.joined = nil
 	a.declared = map[string]*bridge.TrackConfig{}
+	a.interest = nil
 	a.mu.Unlock()
 
 	// Stop supervising before closing, or the supervisor would see the

@@ -90,10 +90,17 @@ type remote struct {
 	// retrying marks a resubscribe loop already in flight for this remote.
 	retrying   bool
 	hasCatalog bool
-	nickname   string
-	version    string
-	video      *remoteTrack
-	audio      *remoteTrack
+	// catalogVideo/catalogAudio are what the last catalog declared, which is
+	// not the same as what is subscribed now that the frontend can decline
+	// video it cannot see. The roster reports these: a participant whose tile
+	// is merely scrolled out of view has not turned their camera off, and
+	// saying so would be a lie the moment anyone scrolled back.
+	catalogVideo bool
+	catalogAudio bool
+	nickname     string
+	version      string
+	video        *remoteTrack
+	audio        *remoteTrack
 	// closed stops late catalog updates from resurrecting subscriptions
 	// after the participant has left.
 	closed bool
@@ -377,6 +384,10 @@ func (r *remote) onCatalog(group uint64, payload []byte) {
 		r.nickname = cat.Nickname
 		r.version = cat.Version
 	}
+	// §11.3 Complete means they have ended the broadcast, so it declares
+	// nothing whatever the track fields say.
+	r.catalogVideo = !cat.Complete && cat.Video != nil
+	r.catalogAudio = !cat.Complete && cat.Audio != nil
 	r.mu.Unlock()
 
 	r.log.Info("catalog received",
@@ -406,11 +417,23 @@ func (r *remote) remember(video, audio *bridge.TrackConfig) {
 	r.mu.Unlock()
 }
 
-// missing reports whether a track the catalog asked for has no subscription.
+// missing reports whether a track that should be subscribed is not.
+//
+// Video counts only while the frontend wants it. Otherwise deliberately not
+// subscribing would read as a subscription that failed, and the retry loop
+// would spend its whole budget re-establishing a track nobody asked for before
+// announcing to the user that it had given up on it.
+//
+// The want is read before the lock, not under it: publishParticipants holds the
+// room's lock and calls into each remote, so a remote that reached back into
+// the room while holding its own would close the cycle.
 func (r *remote) missing() bool {
+	wantsVideo := r.room.wantsVideo(r.id)
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return (r.wantVideo != nil && r.video == nil) || (r.wantAudio != nil && r.audio == nil)
+	return (r.wantVideo != nil && r.video == nil && wantsVideo) ||
+		(r.wantAudio != nil && r.audio == nil)
 }
 
 // scheduleResubscribe starts the retry loop, unless one is already running.
@@ -490,8 +513,32 @@ func (r *remote) displayName() string {
 // configs. A nil config means the track should not be subscribed.
 func (r *remote) reconcile(video, audio *bridge.TrackConfig) {
 	r.remember(video, audio)
-	r.syncTrack(&r.video, VideoTrack, bridge.KindVideo, video)
+	// What they publish and what we can use are different questions. The
+	// answer to the second is the frontend's — it knows which tiles are on
+	// screen — and it only ever subtracts: a track the catalog does not
+	// declare cannot be wanted into existence.
+	wanted := video
+	if wanted != nil && !r.room.wantsVideo(r.id) {
+		wanted = nil
+	}
+	r.syncTrack(&r.video, VideoTrack, bridge.KindVideo, wanted)
 	r.syncTrack(&r.audio, AudioTrack, bridge.KindAudio, audio)
+}
+
+// applyInterest re-runs reconcile against the catalog this remote last
+// published, after the frontend has changed what it can see.
+func (r *remote) applyInterest() {
+	r.mu.Lock()
+	video, audio, closed := r.wantVideo, r.wantAudio, r.closed
+	r.mu.Unlock()
+	if closed {
+		return
+	}
+	// Through the same lock a catalog would take, so an interest change and an
+	// arriving catalog cannot both decide the same track's fate at once.
+	r.applying.Lock()
+	defer r.applying.Unlock()
+	r.reconcile(video, audio)
 }
 
 // syncTrack subscribes, unsubscribes, or resubscribes one track so its
@@ -735,7 +782,7 @@ func (r *remote) participant() bridge.Participant {
 		ID:       r.id,
 		Nickname: r.nickname,
 		Version:  r.version,
-		HasVideo: r.video != nil,
-		HasAudio: r.audio != nil,
+		HasVideo: r.catalogVideo,
+		HasAudio: r.catalogAudio,
 	}
 }

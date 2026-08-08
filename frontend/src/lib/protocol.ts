@@ -135,6 +135,10 @@ export type ClientMessage =
   // Handing a link to the OS is the backend's job: navigating this WebView to
   // a web page would replace the app with it, with no way back to the call.
   | { type: 'openUrl'; openUrl: string }
+  // Which remote participants' video is worth receiving. Video only: audio is
+  // never gated on being visible, since someone speaking off-screen has to be
+  // heard, and hearing them is what makes anyone scroll to them.
+  | { type: 'interest'; interest: { video: string[] } }
   | { type: 'report'; report: ClientReport };
 
 /**

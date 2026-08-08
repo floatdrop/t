@@ -468,6 +468,11 @@ class Store {
     this.speakingPeers = [];
     this.#speakingTimers.forEach(clearTimeout);
     this.#speakingTimers.clear();
+    // A fresh session starts out subscribing to everything, so the next
+    // observer reading has to be sent even if the tiles on screen have not
+    // moved — otherwise the deduplication would swallow it and the call would
+    // quietly pay for every tile in the room.
+    this.#interestKey = null;
   }
 
   detach(): void {
@@ -834,6 +839,26 @@ class Store {
     this.logLevel = level;
     bridge.send({ type: 'logLevel', logLevel: level });
   }
+
+  /**
+   * Tells the backend whose video is worth receiving — the tiles on screen,
+   * plus whatever a scroll is about to bring on.
+   *
+   * Sorted and compared against the last set before sending, because the
+   * observer fires on every scroll and the answer usually has not changed.
+   * Re-sending it would make every remote reconsider its subscriptions for
+   * nothing.
+   */
+  setVideoInterest(ids: string[]): void {
+    const wanted = [...ids].sort();
+    const key = wanted.join(',');
+    if (key === this.#interestKey) return;
+    this.#interestKey = key;
+    bridge.send({ type: 'interest', interest: { video: wanted } });
+  }
+
+  /** The last interest set sent, so an unchanged one is not sent twice. */
+  #interestKey: string | null = null;
 
   clearLogs(): void {
     this.logs = [];

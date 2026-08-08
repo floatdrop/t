@@ -93,6 +93,22 @@ type ClientMessage struct {
 	Untrack string `json:"untrack,omitempty"`
 	// OpenURL is a link to hand to the OS browser. See MsgOpenURL.
 	OpenURL string `json:"openUrl,omitempty"`
+	// Interest is which remote video is worth receiving. See MsgInterest.
+	Interest *Interest `json:"interest,omitempty"`
+}
+
+// Interest is the frontend's account of which remote participants' video it
+// can currently make use of: the tiles on screen, plus whatever a scroll is
+// about to bring on.
+//
+// Only video. Audio is never gated on being visible — someone speaking
+// off-screen has to be heard, and the speaking indicator is what makes anyone
+// scroll to them in the first place. It is also 32 kbps against video's
+// 1.5 Mbps, so there is nothing to win by dropping it.
+type Interest struct {
+	// Video lists participant IDs whose video is wanted. An empty list means
+	// none, which is a real answer — everyone can be scrolled off screen.
+	Video []string `json:"video"`
 }
 
 // Client message types.
@@ -112,6 +128,10 @@ const (
 	// itself — that would replace the app with a web page and there would be
 	// no way back — and a target=_blank anchor generally does nothing here.
 	MsgOpenURL = "openUrl"
+
+	// MsgInterest carries which remote participants' video is worth
+	// receiving — the tiles on screen, plus a margin for scrolling.
+	MsgInterest = "interest"
 )
 
 // ClientReport is something the frontend wants in the shared log: a

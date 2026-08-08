@@ -134,6 +134,75 @@
    * that is quietly the wrong size.
    */
   const columns = $derived(expanded !== null ? 1 : tileColumns(remotes.length + 1));
+
+  /**
+   * How far outside the grid a tile still counts as worth receiving.
+   *
+   * A whole viewport in each direction, which is more than it sounds and less
+   * than it needs to be. Subscribing is not instantaneous: a fresh SUBSCRIBE
+   * starts at the live edge and the first thing a decoder can use is the next
+   * keyframe, so a tile subscribed the moment it appears shows nothing for up
+   * to the publisher's keyframe interval — two seconds. There is no way to ask
+   * a remote publisher for one sooner; nobody has a channel to ask on. So the
+   * margin has to be wide enough that the wait happens off screen, and a
+   * viewport of scrolling is about the least that reliably is.
+   */
+  const INTEREST_MARGIN = '100%';
+
+  /**
+   * How long to let the view settle before telling the backend. A scroll fires
+   * the observer many times on the way past, and the answer at the end is the
+   * only one worth acting on — the same reasoning as the resize settle.
+   */
+  const INTEREST_SETTLE_MS = 250;
+
+  let gridEl = $state<HTMLDivElement | undefined>();
+
+  /**
+   * Reports which tiles are on screen, so the backend can stop subscribing to
+   * the video of people nobody can see.
+   *
+   * The grid scrolls — that is the whole reason this exists. A nine-person
+   * call draws nine tiles and shows perhaps six, and the other three are a
+   * megabit each of pictures being decoded into a scroll region nobody is
+   * looking at. Discarding them here would still have paid for them on the
+   * wire; not asking is the only saving available.
+   *
+   * Re-observes whenever the set of tiles changes, which is why remotes and
+   * expanded are read: solo view renders exactly one tile, and everyone else
+   * stops being visible in the most literal sense.
+   */
+  $effect(() => {
+    void remotes.length;
+    void expanded;
+    const root = gridEl;
+    if (!root) return;
+
+    const visible = new Set<string>();
+    let settle: ReturnType<typeof setTimeout> | undefined;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const id = (entry.target as HTMLElement).dataset.participant;
+          if (!id) continue;
+          if (entry.isIntersecting) visible.add(id);
+          else visible.delete(id);
+        }
+        clearTimeout(settle);
+        settle = setTimeout(() => store.setVideoInterest([...visible]), INTEREST_SETTLE_MS);
+      },
+      { root, rootMargin: INTEREST_MARGIN, threshold: 0 },
+    );
+
+    for (const tile of root.querySelectorAll('[data-participant]')) {
+      observer.observe(tile);
+    }
+    return () => {
+      clearTimeout(settle);
+      observer.disconnect();
+    };
+  });
 </script>
 
 <div class="conference">
@@ -183,6 +252,7 @@
   <!-- Padding and gap come from the same constants, since the width they leave
        for a tile is exactly what Auto resolution measures against. -->
   <div
+    bind:this={gridEl}
     class="grid"
     class:solo={expanded !== null}
     style:grid-template-columns={`repeat(${columns}, minmax(0, 1fr))`}

@@ -784,12 +784,6 @@ export class Capture {
       bitrate: settings.bitrate,
       framerate,
       latencyMode: 'realtime',
-      // Asked for rather than assumed. The default is no preference, and a
-      // realtime H.264 encode is exactly the case a platform may answer in
-      // software — which on a machine already running a second encoder and a
-      // decoder per participant is the difference between keeping up and the
-      // capture pipeline stalling.
-      hardwareAcceleration: 'prefer-hardware',
       // Annex B puts SPS/PPS in the bitstream ahead of every keyframe, so
       // a subscriber can start decoding from any group without an
       // out-of-band description.
@@ -1176,7 +1170,6 @@ export class Capture {
         bitrate: rung.minBitrate,
         framerate: framerate / LOW_LAYER_FRAME_DIVISOR,
         latencyMode: 'realtime',
-        hardwareAcceleration: 'prefer-hardware',
         avc: { format: 'annexb' },
       });
     } catch (err) {

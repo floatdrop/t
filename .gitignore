@@ -4,6 +4,10 @@ frontend/dist
 frontend/node_modules
 build/linux/appimage/build
 build/windows/nsis/MicrosoftEdgeWebview2Setup.exe
+# Go workspace (per-machine; names paths like ../moq-go that exist on one
+# disk and on no CI runner)
+go.work
+go.work.sum
 # Mobile generated (per-machine; overlays hold absolute paths)
 build/ios/xcode/overlay.json
 build/ios/xcode/gen/

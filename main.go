@@ -92,8 +92,15 @@ func main() {
 	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
 	go func() {
-		if err := server.Serve(ctx); err != nil {
-			logger.Error("bridge server stopped", "err", err)
+		if err := server.Serve(ctx); err != nil && ctx.Err() == nil {
+			// Fatal, not merely logged. The listener is the only way the
+			// WebView reaches the backend: without it nothing can join, no
+			// call can be made, and every future reconnect attempt finds a
+			// closed port — while the window stays open looking perfectly
+			// usable. An app that cannot do the one thing it is for should
+			// stop rather than pretend.
+			logger.Error("bridge server stopped; the app cannot serve its own frontend", "err", err)
+			log.Fatal(err)
 		}
 	}()
 	endpoint := server.Endpoint()

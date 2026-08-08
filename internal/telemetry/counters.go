@@ -38,6 +38,10 @@ func (c *TrackCounter) AddArrival(now time.Time, mediaMicros uint64) {
 	c.skew.Add(now, mediaMicros)
 }
 
+// Lag reports how far this track has slipped behind where it started, in
+// milliseconds, and whether there is anything to report. See [SkewTracker.Lag].
+func (c *TrackCounter) Lag() (float64, bool) { return c.skew.Lag() }
+
 func (c *TrackCounter) read() trackSample {
 	s := trackSample{
 		bytes:   c.bytes.Load(),
@@ -45,6 +49,7 @@ func (c *TrackCounter) read() trackSample {
 		groups:  c.groups.Load(),
 	}
 	s.skew, s.hasSkew = c.skew.Slope()
+	s.lag, _ = c.skew.Lag()
 	return s
 }
 
@@ -56,6 +61,7 @@ type trackSample struct {
 	groups  uint64
 	skew    float64
 	hasSkew bool
+	lag     float64
 }
 
 // Registry holds the counters for every live track, keyed by a display
@@ -212,6 +218,8 @@ func (s *Sampler) Sample(now time.Time) bridge.Metrics {
 		if cur.hasSkew {
 			skew := cur.skew
 			tm.SkewMillisPerSec = &skew
+			lag := cur.lag
+			tm.LagMillis = &lag
 		}
 		if !first {
 			tm.Kbps = kbps(diff(cur.bytes, prev.bytes), elapsed)

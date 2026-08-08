@@ -149,3 +149,37 @@ func TestSkewForgetsOldSamples(t *testing.T) {
 		t.Errorf("slope = %v ms/s, want ~0: the bad stretch should have aged out", slope)
 	}
 }
+
+// Slope says a call is falling behind; Lag says it has fallen behind. The
+// second is what a subscription is rebuilt to escape, and the two answer
+// different questions from the same samples.
+func TestSkewReportsAccumulatedLag(t *testing.T) {
+	var s SkewTracker
+	if _, ok := s.Lag(); ok {
+		t.Error("reported a lag before any object arrived")
+	}
+
+	// Four seconds at 1% slower than the media clock is 40 ms of slip.
+	feed(&s, 200, 0.01)
+
+	lag, ok := s.Lag()
+	if !ok {
+		t.Fatal("no lag after four seconds of arrivals")
+	}
+	if math.Abs(lag-40) > 5 {
+		t.Errorf("lag = %v ms, want ~40 for 4 s at 1%% behind", lag)
+	}
+}
+
+func TestSkewLagStaysFlatWhenKeepingUp(t *testing.T) {
+	var s SkewTracker
+	feed(&s, 200, 0)
+
+	lag, ok := s.Lag()
+	if !ok {
+		t.Fatal("no lag reported")
+	}
+	if math.Abs(lag) > 1 {
+		t.Errorf("lag = %v ms on a path that is keeping up, want ~0", lag)
+	}
+}

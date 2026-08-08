@@ -65,6 +65,35 @@ func (l videoLevel) String() string {
 	}
 }
 
+// maxLag is how far behind the live edge a subscription may slip before it is
+// rebuilt to escape it.
+//
+// Falling behind is not the same problem as being sent too much, and the
+// ladder does not solve it. A path that is only mildly over capacity never
+// earns the relay's verdict and never moves the drift trend far enough to
+// demote — it just delivers everything a little late, and a little later
+// again, until the call is a minute behind. Nothing local notices: audio,
+// video and their sync are all consistently late together, buffers look
+// healthy, and there is no shared clock to measure lateness against.
+//
+// So the accumulated slip is the signal, and rebuilding the subscription is
+// the escape: a fresh SUBSCRIBE starts at the live edge by definition. A
+// second and a half is above the quarter second the player trims to and below
+// the point where anyone would call it a delay rather than a stutter.
+const maxLag = 1500 * time.Millisecond
+
+// resyncCooldown keeps a link that cannot hold the live edge from rebuilding
+// its subscriptions continuously. Each rebuild costs a SUBSCRIBE and a
+// backfilled group; doing it every second would spend more of the link on
+// recovering than on media.
+const resyncCooldown = 15 * time.Second
+
+// lagCheckObjects is how often the slip is examined, in audio objects. At the
+// 20 ms cadence audio is produced on, fifty of them is about a second — often
+// enough to catch a slip while it is still seconds rather than minutes, rare
+// enough to be free.
+const lagCheckObjects = 50
+
 // videoRecovery is how long a demotion holds before this client tries one step
 // back up.
 //
@@ -143,6 +172,10 @@ type remote struct {
 	// each of them, so the same verdict lands more than once; without this
 	// every stream of a dead subscription would demote another step.
 	demotedFor uint32
+	// resyncedAt is when this participant's subscriptions were last rebuilt to
+	// escape a slip, so a link that cannot hold the live edge does not rebuild
+	// them continuously.
+	resyncedAt time.Time
 	// recovery lifts the demotion once the link has been quiet. Replaced on
 	// each demotion, so the wait always runs from the most recent one.
 	recovery *time.Timer
@@ -161,7 +194,11 @@ type remoteTrack struct {
 	name   string
 	config bridge.TrackConfig
 	sub    *session.Subscription
-	label  string
+	// fetch is the joining FETCH that backfilled the group in progress when
+	// this track was subscribed. Nil on audio, and on video whose backfill was
+	// refused.
+	fetch *session.FetchRequest
+	label string
 }
 
 // newRemote subscribes to a newly discovered participant's catalog. The
@@ -685,14 +722,15 @@ func (r *remote) subscribeTrack(slot **remoteTrack, name string, kind uint8, cfg
 	if kind == bridge.KindAudio {
 		priority = audioPriority
 	}
-	sub, err := r.room.sess.Subscribe(r.ctx, &message.Subscribe{
+	subMsg := &message.Subscribe{
 		Namespace: r.ns,
 		Name:      []byte(name),
 		Parameters: message.Parameters{
 			message.LargestObjectFilter(),
 			message.SubscriberPriorityParam(priority),
 		},
-	})
+	}
+	sub, err := r.room.sess.Subscribe(r.ctx, subMsg)
 	if err != nil {
 		return fmt.Errorf("conf: SUBSCRIBE %s %s: %w", r.id, name, err)
 	}
@@ -736,7 +774,104 @@ func (r *remote) subscribeTrack(slot **remoteTrack, name string, kind uint8, cfg
 	})
 	r.log.Info("subscribed to track",
 		"track", name, "alias", sub.TrackAlias(), "handle", handle, "codec", cfg.Codec)
+
+	if kind == bridge.KindVideo {
+		r.backfillGroup(subMsg.RequestID, track, counter)
+	}
 	return nil
+}
+
+// backfillGroup asks for the group already in progress, so a fresh video
+// subscription has a picture now rather than at the next keyframe.
+//
+// A SUBSCRIBE with the largest-object filter starts at the first object *after*
+// whatever exists, which for video is the middle of a GOP — undecodable, since
+// playback discards inbound frames until it sees a keyframe. So a new
+// subscription showed nothing at all until the publisher's next keyframe, up to
+// the whole keyframe interval away, and there is no way to ask a remote
+// publisher to produce one sooner. Every layer change, every demotion and every
+// tile scrolled back into view paid that.
+//
+// The Relative Joining FETCH (§10.12.2) with JoiningStart=0 resolves to
+// {largest.Group, 0} through {largest.Group, largest.Object + 1} — the current
+// group from its keyframe up to exactly where the subscription begins. The two
+// ranges are adjacent: no object arrives twice and none is skipped. It is the
+// same pairing the catalog subscription has always used.
+//
+// Video only. The same backfill on audio would deliver up to half a second of
+// sound that has already been and gone, straight into a player whose whole job
+// is staying near the live edge.
+func (r *remote) backfillGroup(
+	subscribeID uint64,
+	track *remoteTrack,
+	counter *telemetry.TrackCounter,
+) {
+	fetchMsg := &message.Fetch{
+		FetchType: message.FetchTypeRelativeJoining,
+		Joining: &message.JoiningFetch{
+			JoiningRequestID: subscribeID,
+			JoiningStart:     0,
+		},
+	}
+	fetch, err := r.room.sess.Fetch(r.ctx, fetchMsg)
+	if err != nil {
+		// Degraded, not fatal: without it the tile stays blank until the next
+		// keyframe, which is exactly what it did before this existed.
+		r.log.Debug("video backfill FETCH refused", "handle", track.handle, "err", err)
+		return
+	}
+
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		fetch.Close()
+		return
+	}
+	track.fetch = fetch
+	r.mu.Unlock()
+
+	r.room.router.HandleFetch(fetchMsg.RequestID, func(s *session.IncomingFetchStream) {
+		r.readMediaFetch(s, track, counter)
+	})
+}
+
+// readMediaFetch drains a backfilled group, forwarding it exactly as the live
+// path does.
+func (r *remote) readMediaFetch(
+	s *session.IncomingFetchStream,
+	track *remoteTrack,
+	counter *telemetry.TrackCounter,
+) {
+	counter.AddGroup()
+	for {
+		obj, err := s.ReadDecoded()
+		if err != nil {
+			if !errors.Is(err, io.EOF) && r.ctx.Err() == nil {
+				r.log.Debug("video backfill ended", "handle", track.handle, "err", err)
+			}
+			return
+		}
+		// §11.4.4.2 absence markers carry no payload.
+		if obj.EndOfNonExistentRange || obj.EndOfUnknownRange {
+			continue
+		}
+
+		decoded, err := loc.Decode(obj.Properties, obj.Payload)
+		if err != nil {
+			r.log.Warn("LOC decode failed in backfill", "handle", track.handle, "err", err)
+			continue
+		}
+
+		counter.AddObject(len(decoded.Payload))
+		r.room.sink.SendMedia(&bridge.MediaFrame{
+			Kind:      track.kind,
+			Handle:    track.handle,
+			Timestamp: scaleTimestamp(decoded.Properties),
+			KeyFrame:  obj.ObjectID == 0,
+			Config:    decoded.Properties.VideoConfig,
+			Payload:   decoded.Payload,
+		})
+	}
 }
 
 // dropTrack closes one media subscription and tells the frontend to
@@ -751,6 +886,9 @@ func (r *remote) dropTrack(slot **remoteTrack) {
 	}
 
 	track.sub.Close()
+	if track.fetch != nil {
+		track.fetch.Close()
+	}
 	r.room.counters.Forget(track.label)
 	r.room.sink.SendControl(&bridge.ServerMessage{
 		Type:      bridge.MsgTrackGone,
@@ -766,6 +904,7 @@ func (r *remote) readMedia(
 	counter *telemetry.TrackCounter,
 ) {
 	counter.AddGroup()
+	var seen int
 	for {
 		obj, err := s.ReadDecoded()
 		if err != nil {
@@ -799,6 +938,9 @@ func (r *remote) readMedia(
 			// produced on a fixed 20 ms cadence and is the one track never
 			// dropped, so the measurement survives whatever else gets shed.
 			counter.AddArrival(time.Now(), frame.Timestamp)
+			if seen++; seen%lagCheckObjects == 0 {
+				r.checkLag(counter)
+			}
 		}
 
 		counter.AddObject(len(decoded.Payload))
@@ -941,6 +1083,42 @@ func (r *remote) recover() {
 	if more {
 		r.scheduleRecovery()
 	}
+}
+
+// checkLag rebuilds this participant's subscriptions when they have slipped too
+// far behind the live edge.
+//
+// Measured on audio, because that is the track the drift meter is fed from and
+// the one that is never dropped — but acted on for both, since a path that is
+// late is late for everything on it, and leaving video where it was would put
+// the picture a minute behind the sound.
+func (r *remote) checkLag(counter *telemetry.TrackCounter) {
+	lag, ok := counter.Lag()
+	if !ok || lag < float64(maxLag/time.Millisecond) {
+		return
+	}
+
+	r.mu.Lock()
+	if r.closed || time.Since(r.resyncedAt) < resyncCooldown {
+		r.mu.Unlock()
+		return
+	}
+	r.resyncedAt = time.Now()
+	video, videoLow, audio := r.wantVideo, r.wantVideoLow, r.wantAudio
+	r.mu.Unlock()
+
+	r.log.Warn("this participant has slipped behind the live edge; resubscribing",
+		"lag_ms", int(lag), "limit_ms", int(maxLag/time.Millisecond))
+
+	// Dropped rather than reconciled in place: reconcile leaves a track whose
+	// config has not changed exactly where it is, which is the whole problem —
+	// it is not the wrong track, it is the right track too far back.
+	r.dropTrack(&r.video)
+	r.dropTrack(&r.audio)
+
+	r.applying.Lock()
+	r.reconcile(video, videoLow, audio)
+	r.applying.Unlock()
 }
 
 // scaleTimestamp converts a LOC timestamp to microseconds, which is what

@@ -213,6 +213,13 @@ export interface TrackMetrics {
    * trend. Absent and zero are different answers: zero means keeping up.
    */
   skewMillisPerSec?: number;
+  /**
+   * How much later objects are arriving now than when this subscription
+   * started — the integral of the above. The slope says the call is falling
+   * behind; this says it has fallen behind, and is what a resubscribe exists
+   * to reset.
+   */
+  lagMillis?: number;
 }
 
 export interface Metrics {

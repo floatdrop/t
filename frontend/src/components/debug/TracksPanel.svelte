@@ -148,6 +148,10 @@
                  being sent than is getting through. Audio carries it, because
                  it is the track produced on a fixed cadence. -->
             <th scope="col">Drift</th>
+            <!-- How far behind the live edge this track has slipped since it
+                 was subscribed. The backend rebuilds a subscription that gets
+                 too far behind, so this returning to zero is that working. -->
+            <th scope="col">Behind</th>
           </tr>
         </thead>
         <tbody>
@@ -163,6 +167,15 @@
                        being a plausible explanation. -->
                   <span class={t.skewMillisPerSec > 1 ? 'warn' : ''}>
                     {t.skewMillisPerSec > 0 ? '+' : ''}{t.skewMillisPerSec.toFixed(1)} ms/s
+                  </span>
+                {:else}
+                  —
+                {/if}
+              </td>
+              <td>
+                {#if t.lagMillis !== undefined}
+                  <span class={t.lagMillis > 500 ? 'warn' : ''}>
+                    {t.lagMillis > 0 ? '+' : ''}{t.lagMillis.toFixed(0)} ms
                   </span>
                 {:else}
                   —

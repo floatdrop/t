@@ -365,6 +365,10 @@ type TrackMetrics struct {
 	// to fit a trend, which is why it is a pointer: zero means "keeping up",
 	// not "no reading".
 	SkewMillisPerSec *float64 `json:"skewMillisPerSec,omitempty"`
+	// LagMillis is how much later objects are arriving now than when this
+	// subscription started — the integral of the above. It says the call has
+	// fallen behind, where the slope says it is falling behind.
+	LagMillis *float64 `json:"lagMillis,omitempty"`
 }
 
 // Endpoint is what the asset handler serves at /__bridge so the frontend

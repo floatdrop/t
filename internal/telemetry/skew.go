@@ -103,6 +103,24 @@ func (s *SkewTracker) Add(now time.Time, mediaMicros uint64) {
 	}
 }
 
+// Lag returns how much later objects are arriving now than they were when this
+// subscription started, in milliseconds.
+//
+// The integral of what Slope reports, and the number that says a call has
+// fallen behind rather than that it is falling behind. It is relative to the
+// first sample, not to real time — no shared clock exists to measure that
+// against — so it answers "how much have we slipped since we subscribed",
+// which is the question worth acting on: a subscription is rebuilt to escape
+// it, and the rebuilt one starts measuring from zero.
+func (s *SkewTracker) Lag() (float64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.samples) == 0 {
+		return 0, false
+	}
+	return s.samples[len(s.samples)-1].skew, true
+}
+
 // Slope returns the trend in milliseconds of accumulated delay per second of
 // wall clock, and whether there was enough history to fit one.
 //

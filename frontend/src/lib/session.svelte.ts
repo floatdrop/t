@@ -701,7 +701,17 @@ class Store {
 
     bridge.send({ type: 'join', join: { relay, room, nickname } });
     await this.#awaitPhase('joined', 15000);
-    await capture.start(this.videoSettings, this.audioSettings);
+    try {
+      await capture.start(this.videoSettings, this.audioSettings);
+    } catch (err) {
+      // The phase is already "joined" by now, so the conference is on screen
+      // and the welcome screen that would have shown this is gone. Without
+      // saying so here, a capture that failed after the room was joined is a
+      // call with an empty catalog and nothing anywhere to explain it.
+      bridge.report('ERROR', 'capture failed to start after joining', { err: String(err) });
+      this.reportFault('Could not start your camera or microphone. Others cannot see or hear you.');
+      throw err;
+    }
   }
 
   leave(): void {

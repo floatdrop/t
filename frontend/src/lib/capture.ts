@@ -295,6 +295,34 @@ const MAX_AUDIO_LATE_US = 80_000;
  */
 const MAX_AUDIO_ENCODE_QUEUE = Math.max(1, Math.round(MAX_AUDIO_LATE_US / OPUS_FRAME_US));
 
+/** How long to wait for the capture element to start playing before going on. */
+const PLAY_TIMEOUT_MS = 3000;
+
+/**
+ * Resolves when work does, or after ms — whichever comes first, saying which.
+ *
+ * For the promises the platform hands back from a media element, where "it
+ * never settles" is a real outcome and the caller has something better to do
+ * than wait for it forever.
+ */
+async function withTimeout<T>(work: Promise<T>, ms: number, what: string): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<null>((resolve) => {
+    timer = setTimeout(() => {
+      bridge.report('WARN', 'timed out waiting on the platform; carrying on', {
+        what,
+        afterMs: String(ms),
+      });
+      resolve(null);
+    }, ms);
+  });
+  try {
+    return await Promise.race([work, expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * How long the capture clock may be wrong before the epoch is corrected.
  *
@@ -610,7 +638,18 @@ export class Capture {
     el.srcObject = new MediaStream([track]);
     el.muted = true;
     el.playsInline = true;
-    await el.play();
+    // Not awaited without a bound. play() on a MediaStream element is a
+    // promise the platform is under no obligation to settle promptly, and the
+    // whole of start() is behind it: a join awaits start, so a play that never
+    // settles is a call that reaches "joined", shows a conference, publishes
+    // nothing and says nothing — devices open, catalog empty, no error
+    // anywhere. Seen exactly once and not reproduced since, which is reason to
+    // bound it rather than to wait for a better explanation.
+    //
+    // Proceeding early is safe: the pump is driven by requestVideoFrameCallback
+    // on this element, so if it starts playing later the frames simply begin
+    // then, and if it never does the watchdog below has something to report.
+    await withTimeout(el.play(), PLAY_TIMEOUT_MS, 'video element play()');
     this.#video = el;
 
     const encoder = new VideoEncoder({

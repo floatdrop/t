@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -34,10 +35,19 @@ const sendQueueDepth = 256
 // controlQueueDepth bounds the outbound control queue, which is separate
 // because control messages are not interchangeable the way frames are. A
 // dropped remoteTrack announcement is a participant who never gets a decoder;
-// a dropped state is a session phase the frontend never learns about. They are
-// small, they are rare, and there is no version of "too many" worth reaching
-// for — this is sized so the question does not arise.
-const controlQueueDepth = 1024
+// a dropped state is a session phase the frontend never learns about.
+//
+// Comfortably above telemetry.logRingSize, because HandleConnect replays the
+// whole ring into this queue the moment a frontend attaches, before it has
+// read anything. Sized under that and a reconnecting WebView would overflow
+// its own backlog on arrival.
+const controlQueueDepth = 4096
+
+// writeTimeout bounds one WebSocket write. Without it a frontend that has
+// stopped reading — which one does, for as long as macOS is resizing its
+// window — blocks the write loop on a send that has nowhere to go, and the
+// queues behind it fill with nothing draining them.
+const writeTimeout = 10 * time.Second
 
 // Handler consumes what arrives from the frontend. Both methods are
 // called from the connection's read goroutine, one at a time.
@@ -219,7 +229,10 @@ func (s *Server) readLoop(ctx context.Context, c *conn) {
 
 func (c *conn) writeLoop(log *slog.Logger) {
 	write := func(msg outbound) bool {
-		if err := c.ws.Write(c.ctx, msg.typ, msg.data); err != nil {
+		ctx, cancel := context.WithTimeout(c.ctx, writeTimeout)
+		err := c.ws.Write(ctx, msg.typ, msg.data)
+		cancel()
+		if err != nil {
 			if c.ctx.Err() == nil && !isNormalClose(err) {
 				log.Warn("bridge: write failed", "err", err)
 			}
@@ -298,6 +311,22 @@ func (s *Server) SendMedia(f *MediaFrame) {
 
 // enqueueControl queues a control message, which is never dropped for
 // backpressure: unlike frames, no two of them are interchangeable.
+//
+// Never blocks either, which is the harder half. Every goroutine in the
+// process reaches this: the log sink emits synchronously on whichever
+// goroutine called slog, and slog is the default logger, so moq-go's and
+// quic-go's own diagnostics arrive here too. Waiting for room would therefore
+// stall the metrics sampler, the bridge read loop, whichever conf goroutine
+// was mid-subscribe holding its lock, and the transport underneath — on
+// nothing more than a frontend that stopped reading its socket.
+//
+// So a full queue is treated as what it is. A thousand messages have gone
+// unread; the frontend is gone in all but name, and the connection is failed
+// rather than propped up. The WebView reconnects on its own and gets a fresh
+// state message on attach, which is exactly the recovery path this has.
+//
+// Deliberately silent: reporting it would call slog, which would come straight
+// back here.
 func (s *Server) enqueueControl(msg outbound) {
 	c := s.current()
 	if c == nil {
@@ -306,6 +335,8 @@ func (s *Server) enqueueControl(msg outbound) {
 	select {
 	case c.control <- msg:
 	case <-c.ctx.Done():
+	default:
+		c.cancel()
 	}
 }
 

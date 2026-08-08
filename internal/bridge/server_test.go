@@ -103,12 +103,6 @@ func TestControlSurvivesASaturatedMediaQueue(t *testing.T) {
 // waited for room would wedge the MOQ read loop that called it.
 func TestSendOnADeadConnectionDoesNotBlock(t *testing.T) {
 	s, c := stalledConn(t)
-	for i := range controlQueueDepth {
-		s.SendControl(&ServerMessage{Type: MsgState, State: &SessionState{Phase: PhaseJoined}})
-		if i == 0 {
-			continue
-		}
-	}
 	c.cancel() // the connection has gone away
 
 	done := make(chan struct{})
@@ -121,6 +115,52 @@ func TestSendOnADeadConnectionDoesNotBlock(t *testing.T) {
 	case <-done:
 	case <-t.Context().Done():
 		t.Fatal("send blocked on a connection that is already gone")
+	}
+}
+
+// TestControlOverflowFailsTheConnectionRatherThanBlocking covers the deadlock
+// that a never-dropping control queue invites.
+//
+// Every goroutine in the process reaches enqueueControl: the log sink emits
+// synchronously on whichever goroutine called slog, and slog is the default
+// logger, so the transport's own diagnostics arrive here too. If a full queue
+// waited for room, a frontend that merely stopped reading its socket would
+// stall the metrics sampler, the read loop, whichever conf goroutine was
+// mid-subscribe holding its lock, and quic-go underneath it — the whole
+// backend, on nothing worse than a window being resized.
+func TestControlOverflowFailsTheConnectionRatherThanBlocking(t *testing.T) {
+	s, c := stalledConn(t)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Twice the depth, so the overflow is reached with plenty to spare.
+		for range controlQueueDepth * 2 {
+			s.SendControl(&ServerMessage{Type: MsgState, State: &SessionState{Phase: PhaseJoined}})
+		}
+	}()
+	select {
+	case <-done:
+	case <-t.Context().Done():
+		t.Fatal("a full control queue blocked the sender")
+	}
+
+	if c.ctx.Err() == nil {
+		t.Error("the connection survived a control queue that overflowed; " +
+			"a frontend that far behind is gone and should be failed, not propped up")
+	}
+}
+
+// TestControlQueueOutgrowsTheLogBackfill pins a coupling that is invisible at
+// either end: HandleConnect replays the whole log ring into this queue the
+// moment a frontend attaches, before it has read a byte. Sized under that, a
+// reconnecting WebView would overflow its own backlog on arrival and be
+// disconnected for it — a reconnect loop that can never converge.
+func TestControlQueueOutgrowsTheLogBackfill(t *testing.T) {
+	const logRingSize = 2000 // telemetry.logRingSize, unexported
+	if controlQueueDepth <= logRingSize {
+		t.Fatalf("controlQueueDepth %d must exceed the %d-entry log backfill",
+			controlQueueDepth, logRingSize)
 	}
 }
 

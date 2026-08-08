@@ -517,7 +517,14 @@ export class Playback {
         }
         video.sawKeyFrame = true;
       }
-      if (video.decoder.state !== 'configured') return;
+      // A decoder that is closed or still being rebuilt takes nothing, and
+      // every frame it turns away is a frame the viewer does not see. Counted
+      // so the gap between a decoder that is failing and a track that is not
+      // arriving is visible in the panel rather than being guessed at.
+      if (video.decoder.state !== 'configured') {
+        video.dropped++;
+        return;
+      }
       try {
         video.decoder.decode(new EncodedVideoChunk({
           type: frame.keyFrame ? 'key' : 'delta',
@@ -540,7 +547,10 @@ export class Playback {
       const { voiceActivity, level } = decodeAudioLevel(frame.audioLevel);
       this.onVoice?.(sink.track.participant, voiceActivity, level);
     }
-    if (audio.decoder.state !== 'configured') return;
+    if (audio.decoder.state !== 'configured') {
+      audio.dropped++;
+      return;
+    }
     try {
       audio.decoder.decode(new EncodedAudioChunk({
         // Every Opus packet stands on its own.
@@ -566,7 +576,13 @@ export class Playback {
     sink.width = frame.displayWidth;
     sink.height = frame.displayHeight;
     sink.queue.push(frame);
-    while (sink.queue.length > MAX_QUEUE) sink.queue.shift()!.close();
+    // Counted, not just discarded. A queue this long means presentation has
+    // stopped keeping up with the decoder, and the frames shed here are as
+    // lost to the viewer as the ones that never arrived.
+    while (sink.queue.length > MAX_QUEUE) {
+      sink.queue.shift()!.close();
+      sink.dropped++;
+    }
   }
 
   /**

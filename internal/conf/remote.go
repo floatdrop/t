@@ -585,9 +585,7 @@ func (r *remote) readMedia(
 	for {
 		obj, err := s.ReadDecoded()
 		if err != nil {
-			if !errors.Is(err, io.EOF) && r.ctx.Err() == nil {
-				r.log.Debug("media read ended", "handle", track.handle, "err", err)
-			}
+			r.reportMediaEnd(track, err)
 			return
 		}
 
@@ -617,6 +615,40 @@ func (r *remote) readMedia(
 
 		counter.AddObject(len(decoded.Payload))
 		r.room.sink.SendMedia(&frame)
+	}
+}
+
+// reportMediaEnd says why one media stream stopped.
+//
+// A group ending is the ordinary case and stays at Debug — every group ends,
+// once per GOP. What this exists to separate out is the relay resetting the
+// stream because this subscriber could not keep up, which is the only inbound
+// capacity signal anybody sends us and was previously logged, at Debug,
+// identically to a group finishing normally.
+//
+// It is reported and not acted on. Re-subscribing immediately would ask the
+// relay for exactly the traffic it just decided we cannot carry, and would do
+// it in a loop; choosing what to subscribe to instead is admission control,
+// which does not exist yet. So the tile stays frozen — as it already did — but
+// the log now says why, which is the difference between a mystery and a
+// measurement.
+func (r *remote) reportMediaEnd(track *remoteTrack, err error) {
+	if r.ctx.Err() != nil {
+		return // we tore this down ourselves
+	}
+	if code, ok := streamReset(err); ok {
+		if overloadReset(code) {
+			r.log.Warn("the relay stopped forwarding a track: we are not keeping up",
+				"handle", track.handle, "code", resetName(code),
+				"consequence", "this track is not being delivered until its subscription is rebuilt")
+			return
+		}
+		r.log.Info("media stream reset by the peer",
+			"handle", track.handle, "code", resetName(code))
+		return
+	}
+	if !errors.Is(err, io.EOF) {
+		r.log.Debug("media read ended", "handle", track.handle, "err", err)
 	}
 }
 

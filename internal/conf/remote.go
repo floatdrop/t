@@ -147,14 +147,64 @@ func (r *remote) subscribeCatalog() error {
 	}
 	fetch, err := r.room.sess.Fetch(r.ctx, fetchMsg)
 	if err != nil {
-		// Without the backfill we only learn this participant's tracks
-		// when they next republish their catalog. Degraded, not fatal.
+		// Not fatal — the subscription above is live, so anything they publish
+		// from here is seen. But "from here" is the problem: a participant who
+		// has settled does not republish, since a catalog goes out only when
+		// track availability changes. Without the backfill they sit in the
+		// roster with no nickname and no media for as long as they stay
+		// unchanged, which for someone already in the call is the whole of it.
+		//
+		// So it is worth another go before accepting that. Left to the
+		// caller's goroutine rather than the request path, which has a
+		// subscription to finish setting up.
 		r.log.Warn("catalog joining FETCH failed", "err", err)
+		go r.retryCatalogFetch(fetchMsg)
 		return nil
 	}
+	r.mu.Lock()
 	r.catalogFetch = fetch
+	r.mu.Unlock()
 	r.room.router.HandleFetch(fetchMsg.RequestID, r.readCatalogFetch)
 	return nil
+}
+
+// retryCatalogFetch asks again for the backfill this remote did not get.
+//
+// Stops as soon as a catalog has arrived by any route: the subscription may
+// deliver one first if the participant happens to republish, and a second
+// backfill would only be the same object again.
+func (r *remote) retryCatalogFetch(fetchMsg *message.Fetch) {
+	delay := trackRetryDelay
+	for attempt := 1; attempt <= trackRetryLimit; attempt++ {
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+
+		r.mu.Lock()
+		closed, have := r.closed, r.hasCatalog
+		r.mu.Unlock()
+		if closed || have {
+			return
+		}
+
+		fetch, err := r.room.sess.Fetch(r.ctx, fetchMsg)
+		if err != nil {
+			r.log.Warn("catalog joining FETCH failed again", "attempt", attempt, "err", err)
+			delay = min(delay*2, trackRetryMax)
+			continue
+		}
+
+		r.mu.Lock()
+		r.catalogFetch = fetch
+		r.mu.Unlock()
+		r.room.router.HandleFetch(fetchMsg.RequestID, r.readCatalogFetch)
+		r.log.Info("catalog backfill recovered", "attempt", attempt)
+		return
+	}
+	r.log.Warn("giving up on a participant's catalog backfill; " +
+		"they will appear only if they republish")
 }
 
 // watchLiveness treats the end of the catalog subscription as the

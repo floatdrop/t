@@ -62,6 +62,26 @@ const MAX_QUEUE = 60;
  */
 const RENDER_STALL_MS = 500;
 
+/**
+ * Shortest gap between canvas resizes, per tile.
+ *
+ * Setting width or height on a canvas is not an assignment: the specification
+ * requires the bitmap and the context to be cleared and reinitialised, and in
+ * WebKit that can mean releasing and reallocating a GPU-backed surface. One of
+ * those per size change is unavoidable and cheap. One per *frame* is a picture
+ * that spends most of its life cleared, which is what a frozen or flickering
+ * tile looks like from the outside.
+ *
+ * Nothing in this app is supposed to change size per frame — the guard below
+ * only fires when the dimensions really differ — but the size is chosen by a
+ * publisher this client does not control, and a publisher whose Auto
+ * resolution oscillates, or whose layer flips, would drive it. The first
+ * change is taken immediately, so a genuine switch is not delayed; a second
+ * within this window waits, and the frame is scaled into the old backing store
+ * meanwhile, which is a slightly soft picture rather than a cleared one.
+ */
+const CANVAS_RESIZE_INTERVAL_MS = 500;
+
 /** How often to check that the presentation loop is still being called. */
 const RENDER_WATCHDOG_MS = 250;
 
@@ -97,6 +117,15 @@ export interface PlaybackStats {
   /** Frames received but not decodable yet (pre-keyframe, or errors). */
   dropped: number;
   decodeQueue: number;
+  /**
+   * Video only: how many times this tile's canvas has been resized.
+   *
+   * Expected to be one per resolution the publisher has sent — a layer switch
+   * or an Auto change. A number that climbs with the frame count means
+   * something is driving a size change per frame, which clears the bitmap
+   * every time and is what a flickering or frozen tile looks like.
+   */
+  resizes?: number;
   /** Codec string the decoder was configured with. */
   codec: string;
   /**
@@ -132,6 +161,11 @@ interface VideoSink {
   sawKeyFrame: boolean;
   decoded: number;
   dropped: number;
+  /** When the canvas was last resized, and how often — see the interval. */
+  lastResizeMs: number;
+  resizes: number;
+  /** Latched once a paint has thrown, so the warning is not repeated. */
+  paintFailed: boolean;
   /** Resolution of the most recently decoded frame. */
   width: number;
   height: number;
@@ -323,6 +357,9 @@ export class Playback {
       sawKeyFrame: false,
       decoded: 0,
       dropped: 0,
+      lastResizeMs: 0,
+      resizes: 0,
+      paintFailed: false,
       width: 0,
       height: 0,
       queue: [],
@@ -793,14 +830,37 @@ export class Playback {
       frame.close();
       return;
     }
+
     if (sink.canvas.width !== frame.displayWidth || sink.canvas.height !== frame.displayHeight) {
-      sink.canvas.width = frame.displayWidth;
-      sink.canvas.height = frame.displayHeight;
+      const now = performance.now();
+      if (now - sink.lastResizeMs >= CANVAS_RESIZE_INTERVAL_MS) {
+        sink.canvas.width = frame.displayWidth;
+        sink.canvas.height = frame.displayHeight;
+        sink.lastResizeMs = now;
+        sink.resizes++;
+      }
     }
+
     try {
-      sink.ctx.drawImage(frame, 0, 0);
+      // Scaled to whatever the backing store currently is, rather than drawn
+      // at the frame's own size. They are the same whenever the resize above
+      // was taken, and while one is being held this is what keeps the picture
+      // filling the tile instead of being cropped or letterboxed into a
+      // canvas that has not caught up yet.
+      sink.ctx.drawImage(frame, 0, 0, sink.canvas.width, sink.canvas.height);
     } catch (err) {
-      console.warn('canvas paint failed', err);
+      // Said out loud, not left in the devtools console. A canvas that will
+      // not accept a frame is a tile frozen on its last picture, which is
+      // indistinguishable from every other reason a tile stops moving —
+      // latched so a failure that repeats per frame does not bury the log.
+      if (!sink.paintFailed) {
+        sink.paintFailed = true;
+        bridge.report('WARN', 'canvas would not accept a decoded frame', {
+          participant: sink.track.participant,
+          handle: String(sink.track.handle),
+          err: String(err),
+        });
+      }
     } finally {
       frame.close();
     }
@@ -847,6 +907,7 @@ export class Playback {
       if (sink.kind === 'video') {
         row.width = sink.width;
         row.height = sink.height;
+        row.resizes = sink.resizes;
         row.queued = sink.queue.length;
         if (sink.avOffsetMs !== null) row.avOffsetMs = sink.avOffsetMs;
       }

@@ -227,7 +227,11 @@
                    decoder falling behind, the other is presentation holding
                    frames back on purpose. -->
               <th scope="col">Held</th>
-              <th scope="col">Dropped</th><th scope="col">Buffered</th>
+              <th scope="col">Dropped</th>
+              <!-- One per resolution the publisher has sent. A number that
+                   climbs with the frame count means something is resizing the
+                   canvas per frame, which clears it every time. -->
+              <th scope="col">Resizes</th><th scope="col">Buffered</th>
               <th scope="col">Underruns</th>
               <!-- How far the picture led the sound at the last presented
                    frame. Nothing corrects from this, but without it a sync
@@ -252,6 +256,7 @@
                 <td>{s.decodeQueue}</td>
                 <td>{s.queued ?? '—'}</td>
                 <td>{s.dropped}</td>
+                <td>{s.resizes ?? '—'}</td>
                 <td>
                   {#if s.buffered !== undefined}
                     {(s.buffered / 48).toFixed(0)} ms

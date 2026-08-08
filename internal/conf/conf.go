@@ -81,6 +81,15 @@ const (
 // held onto for the rest of the call.
 const joinTimeout = 15 * time.Second
 
+// How long to wait before retrying a catalog publish, and how many times. The
+// delay lengthens with each attempt. Short and few: the catalog is what makes
+// this participant decodable, so it is worth pushing at, and a session that
+// cannot carry one small object is not going to be fixed by patience.
+const (
+	catalogRetryDelay = 300 * time.Millisecond
+	catalogRetryLimit = 4
+)
+
 // audioGroupObjects is how many audio frames share one group. At the
 // 20 ms Opus framing WebCodecs produces, 25 objects is a 500 ms group:
 // long enough that stream setup is negligible, short enough that losing

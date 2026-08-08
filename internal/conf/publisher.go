@@ -29,6 +29,8 @@ var ErrAwaitingKeyFrame = errors.New("conf: waiting for first keyframe")
 // publisher owns the local participant's three publications: the MSF
 // catalog and the two LOC media tracks.
 type publisher struct {
+	// ctx is the room's, so a retry stops when the session does.
+	ctx      context.Context
 	log      *slog.Logger
 	sess     *session.Session
 	counters *telemetry.Registry
@@ -77,6 +79,7 @@ func newPublisher(
 ) (*publisher, error) {
 	ns := namespaceFor(cfg.Room, cfg.ID)
 	p := &publisher{
+		ctx:      ctx,
 		log:      log,
 		sess:     sess,
 		counters: counters,
@@ -218,7 +221,37 @@ func (p *publisher) undeclareConfig(kind string) error {
 // republishCatalog emits the current catalog as a fresh object in a new
 // group. §5 says a catalog object should be published only when track
 // availability changes, which is exactly when this is called.
+// republishCatalog emits the catalog, retrying a write that fails.
+//
+// This is the one message that makes a participant decodable: until it lands,
+// peers know a namespace exists and nothing about what it carries. A failure
+// used to be returned and forgotten, leaving the on-wire catalog stale — or,
+// on the first declaration, absent — with nothing to try again.
+//
+// Retried here rather than left to the caller because the callers are the
+// frontend declaring an encoder and the reconnect replaying one, and neither
+// is in a position to know that the right response is to wait 500ms.
 func (p *publisher) republishCatalog() error {
+	var err error
+	for attempt := 1; attempt <= catalogRetryLimit; attempt++ {
+		if err = p.writeCatalog(); err == nil {
+			if attempt > 1 {
+				p.log.Info("catalog published after a retry", "attempt", attempt)
+			}
+			return nil
+		}
+		p.log.Warn("catalog publish failed", "attempt", attempt, "err", err)
+
+		select {
+		case <-p.ctx.Done():
+			return err
+		case <-time.After(time.Duration(attempt) * catalogRetryDelay):
+		}
+	}
+	return err
+}
+
+func (p *publisher) writeCatalog() error {
 	p.mu.Lock()
 	cat, err := buildCatalog(p.nickname, p.version, p.videoConfig, p.audioConfig)
 	group := p.catalogGroup

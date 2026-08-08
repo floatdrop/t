@@ -102,6 +102,38 @@ func Join(ctx context.Context, log *slog.Logger, sink Sink, counters *telemetry.
 	// join that returns must leave the session running.
 	roomCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 
+	// Which leaves the handshake below with nothing bounding it. Every step
+	// of it waits on the relay answering, none has a deadline, and roomCtx is
+	// detached by design — so a relay that completes SETUP and then never
+	// answers PUBLISH holds this forever. QUIC keepalives keep the connection
+	// up so the idle timeout never fires, the redial loop never returns from
+	// this attempt to make another, and Leave cancels a context that does not
+	// reach here. The call sits on "reconnecting" for good.
+	//
+	// So the setup is watched: if the caller gives up or joinTimeout passes
+	// before the room is built, roomCtx is cancelled and every blocked step
+	// comes back with an error. The flag closes the race with a watcher that
+	// fires just as setup finishes — either it cancels before setup is marked
+	// done, and the check below catches it, or setup wins and the watcher
+	// stands down.
+	var setupMu sync.Mutex
+	setupDone := false
+	joined := make(chan struct{})
+	defer close(joined)
+	go func() {
+		select {
+		case <-joined:
+			return
+		case <-ctx.Done():
+		case <-time.After(joinTimeout):
+		}
+		setupMu.Lock()
+		defer setupMu.Unlock()
+		if !setupDone {
+			cancel()
+		}
+	}()
+
 	r := &Room{
 		cfg:      cfg,
 		log:      log.With("room", cfg.Room, "self", cfg.ID),
@@ -131,6 +163,17 @@ func Join(ctx context.Context, log *slog.Logger, sink Sink, counters *telemetry.
 		cancel()
 		_ = res.sess.Close(moqt.SessionInternalError, "namespace watch failed")
 		return nil, err
+	}
+
+	setupMu.Lock()
+	setupDone = true
+	setupMu.Unlock()
+	if err := roomCtx.Err(); err != nil {
+		// The watcher fired: the caller left, or the relay took longer than
+		// joinTimeout to finish answering. Whatever was built is half a room.
+		cancel()
+		_ = res.sess.Close(moqt.SessionInternalError, "join abandoned")
+		return nil, fmt.Errorf("conf: join %s: %w", cfg.Relay, err)
 	}
 
 	// Registered after the session is up. OnGoaway replays a GOAWAY that

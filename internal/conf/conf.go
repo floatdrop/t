@@ -73,6 +73,14 @@ const (
 	trackRetryLimit = 5
 )
 
+// joinTimeout bounds the handshake between a dialled session and a built room
+// — PUBLISH for three tracks, the first catalog, PUBLISH_NAMESPACE and
+// SUBSCRIBE_NAMESPACE. Generous against a slow relay on a slow link, since
+// failing a join that would have worked costs a full redial; short enough that
+// a relay which answers nothing is abandoned for the next attempt rather than
+// held onto for the rest of the call.
+const joinTimeout = 15 * time.Second
+
 // audioGroupObjects is how many audio frames share one group. At the
 // 20 ms Opus framing WebCodecs produces, 25 objects is a 500 ms group:
 // long enough that stream setup is negligible, short enough that losing

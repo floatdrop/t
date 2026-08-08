@@ -20,6 +20,7 @@ import {
   type VideoSettings,
   type VideoSource,
 } from './capture';
+import { CongestionDetector, inboundDrifts } from './congestion';
 import { autoVideoBitrate, autoVideoRung } from './layout';
 import { playback, type PlaybackStats } from './playback';
 import type {
@@ -58,30 +59,6 @@ const SPEAKING_TIMEOUT_MS = 400;
  * outlast the drag itself.
  */
 const RESIZE_SETTLE_MS = 300;
-
-/**
- * How fast a publisher's audio must be falling behind its own clock to count
- * as congestion, in milliseconds per second.
- *
- * A healthy path measures within a tenth of this and a real bottleneck a
- * hundred times it, so there is a wide gap to sit in. The panel warns past
- * 1 ms/s, which is where clock drift between two machines stops being a
- * plausible explanation; acting is held to ten times that.
- */
-const DRIFT_CONGESTED_MS_PER_SEC = 10;
-
-/** How long the drift must hold before the picture is taken down. */
-const DRIFT_CONGESTED_HOLD_MS = 2000;
-
-/** How long it must stay quiet before the full picture is asked for again. */
-const DRIFT_QUIET_MS = 15000;
-
-/**
- * How many publishers must be drifting at once for the cause to be our own
- * downlink rather than one publisher's uplink. Capped by how many there are:
- * in a two-person call there is no second opinion to be had.
- */
-const DRIFT_MIN_PUBLISHERS = 2;
 
 /** How many times to try building a sink before giving up on a participant. */
 const PLAYBACK_ADD_ATTEMPTS = 3;
@@ -503,8 +480,7 @@ class Store {
     // grid rebuilds.
     this.#visibleTiles = [];
     this.linkCongested = false;
-    this.#driftingSince = null;
-    this.#quietSince = null;
+    this.#congestion.reset();
   }
 
   detach(): void {
@@ -917,73 +893,29 @@ class Store {
   /**
    * Whether the inbound path is failing to carry what is being sent to us.
    *
-   * Driven by the drift meter — how fast each publisher's audio is arriving
-   * later than the clock that produced it — which leads the relay's own
-   * verdict by several seconds. The relay only tells us we could not keep up
-   * after it has already stopped forwarding; this is the part that can be seen
-   * coming.
+   * Mirrored as state so the header can say so — the picture visibly changes,
+   * and the alternative is a call that quietly got worse for no reason anyone
+   * can see. The decision itself lives in congestion.ts, which is a policy
+   * worth testing without a session around it.
    */
   linkCongested = $state(false);
 
-  #driftingSince: number | null = null;
-  #quietSince: number | null = null;
+  #congestion = new CongestionDetector();
 
-  /**
-   * Decides whether the inbound path is over capacity, from the per-publisher
-   * drift readings in one metrics sample.
-   *
-   * The count is what matters, not any single reading. Drift is measured per
-   * publisher on their audio, so one publisher drifting alone says something
-   * about *their* uplink or the relay's path for that one stream — and taking
-   * our own picture down for that would be answering the wrong question. Several
-   * drifting together is the shared thing they have in common, which is our
-   * downlink.
-   *
-   * With only one other participant the two causes cannot be told apart. It is
-   * acted on anyway: the cost of being wrong is one layer switch, and the cost
-   * of doing nothing is a call that stays broken.
-   */
+  /** Feeds one metrics sample to the detector and acts on a change of mind. */
   #updateCongestion(m: Metrics): void {
-    const inbound = (m.tracks ?? []).filter(
-      (t) => !t.label.startsWith('out/') && t.label.endsWith('/audio'),
-    );
-    const measured = inbound.filter((t) => t.skewMillisPerSec !== undefined);
-    if (measured.length === 0) return;
+    const drifts = inboundDrifts(m.tracks);
+    if (!this.#congestion.update(drifts, performance.now())) return;
 
-    const drifting = measured.filter(
-      (t) => (t.skewMillisPerSec ?? 0) > DRIFT_CONGESTED_MS_PER_SEC,
-    ).length;
-    const needed = Math.min(DRIFT_MIN_PUBLISHERS, measured.length);
-    const bad = drifting >= needed;
-    const now = performance.now();
-
-    if (bad) {
-      this.#quietSince = null;
-      this.#driftingSince ??= now;
-      // Held for a moment before acting: a single sample can catch a burst
-      // that is already draining, and a layer switch costs a keyframe wait.
-      if (!this.linkCongested && now - this.#driftingSince >= DRIFT_CONGESTED_HOLD_MS) {
-        this.linkCongested = true;
-        bridge.report('WARN', 'inbound path is falling behind; taking smaller video', {
-          drifting: String(drifting),
-          publishers: String(measured.length),
-        });
-        this.#sendInterest();
-      }
-      return;
-    }
-
-    this.#driftingSince = null;
-    this.#quietSince ??= now;
-    // Far longer than the drop, and deliberately so. Going back up costs a
-    // fresh SUBSCRIBE, a new handle, a new decoder and a wait for the next
-    // keyframe, so being wrong upwards is visible in a way being wrong
-    // downwards is not.
-    if (this.linkCongested && now - this.#quietSince >= DRIFT_QUIET_MS) {
-      this.linkCongested = false;
+    this.linkCongested = this.#congestion.congested;
+    if (this.linkCongested) {
+      bridge.report('WARN', 'inbound path is falling behind; taking smaller video', {
+        publishers: String(drifts.length),
+      });
+    } else {
       bridge.report('INFO', 'inbound path has been quiet; asking for full video again');
-      this.#sendInterest();
     }
+    this.#sendInterest();
   }
 
   clearLogs(): void {

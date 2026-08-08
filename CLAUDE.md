@@ -47,6 +47,7 @@ go vet . ./internal/...
 gofmt -l . | grep -v '^build/'        # build/ ships unformatted from the template
 
 cd frontend && npx svelte-check --tsconfig ./tsconfig.json   # frontend typecheck
+cd frontend && npm test                                      # vitest, policy modules only
 ```
 
 A relay is needed to run anything end to end:
@@ -58,6 +59,11 @@ how two instances get started against it without clicking through twice:
 bin/tlmst.dev.app/Contents/MacOS/tlmst -relay localhost:4433 -room demo \
     -nickname alice -join -debug
 ```
+
+The frontend's tests cover the plain-TypeScript policy modules — the arithmetic
+that decides what to send and what to ask for (`layout.ts`, `congestion.ts`).
+Nothing renders a component: what touches a camera, a codec or a socket is
+exercised by running the app.
 
 `internal/conf`'s tests run a real moq-go relay in-process over loopback QUIC
 and assert on the whole path — discovery, catalog exchange, subscription, exact

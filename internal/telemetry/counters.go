@@ -42,6 +42,12 @@ func (c *TrackCounter) AddArrival(now time.Time, mediaMicros uint64) {
 // milliseconds, and whether there is anything to report. See [SkewTracker.Lag].
 func (c *TrackCounter) Lag() (float64, bool) { return c.skew.Lag() }
 
+// SuspendSkew stops measuring arrival timing for d, for a delay this client
+// caused itself. See [SkewTracker.Suspend].
+func (c *TrackCounter) SuspendSkew(now time.Time, d time.Duration) {
+	c.skew.Suspend(now, d)
+}
+
 func (c *TrackCounter) read() trackSample {
 	s := trackSample{
 		bytes:   c.bytes.Load(),

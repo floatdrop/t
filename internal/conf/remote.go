@@ -88,6 +88,14 @@ const maxLag = 1500 * time.Millisecond
 // recovering than on media.
 const resyncCooldown = 15 * time.Second
 
+// backfillBlind is how long the drift meter stops measuring after a backfill.
+//
+// A backfilled group is a couple of seconds of video arriving at once, which
+// delays the audio the meter is fed from — real contention, but caused by this
+// client and over in a moment, so it says nothing about what the path can
+// carry. Long enough to cover the burst and the queue it leaves behind.
+const backfillBlind = 4 * time.Second
+
 // lagCheckObjects is how often the slip is examined, in audio objects. At the
 // 20 ms cadence audio is produced on, fifty of them is about a second — often
 // enough to catch a slip while it is still seconds rather than minutes, rare
@@ -703,8 +711,14 @@ func (r *remote) syncTrack(slot **remoteTrack, name string, kind uint8, want *br
 		// The publisher changed codec or resolution. The frontend keys
 		// its decoder off the handle, so tear the old one down and
 		// announce a fresh handle rather than reconfiguring in place.
-		r.log.Info("track changed, resubscribing",
-			"from", current.name, "to", name)
+		if current.name == name {
+			r.log.Info("track re-encoded, resubscribing", "track", name,
+				"from", fmt.Sprintf("%dx%d", current.config.Width, current.config.Height),
+				"to", fmt.Sprintf("%dx%d", want.Width, want.Height))
+		} else {
+			r.log.Info("layer changed, resubscribing",
+				"from", current.name, "to", name)
+		}
 		r.dropTrack(slot)
 	}
 
@@ -829,6 +843,12 @@ func (r *remote) backfillGroup(
 	}
 	track.fetch = fetch
 	r.mu.Unlock()
+
+	// The audio meter, not this track's: drift is measured on audio, and audio
+	// is what this burst is about to get in the way of.
+	r.room.counters.
+		Track(telemetry.InPrefix+r.id+"/"+AudioTrack).
+		SuspendSkew(time.Now(), backfillBlind)
 
 	r.room.router.HandleFetch(fetchMsg.RequestID, func(s *session.IncomingFetchStream) {
 		r.readMediaFetch(s, track, counter)

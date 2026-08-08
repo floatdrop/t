@@ -46,6 +46,9 @@ type SkewTracker struct {
 	// numbers stay small and readable. It cancels in the slope regardless.
 	base     float64
 	haveBase bool
+	// blindUntil is when measuring resumes after something this client did
+	// itself. See Suspend.
+	blindUntil time.Time
 }
 
 type skewSample struct {
@@ -66,6 +69,31 @@ const (
 	skewMinSamples = 20
 	skewMinSpan    = time.Second
 )
+
+// Suspend stops measuring until d has passed, and starts afresh afterwards.
+//
+// For the times this client is the reason the path is busy. Rebuilding a
+// subscription asks for the group already in progress, which arrives as a
+// burst — a couple of seconds of video delivered at once, competing with the
+// audio this is measured on. That is real contention and it does delay
+// arrivals, but it says nothing about what the path can carry: it is a cost
+// this client chose, it is bounded, and it is over in a moment.
+//
+// Measured through, it reads as exactly the thing it is not. A burst is enough
+// to hold the trend above the threshold for as long as the threshold asks,
+// so the response was to conclude the link was overloaded and take the picture
+// down — after which the recovery rebuilds the subscription, which bursts
+// again. The remedy has to be blind to its own cost or it becomes the disease.
+func (s *SkewTracker) Suspend(now time.Time, d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.blindUntil = now.Add(d)
+	// Dropped rather than kept: the samples either side of the burst differ by
+	// however long it took, and a line through both would find the slope this
+	// exists to ignore.
+	s.samples = s.samples[:0]
+	s.haveBase = false
+}
 
 // Add records one object's arrival. mediaMicros is the object's media
 // timestamp in microseconds; zero means the publisher sent none, which leaves
@@ -88,6 +116,9 @@ func (s *SkewTracker) Add(now time.Time, mediaMicros uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if now.Before(s.blindUntil) {
+		return
+	}
 	if !s.haveBase {
 		s.base, s.haveBase = skew, true
 	}

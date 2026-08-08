@@ -38,6 +38,16 @@ const KEYFRAME_INTERVAL_SEC = 2;
 const MAX_FRAMERATE = 30;
 
 /**
+ * How much slower the small layer runs than the primary.
+ *
+ * Halving it halves both of that layer's costs — the scale down and the encode
+ * — and a thumbnail is not where anyone reads motion. It stays a factor rather
+ * than a fixed rate so it follows the primary down when the primary is already
+ * slow, as a screen share is.
+ */
+const LOW_LAYER_FRAME_DIVISOR = 2;
+
+/**
  * How close to a full frame interval two presentations may be and still count
  * as two frames.
  *
@@ -422,6 +432,8 @@ export class Capture {
   #lowEncoder: VideoEncoder | null = null;
   /** Where a frame is scaled down before the low encoder sees it. */
   #lowCanvas: OffscreenCanvas | null = null;
+  /** Alternates, so the small layer takes every second frame. */
+  #lowSkip = false;
   #lowCtx: OffscreenCanvasRenderingContext2D | null = null;
   #audioEncoder: AudioEncoder | null = null;
   #audioCtx: AudioContext | null = null;
@@ -772,6 +784,12 @@ export class Capture {
       bitrate: settings.bitrate,
       framerate,
       latencyMode: 'realtime',
+      // Asked for rather than assumed. The default is no preference, and a
+      // realtime H.264 encode is exactly the case a platform may answer in
+      // software — which on a machine already running a second encoder and a
+      // decoder per participant is the difference between keeping up and the
+      // capture pipeline stalling.
+      hardwareAcceleration: 'prefer-hardware',
       // Annex B puts SPS/PPS in the bitstream ahead of every keyframe, so
       // a subscriber can start decoding from any group without an
       // out-of-band description.
@@ -1156,8 +1174,9 @@ export class Capture {
         width: canvas.width,
         height: canvas.height,
         bitrate: rung.minBitrate,
-        framerate,
+        framerate: framerate / LOW_LAYER_FRAME_DIVISOR,
         latencyMode: 'realtime',
+        hardwareAcceleration: 'prefer-hardware',
         avc: { format: 'annexb' },
       });
     } catch (err) {
@@ -1176,18 +1195,31 @@ export class Capture {
         codec,
         width: canvas.width,
         height: canvas.height,
-        framerate,
+        framerate: framerate / LOW_LAYER_FRAME_DIVISOR,
         bitrate: rung.minBitrate,
       },
     });
     bridge.report('INFO', 'small video layer configured', {
       size: `${canvas.width}x${canvas.height}`,
       bitrate: String(rung.minBitrate),
+      framerate: String(Math.round(framerate / LOW_LAYER_FRAME_DIVISOR)),
     });
   }
 
   /** Scales one frame down and encodes it into the small layer. */
   #encodeLowLayer(frame: VideoFrame, keyFrame: boolean): void {
+    // Half the primary's rate. A tile small enough to want this layer is not a
+    // tile anyone is reading motion off, and both costs it carries — the scale
+    // down and the encode — are paid per frame. A keyframe is never skipped:
+    // it is the only frame a subscriber can start from, and dropping one would
+    // strand anyone switching to this layer until the next.
+    if (!keyFrame) {
+      this.#lowSkip = !this.#lowSkip;
+      if (this.#lowSkip) return;
+    } else {
+      this.#lowSkip = false;
+    }
+
     const encoder = this.#lowEncoder;
     const canvas = this.#lowCanvas;
     const ctx = this.#lowCtx;

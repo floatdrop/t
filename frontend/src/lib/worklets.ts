@@ -109,8 +109,28 @@ const CAPACITY = 96000;
 // audio that is already late: a gap is audible once, and permanent latency is
 // audible for the rest of the call. The high-water mark is four times the
 // preroll, so ordinary jitter never reaches it.
+//
+// The floor is not the preroll depth, though it started as it. Measured on a
+// nine-minute call over a VPN to a remote relay: twenty-four trims across two
+// participants, every one firing between 253 and 269 ms. So the buffer was
+// never running away — it was grazing the ceiling and being cut to 60 ms,
+// which is a 190 ms hole in the sound each time and leaves nothing in hand on
+// a path that had just demonstrated it delivers in bursts.
+//
+// Doubling the floor was expected to trade rare large gaps for frequent small
+// ones and nothing more, on the reasoning that the discard rate is set by how
+// fast the buffer fills. The measurement said otherwise: the same nine minutes
+// on the same path went from twenty-four trims to seven. So the fill is not a
+// steady drift being given back in instalments — it is episodic, and a deeper
+// cushion absorbs bursts that a preroll's worth of audio could not, before
+// they ever reach the ceiling. The cost is 60 ms of standing latency after
+// each trim, which is well inside what a conversation tolerates.
+//
+// Two runs on a path whose conditions are not controlled, so the size of that
+// improvement is not to be trusted; the direction was consistent for both
+// participants.
 const MAX_BUFFER = 12000; // 250 ms
-const TRIM_TO = 2880;     // 60 ms, the preroll depth
+const TRIM_TO = 5760;     // 120 ms, twice the preroll
 
 // A chunk whose timestamp misses the expected one by more than this is
 // treated as a new reference rather than a continuation.

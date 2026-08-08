@@ -93,9 +93,30 @@ so any moment where the writer got ahead stays ahead for the rest of the call.
 Measured on a five-way call, every buffer sat pinned at its two-second capacity:
 two full seconds between someone speaking and anyone hearing it, with the
 **BUFFERED** column reading 1995 ms and **A/V** reading +1969 ms. So `pcm-player`
-drops the oldest audio once more than 250 ms has queued, back to the 60 ms
-preroll depth, and reports the count. A gap is audible once; permanent latency
-is audible for the whole call. The playout clock needs no correction — it is
+drops the oldest audio once more than 250 ms has queued, back to 120 ms, and
+reports the count. A gap is audible once; permanent latency is audible for the
+whole call.
+
+The floor was the 60 ms preroll depth until a nine-minute call over a VPN to a
+remote relay was measured: twenty-four trims across two participants, every one
+firing between 253 and 269 ms. The buffer was never running away — it was
+grazing the ceiling and being cut back to a preroll's worth, which is a 190 ms
+hole in the sound each time and leaves nothing in hand on a path that had just
+demonstrated it delivers in bursts.
+
+Doubling the floor was expected to trade rare large gaps for frequent small ones
+and nothing else, since the discard rate should follow how fast the buffer
+fills. It did not: the same nine minutes on the same path went from twenty-four
+trims to seven. The fill is episodic rather than a steady drift, so a deeper
+cushion absorbs bursts before they reach the ceiling instead of re-slicing the
+same total. The cost is 60 ms of standing latency after each trim. Two runs on
+an uncontrolled path, so the size of that is not worth trusting — the direction
+held for both participants.
+
+That measurement was only possible because the warning reports the depth it
+trimmed *from*. What is left after a trim is the floor by construction, so the
+figure that used to be logged said the same thing every time, whether the
+buffer had reached 260 ms or two seconds. The playout clock needs no correction — it is
 derived from what is still buffered, so skipping ahead in the buffer is skipping
 ahead in time, and the video scheduled against it follows.
 

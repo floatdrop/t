@@ -195,6 +195,17 @@ export class Playback {
    */
   onVoice: ((participant: string, speaking: boolean, level: number) => void) | null = null;
 
+  /**
+   * Notified when a participant's media has stopped for good on this side.
+   *
+   * Giving up is the one outcome nobody can infer from the tiles. A retired
+   * video decoder leaves the last painted frame exactly where it was, which is
+   * what a peer who stopped moving looks like; a retired audio decoder leaves
+   * silence, which is what someone not talking sounds like. Both are states a
+   * call produces normally, so neither reads as a fault.
+   */
+  onFailure: ((participant: string, detail: string) => void) | null = null;
+
   #sinks = new Map<number, Sink>();
   #audioCtx: AudioContext | null = null;
   #audioReady: Promise<AudioContext> | null = null;
@@ -265,6 +276,7 @@ export class Playback {
         restarts: String(sink.restarts),
         err: String(err),
       });
+      this.onFailure?.(sink.track.participant, 'their video cannot be decoded');
       return;
     }
 
@@ -448,6 +460,7 @@ export class Playback {
         restarts: String(sink.restarts),
         err: String(err),
       });
+      this.onFailure?.(sink.track.participant, 'their audio cannot be decoded');
       return;
     }
     bridge.report('WARN', 'audio decoder failed; rebuilding it', {

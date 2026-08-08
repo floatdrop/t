@@ -59,6 +59,12 @@ const SPEAKING_TIMEOUT_MS = 400;
  */
 const RESIZE_SETTLE_MS = 300;
 
+/** How many times to try building a sink before giving up on a participant. */
+const PLAYBACK_ADD_ATTEMPTS = 3;
+
+/** Base gap between those attempts; it lengthens with each one. */
+const PLAYBACK_ADD_RETRY_MS = 400;
+
 /**
  * The device and encoder selection, shared by the welcome screen and the
  * in-call device menu. It lives in the store because both need to read and
@@ -333,15 +339,7 @@ class Store {
           // Said out loud rather than dropped on the floor. A sink that fails
           // to build is a participant nobody can hear or see, and a bare `void`
           // leaves that as an unhandled rejection nobody is reading.
-          void playback.add(track).catch((err) => {
-            bridge.report('ERROR', 'could not start playback for a remote track', {
-              participant: track.participant,
-              kind: track.config.kind,
-              err: String(err),
-            });
-            const who = track.nickname || track.participant;
-            this.reportFault(`Cannot play ${track.config.kind} from ${who}.`);
-          });
+          void this.#addPlayback(track);
           break;
         }
 
@@ -393,6 +391,10 @@ class Store {
     };
     playback.onVoice = (participant, speaking) => {
       this.#markSpeaking(participant, speaking);
+    };
+    playback.onFailure = (participant, detail) => {
+      const peer = this.participants.find((p) => p.id === participant);
+      this.reportFault(`${peer?.nickname || participant}: ${detail}.`);
     };
 
     this.#statsTimer = setInterval(() => {
@@ -665,6 +667,45 @@ class Store {
       this.#syncPreview();
     }
     await this.refreshDevices();
+  }
+
+  /**
+   * Builds a sink for a remote track, retrying before giving up on it.
+   *
+   * The announcement comes once. Nothing re-sends it, so a transient failure
+   * here — a context created under load, a module that blipped — is that
+   * participant silent or blank for the whole call, and the memoised context
+   * having been cleared means the *next* participant succeeds, which makes it
+   * look like an isolated hiccup rather than someone lost.
+   */
+  async #addPlayback(track: RemoteTrack, attempt = 1): Promise<void> {
+    try {
+      await playback.add(track);
+    } catch (err) {
+      // Still wanted? A track that has since gone, or a session that has since
+      // dropped, is not something to keep retrying into.
+      if (!this.tracks.some((t) => t.handle === track.handle)) return;
+
+      if (attempt < PLAYBACK_ADD_ATTEMPTS) {
+        bridge.report('WARN', 'could not start playback for a remote track; retrying', {
+          participant: track.participant,
+          kind: track.config.kind,
+          attempt: String(attempt),
+          err: String(err),
+        });
+        await new Promise((resolve) => setTimeout(resolve, PLAYBACK_ADD_RETRY_MS * attempt));
+        return this.#addPlayback(track, attempt + 1);
+      }
+
+      bridge.report('ERROR', 'could not start playback for a remote track', {
+        participant: track.participant,
+        kind: track.config.kind,
+        attempts: String(attempt),
+        err: String(err),
+      });
+      const who = track.nickname || track.participant;
+      this.reportFault(`Cannot play ${track.config.kind} from ${who}.`);
+    }
   }
 
   /**

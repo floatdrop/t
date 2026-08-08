@@ -540,6 +540,10 @@ func (a *App) sampleMetrics(ctx context.Context, room *conf.Room) {
 			return
 		case now := <-ticker.C:
 			m := sampler.Sample(now)
+			// Read here rather than counted by the sampler: the drops belong to
+			// the bridge connection, which outlives any one session and knows
+			// nothing about rooms.
+			m.BridgeDropped = a.server.DroppedFrames()
 			a.server.SendControl(&bridge.ServerMessage{Type: bridge.MsgMetrics, Metrics: &m})
 		}
 	}

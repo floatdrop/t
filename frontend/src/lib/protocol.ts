@@ -223,6 +223,9 @@ export interface Metrics {
   objectsInPerSec: number;
   groupsOutPerSec: number;
 
+  /** Frames the bridge dropped on the way here, cumulative for the connection. */
+  bridgeDropped: number;
+
   tracks?: TrackMetrics[];
 }
 

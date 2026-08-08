@@ -257,8 +257,10 @@ func (s *Server) Connected() bool {
 }
 
 // DroppedFrames returns how many outbound frames the current connection
-// has dropped for backpressure. Surfaced in the debug panel: a rising
-// count means the WebView cannot keep up with its decoders.
+// has dropped for backpressure. Sampled into every metrics message, so a
+// rising count is visible in the debug panel while it is rising: it means
+// the WebView cannot keep up with its decoders, and the loss is ours rather
+// than the network's.
 func (s *Server) DroppedFrames() uint64 {
 	s.mu.Lock()
 	c := s.conn

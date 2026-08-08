@@ -16,6 +16,10 @@ type TrackCounter struct {
 	bytes   atomic.Uint64
 	objects atomic.Uint64
 	groups  atomic.Uint64
+	// skew is fed only for tracks whose arrival timing is worth trending —
+	// see AddArrival. It stays empty on every other track, and an unfed
+	// tracker reports no slope rather than a zero one.
+	skew SkewTracker
 }
 
 // AddObject records one object of n payload bytes.
@@ -27,8 +31,31 @@ func (c *TrackCounter) AddObject(n int) {
 // AddGroup records the start of one group.
 func (c *TrackCounter) AddGroup() { c.groups.Add(1) }
 
-func (c *TrackCounter) read() (bytes, objects, groups uint64) {
-	return c.bytes.Load(), c.objects.Load(), c.groups.Load()
+// AddArrival records when an object arrived against the media timestamp it
+// carries, for the inbound delay trend. See [SkewTracker] for which tracks
+// this is meaningful on.
+func (c *TrackCounter) AddArrival(now time.Time, mediaMicros uint64) {
+	c.skew.Add(now, mediaMicros)
+}
+
+func (c *TrackCounter) read() trackSample {
+	s := trackSample{
+		bytes:   c.bytes.Load(),
+		objects: c.objects.Load(),
+		groups:  c.groups.Load(),
+	}
+	s.skew, s.hasSkew = c.skew.Slope()
+	return s
+}
+
+// trackSample is one read of a TrackCounter: the monotonic totals the sampler
+// differences, plus the skew trend, which is already a rate and is not.
+type trackSample struct {
+	bytes   uint64
+	objects uint64
+	groups  uint64
+	skew    float64
+	hasSkew bool
 }
 
 // Registry holds the counters for every live track, keyed by a display
@@ -86,13 +113,12 @@ func (r *Registry) Reset() {
 	r.order = nil
 }
 
-func (r *Registry) snapshot() map[string][3]uint64 {
+func (r *Registry) snapshot() map[string]trackSample {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	out := make(map[string][3]uint64, len(r.tracks))
+	out := make(map[string]trackSample, len(r.tracks))
 	for label, c := range r.tracks {
-		b, o, g := c.read()
-		out[label] = [3]uint64{b, o, g}
+		out[label] = c.read()
 	}
 	return out
 }
@@ -106,13 +132,13 @@ type Sampler struct {
 
 	last     time.Time
 	lastQUIC QUICSnapshot
-	lastPer  map[string][3]uint64
+	lastPer  map[string]trackSample
 }
 
 // NewSampler returns a sampler over the given sources. trace may be nil
 // before a session is dialed, in which case transport fields stay zero.
 func NewSampler(reg *Registry, trace *QUICTrace) *Sampler {
-	return &Sampler{registry: reg, trace: trace, lastPer: map[string][3]uint64{}}
+	return &Sampler{registry: reg, trace: trace, lastPer: map[string]trackSample{}}
 }
 
 // Sample returns the metrics for the interval since the previous call.
@@ -176,13 +202,21 @@ func (s *Sampler) Sample(now time.Time) bridge.Metrics {
 		prev := s.lastPer[label]
 		tm := bridge.TrackMetrics{
 			Label:   label,
-			Objects: cur[1],
-			Groups:  cur[2],
+			Objects: cur.objects,
+			Groups:  cur.groups,
+		}
+		// Already a rate, so it is reported as read rather than differenced,
+		// and it is a pointer because zero is a real answer here — "arriving
+		// exactly on cadence" and "not enough history to say" are opposite
+		// readings that would otherwise both render as 0.
+		if cur.hasSkew {
+			skew := cur.skew
+			tm.SkewMillisPerSec = &skew
 		}
 		if !first {
-			tm.Kbps = kbps(diff(cur[0], prev[0]), elapsed)
-			objDelta := float64(diff(cur[1], prev[1])) / elapsed
-			grpDelta := float64(diff(cur[2], prev[2])) / elapsed
+			tm.Kbps = kbps(diff(cur.bytes, prev.bytes), elapsed)
+			objDelta := float64(diff(cur.objects, prev.objects)) / elapsed
+			grpDelta := float64(diff(cur.groups, prev.groups)) / elapsed
 			// "out/" labels are the local publications; everything
 			// else is inbound. Splitting here keeps the aggregate
 			// bitrates in step with the per-track rows.

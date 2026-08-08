@@ -611,6 +611,10 @@ func (r *remote) readMedia(
 			frame.Config = decoded.Properties.AudioConfig
 			frame.AudioLevel = decoded.Properties.AudioLevel
 			frame.HasAudioLevel = decoded.Properties.HasAudioLevel
+			// Audio carries the inbound delay trend for this publisher: it is
+			// produced on a fixed 20 ms cadence and is the one track never
+			// dropped, so the measurement survives whatever else gets shed.
+			counter.AddArrival(time.Now(), frame.Timestamp)
 		}
 
 		counter.AddObject(len(decoded.Payload))

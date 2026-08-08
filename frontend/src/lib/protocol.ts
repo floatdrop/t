@@ -193,6 +193,15 @@ export interface TrackMetrics {
   kbps: number;
   objects: number;
   groups: number;
+  /**
+   * How fast this track's arrivals are falling behind the clock that produced
+   * them, in milliseconds per second. Positive means a queue on the inbound
+   * path is filling — more is being sent to us than is getting through.
+   *
+   * Inbound audio only, and absent until there is enough history to fit a
+   * trend. Absent and zero are different answers: zero means keeping up.
+   */
+  skewMillisPerSec?: number;
 }
 
 export interface Metrics {

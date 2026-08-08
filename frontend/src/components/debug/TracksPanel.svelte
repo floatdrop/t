@@ -143,6 +143,11 @@
           <tr>
             <th scope="col">Track</th><th scope="col">kbps</th>
             <th scope="col">Objects</th><th scope="col">Groups</th>
+            <!-- How fast this track is falling behind the clock that produced
+                 it. Rising means a queue on the way here is filling: more is
+                 being sent than is getting through. Audio carries it, because
+                 it is the track produced on a fixed cadence. -->
+            <th scope="col">Drift</th>
           </tr>
         </thead>
         <tbody>
@@ -152,6 +157,17 @@
               <td>{Math.round(t.kbps)}</td>
               <td>{t.objects}</td>
               <td>{t.groups}</td>
+              <td>
+                {#if t.skewMillisPerSec !== undefined}
+                  <!-- 1 ms/s is where clock drift between two machines stops
+                       being a plausible explanation. -->
+                  <span class={t.skewMillisPerSec > 1 ? 'warn' : ''}>
+                    {t.skewMillisPerSec > 0 ? '+' : ''}{t.skewMillisPerSec.toFixed(1)} ms/s
+                  </span>
+                {:else}
+                  —
+                {/if}
+              </td>
             </tr>
           {/each}
         </tbody>

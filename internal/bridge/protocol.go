@@ -330,6 +330,13 @@ type TrackMetrics struct {
 	Kbps    float64 `json:"kbps"`
 	Objects uint64  `json:"objects"`
 	Groups  uint64  `json:"groups"`
+	// SkewMillisPerSec is how fast this track's arrivals are falling behind
+	// the clock that produced them, in milliseconds per second. Positive means
+	// a queue on the inbound path is filling — the path is carrying less than
+	// is being sent. Inbound audio only, and nil until there is enough history
+	// to fit a trend, which is why it is a pointer: zero means "keeping up",
+	// not "no reading".
+	SkewMillisPerSec *float64 `json:"skewMillisPerSec,omitempty"`
 }
 
 // Endpoint is what the asset handler serves at /__bridge so the frontend

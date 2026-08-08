@@ -51,8 +51,9 @@ type Room struct {
 	// the relay went away, the transport broke, the peer sent GOAWAY. It is
 	// driven off session.Done rather than inferred from whichever read loop
 	// errors first, so there is one authoritative signal to act on.
-	lost    chan struct{}
-	lostErr error
+	lost     chan struct{}
+	lostErr  error
+	lostOnce sync.Once
 
 	// migrate closes when the relay sends GOAWAY (§10.4) — it is shutting
 	// down or rebalancing and wants us on a different session. Separate
@@ -137,7 +138,7 @@ func Join(ctx context.Context, log *slog.Logger, sink Sink, counters *telemetry.
 	res.sess.OnGoaway(r.onGoaway)
 
 	go r.runRouter()
-	go r.readAnnouncements(watch)
+	go r.watchAnnouncements(watch)
 	go r.watchSession()
 
 	r.log.Info("joined room", "relay", cfg.Relay, "nickname", cfg.Nickname)
@@ -205,9 +206,22 @@ func (r *Room) watchSession() {
 	if r.leaving.Load() {
 		return // Close did this on purpose
 	}
-	r.lostErr = r.sess.Err()
-	r.log.Warn("relay session ended", "err", r.lostErr)
-	close(r.lost)
+	r.log.Warn("relay session ended", "err", r.sess.Err())
+	r.fail(r.sess.Err())
+}
+
+// fail declares the session lost, once, whoever notices first.
+//
+// The session ending is the usual reason and watchSession is the authoritative
+// witness of it. But a session can also be alive and no longer useful — a room
+// watch that cannot be re-established leaves a call where nobody new is ever
+// discovered — and the repair for that is the same one: hand it to the
+// supervisor, which knows how to build a whole session again.
+func (r *Room) fail(err error) {
+	r.lostOnce.Do(func() {
+		r.lostErr = err
+		close(r.lost)
+	})
 }
 
 // State renders the room for the frontend's session banner.
@@ -250,6 +264,67 @@ func (r *Room) watchRoom(ctx context.Context) (*session.NamespaceSubscription, e
 	}
 	r.log.Info("watching room", "prefix", nsString(prefix))
 	return sub, nil
+}
+
+// watchAnnouncements keeps the room watch open for the life of the session.
+//
+// readAnnouncements returns whenever its stream ends, and a stream ending is
+// not the same as a session ending: a relay can reset this one request stream,
+// or send something unparseable, while everything else carries on. Returning
+// there used to be the end of discovery — the session stays up, so Lost never
+// fires and the supervisor never rebuilds, existing peers keep flowing, and
+// the call looks perfectly healthy while nobody who joins afterwards is ever
+// seen and nobody who leaves is ever removed.
+//
+// Re-subscribing is safe to repeat: the relay replays NAMESPACE for everyone
+// already publishing, and addRemote ignores an announcement for a participant
+// it already has. Departures missed while the watch was down are covered by
+// each remote's own catalog liveness, which is why that exists.
+//
+// If it cannot be re-established at all, the session is declared lost. A call
+// that can no longer discover anyone is worth rebuilding from scratch, and the
+// supervisor already knows how — better that than a call which quietly stopped
+// being one.
+func (r *Room) watchAnnouncements(sub *session.NamespaceSubscription) {
+	delay := watchRetryDelay
+	for attempt := 1; ; {
+		r.readAnnouncements(sub)
+
+		if r.ctx.Err() != nil {
+			return
+		}
+		// The session dying is the supervisor's business, not ours; it will
+		// rebuild everything including this watch.
+		select {
+		case <-r.lost:
+			return
+		default:
+		}
+
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+
+		next, err := r.watchRoom(r.ctx)
+		if err != nil {
+			r.log.Warn("could not re-establish the room watch",
+				"attempt", attempt, "err", err)
+			if attempt >= watchRetryLimit {
+				r.fail(fmt.Errorf("conf: room watch could not be re-established: %w", err))
+				return
+			}
+			attempt++
+			delay = min(delay*2, watchRetryMax)
+			continue
+		}
+
+		r.log.Info("room watch re-established", "attempt", attempt)
+		attempt = 1
+		delay = watchRetryDelay
+		sub = next
+	}
 }
 
 // readAnnouncements turns NAMESPACE / NAMESPACE_DONE notifications into

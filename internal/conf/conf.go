@@ -39,6 +39,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/floatdrop/moq-go/pkg/moqt/wire"
 )
@@ -51,6 +52,17 @@ const NamespaceRoot = "tlmst"
 const (
 	VideoTrack = "video"
 	AudioTrack = "audio"
+)
+
+// How long to wait before rebuilding a room watch that ended, the ceiling on
+// that wait, and how many attempts before the session is declared lost instead.
+// Five attempts over roughly fifteen seconds: long enough to ride out a relay
+// that is briefly unhappy, short enough that a call which can no longer
+// discover anyone does not stay that way.
+const (
+	watchRetryDelay = 500 * time.Millisecond
+	watchRetryMax   = 5 * time.Second
+	watchRetryLimit = 5
 )
 
 // audioGroupObjects is how many audio frames share one group. At the

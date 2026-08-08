@@ -887,6 +887,23 @@ export class Playback {
       return;
     }
 
+    // Sized from the frame either way.
+    //
+    // transferFromImageBitmap is specified to give the canvas the bitmap's
+    // dimensions, and relying on that was wrong: the element keeps its default
+    // 300x150 here, so a sixteen-by-nine picture was being drawn into a two-by-
+    // one buffer and came out stretched sideways. The frame carries the size
+    // synchronously, before any conversion, so it costs nothing to say it.
+    if (sink.canvas.width !== frame.displayWidth || sink.canvas.height !== frame.displayHeight) {
+      const now = performance.now();
+      if (now - sink.lastResizeMs >= CANVAS_RESIZE_INTERVAL_MS) {
+        sink.canvas.width = frame.displayWidth;
+        sink.canvas.height = frame.displayHeight;
+        sink.lastResizeMs = now;
+        sink.resizes++;
+      }
+    }
+
     if (painter.kind === 'bitmap') {
       // One conversion at a time — see VideoSink.painting.
       if (sink.painting) {
@@ -901,10 +918,8 @@ export class Playback {
           // unmounted, a layer switched. Nothing to transfer into, and an
           // ImageBitmap that is not transferred has to be released by hand.
           if (sink.painter?.kind === 'bitmap') {
-            // Takes ownership of the bitmap and sizes the canvas from it, so
-            // there is no separate resize on this path and nothing to hold.
+            // Takes ownership of the bitmap rather than copying out of it.
             sink.painter.ctx.transferFromImageBitmap(bitmap);
-            sink.resizes = 0;
           } else {
             bitmap.close();
           }
@@ -915,16 +930,6 @@ export class Playback {
           frame.close();
         });
       return;
-    }
-
-    if (sink.canvas.width !== frame.displayWidth || sink.canvas.height !== frame.displayHeight) {
-      const now = performance.now();
-      if (now - sink.lastResizeMs >= CANVAS_RESIZE_INTERVAL_MS) {
-        sink.canvas.width = frame.displayWidth;
-        sink.canvas.height = frame.displayHeight;
-        sink.lastResizeMs = now;
-        sink.resizes++;
-      }
     }
 
     try {

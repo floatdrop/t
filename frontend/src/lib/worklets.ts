@@ -1,3 +1,5 @@
+import { bridge } from './bridge';
+
 /**
  * AudioWorklet processors, as source strings loaded through blob URLs.
  *
@@ -307,6 +309,42 @@ function blobURL(name: string, source: string): string {
     moduleURLs.set(name, url);
   }
   return url;
+}
+
+/**
+ * Keeps an AudioContext running, and says so when it does not.
+ *
+ * A context is resumed once, from the gesture that joins the room, and then
+ * trusted for the rest of the call. It does not deserve that: macOS can
+ * interrupt one — audio focus taken by another app, an output device removed,
+ * sleep and wake — and it does not resume itself. Nothing else notices,
+ * because everything downstream keeps working on a graph that is no longer
+ * being rendered.
+ *
+ * The two contexts fail differently and both silently. The playback one is
+ * shared by every remote participant, so an interruption is the whole room
+ * going quiet at once while the tiles carry on painting — presentation falls
+ * back to the newest frame when there is no clock, so even lip sync looks
+ * deliberate. The capture one stops the tap, so the microphone goes dead
+ * while the local preview and everyone else's audio continue.
+ *
+ * Resuming needs no gesture once one has been given, so this can simply ask.
+ */
+export function watchAudioContext(ctx: AudioContext, role: 'capture' | 'playback'): void {
+  ctx.onstatechange = () => {
+    if (ctx.state === 'running' || ctx.state === 'closed') return;
+    bridge.report('WARN', 'audio context stopped running; resuming it', {
+      role,
+      state: ctx.state,
+    });
+    void ctx.resume().catch((err) => {
+      bridge.report('ERROR', 'audio context would not resume', {
+        role,
+        state: ctx.state,
+        err: String(err),
+      });
+    });
+  };
 }
 
 /** Registers the pcm-tap processor on ctx. Idempotent per context. */

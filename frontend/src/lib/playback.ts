@@ -13,7 +13,7 @@ import { bridge } from './bridge';
 import { decodeAudioLevel } from './denoise';
 import { KIND_VIDEO, fromBase64, type MediaFrame, type RemoteTrack } from './protocol';
 import { offsetMillis, presentIndex, projectClock, type ClockSample } from './sync';
-import { addPlayerModule, type PlayerChunk, type PlayerReport } from './worklets';
+import { addPlayerModule, watchAudioContext, type PlayerChunk, type PlayerReport } from './worklets';
 
 /**
  * The shared output limiter. Every participant sums into it, so it exists to
@@ -445,6 +445,7 @@ export class Playback {
     if (!this.#audioReady) {
       this.#audioReady = (async () => {
         const ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
+        watchAudioContext(ctx, 'playback');
         await addPlayerModule(ctx);
         const limiter = ctx.createDynamicsCompressor();
         limiter.threshold.value = LIMITER.threshold;

@@ -21,7 +21,7 @@ import {
   toBytes,
 } from './protocol';
 import { DENOISE_FRAME, Denoiser, type VoiceState } from './denoise';
-import { addTapModule, type TapBlock } from './worklets';
+import { addTapModule, watchAudioContext, type TapBlock } from './worklets';
 
 /** Seconds between forced keyframes — also the video group length. */
 const KEYFRAME_INTERVAL_SEC = 2;
@@ -1023,6 +1023,7 @@ export class Capture {
   async #startAudio(settings: AudioSettings): Promise<void> {
     const track = this.stream!.getAudioTracks()[0];
     const ctx = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: 'interactive' });
+    watchAudioContext(ctx, 'capture');
     try {
       await addTapModule(ctx);
     } catch (err) {

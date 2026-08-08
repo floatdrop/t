@@ -1027,6 +1027,12 @@ export class Capture {
     this.#videoRunning = false;
     bridge.report('ERROR', reason, attrs);
     this.#declare({ type: 'untrack', untrack: 'video' });
+    // The small layer cannot outlive the picture it is a copy of: it is fed
+    // from the same frames, so a dead primary means it will never be fed
+    // again. Leaving it declared would hand every subscriber a decoder that
+    // never receives another frame — the same freeze this withdrawal exists
+    // to prevent, one track along.
+    this.#withdrawLowLayer();
     this.onFailure?.('Your camera stopped publishing — the encoder failed. Others cannot see you.');
   }
 
@@ -1111,7 +1117,14 @@ export class Capture {
     this.#stopLowLayer();
 
     const rung = VIDEO_LADDER[0];
-    if (width <= rung.width) return;
+    if (width <= rung.width) {
+      // The primary is already this small or smaller, so a second copy of it
+      // would be the same picture twice. If a larger primary had one, that
+      // declaration has to go with it rather than being left behind pointing
+      // at an encoder that has just been closed.
+      this.#withdrawLowLayer();
+      return;
+    }
 
     let canvas: OffscreenCanvas;
     let ctx: OffscreenCanvasRenderingContext2D | null;
@@ -1214,6 +1227,16 @@ export class Capture {
   #failLowLayer(reason: string, attrs: Record<string, string>): void {
     if (!this.#lowEncoder) return;
     bridge.report('WARN', reason, attrs);
+    this.#withdrawLowLayer();
+  }
+
+  /**
+   * Stops the small layer and takes it out of the catalog.
+   *
+   * Withdrawing a kind that was never declared is a no-op on the backend, so
+   * this needs no memory of whether there was one.
+   */
+  #withdrawLowLayer(): void {
     this.#stopLowLayer();
     this.#declare({ type: 'untrack', untrack: 'videoLow' });
   }
@@ -1655,7 +1678,10 @@ export class Capture {
       // each subscriber holding a decoder that will never be fed again, sitting
       // on the last frame it got. Withdrawing a kind that was never declared is
       // a no-op on the backend, so this needs no memory of what came before.
-      if (!this.#videoRunning) this.#declare({ type: 'untrack', untrack: 'video' });
+      if (!this.#videoRunning) {
+        this.#declare({ type: 'untrack', untrack: 'video' });
+        this.#withdrawLowLayer();
+      }
       if (!this.#audioRunning) this.#declare({ type: 'untrack', untrack: 'audio' });
     }
 

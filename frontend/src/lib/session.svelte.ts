@@ -21,7 +21,7 @@ import {
   type VideoSource,
 } from './capture';
 import { CongestionDetector, inboundDrifts } from './congestion';
-import { autoVideoBitrate, autoVideoRung } from './layout';
+import { autoVideoBitrate, autoVideoRung, tilesTakeSmallVideo } from './layout';
 import { playback, type PlaybackStats } from './playback';
 import type {
   InviteMessage,
@@ -857,9 +857,31 @@ class Store {
    * scrolls, and a link that got worse while the view held still would
    * otherwise never be acted on.
    */
-  setVisibleTiles(ids: string[], smallEnough: boolean): void {
+  setVisibleTiles(ids: string[]): void {
     this.#visibleTiles = ids;
-    this.#tilesAreSmall = smallEnough;
+    this.#sendInterest();
+  }
+
+  /**
+   * Whether the tiles are being drawn small enough that the publishers'
+   * smaller encoding would do.
+   *
+   * Derived from the same numbers Auto resolution uses, rather than measured
+   * in the grid and reported: a window resize changes every tile's size
+   * without changing which tiles are on screen, so an observer watching
+   * visibility never fires and the answer would go stale exactly when someone
+   * made the window smaller.
+   */
+  tilesAreSmall = $derived(
+    tilesTakeSmallVideo({
+      tiles: this.participants.length + 1,
+      viewportWidth: this.viewportWidth,
+      pixelRatio: this.pixelRatio,
+    }),
+  );
+
+  /** Re-sends interest after something other than the visible set changed. */
+  refreshInterest(): void {
     this.#sendInterest();
   }
 
@@ -878,7 +900,7 @@ class Store {
    */
   #sendInterest(): void {
     const wanted = [...this.#visibleTiles].sort();
-    const small = this.#tilesAreSmall || this.linkCongested ? wanted : [];
+    const small = this.tilesAreSmall || this.linkCongested ? wanted : [];
     const key = `${wanted.join(',')}|${small.join(',')}`;
     if (key === this.#interestKey) return;
     this.#interestKey = key;
@@ -888,7 +910,6 @@ class Store {
   /** The last interest set sent, so an unchanged one is not sent twice. */
   #interestKey: string | null = null;
   #visibleTiles: string[] = [];
-  #tilesAreSmall = false;
 
   /**
    * Whether the inbound path is failing to carry what is being sent to us.

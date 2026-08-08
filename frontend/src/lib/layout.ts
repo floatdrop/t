@@ -94,6 +94,36 @@ export function autoVideoBitrate(rung: VideoRung, selected: number): number {
   return next ? Math.min(selected, next.minBitrate) : selected;
 }
 
+/**
+ * The device-pixel width at or below which a publisher's smaller encoding is
+ * enough.
+ *
+ * The bottom rung of the ladder, because that is what the small layer is
+ * encoded at: a tile drawn no wider than this gains nothing from the full
+ * picture, since it would be scaled back down to about this before anyone saw
+ * it.
+ */
+export const SMALL_TILE_WIDTH = VIDEO_LADDER[0].width;
+
+/**
+ * Whether the tiles this grid will draw are small enough that the smaller
+ * encoding will do.
+ *
+ * Here rather than in the component for the same reason the rung arithmetic
+ * is: it is the tile width that decides it, and a second copy of that
+ * calculation would drift from the one the grid lays out with — a drift that
+ * shows up only as a stream that is quietly the wrong size.
+ */
+export function tilesTakeSmallVideo(input: {
+  tiles: number;
+  viewportWidth: number;
+  pixelRatio: number;
+}): boolean {
+  const width =
+    tileWidth(input.tiles, input.viewportWidth) * Math.min(input.pixelRatio, MAX_PIXEL_RATIO);
+  return width > 0 && width <= SMALL_TILE_WIDTH;
+}
+
 export function autoVideoRung(input: AutoVideoInput): VideoRung {
   const wanted =
     tileWidth(input.tiles, input.viewportWidth) * Math.min(input.pixelRatio, MAX_PIXEL_RATIO);

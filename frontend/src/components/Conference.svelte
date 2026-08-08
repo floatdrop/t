@@ -9,7 +9,7 @@
   import { bridge } from '../lib/bridge';
   import { ICON_SIZE } from '../lib/icons';
   import { buildInviteLink, copyText } from '../lib/invite';
-  import { GRID_GAP, GRID_PADDING, tileColumns, tileWidth } from '../lib/layout';
+  import { GRID_GAP, GRID_PADDING, tileColumns } from '../lib/layout';
   import { store } from '../lib/session.svelte';
   import DeviceMenu from './DeviceMenu.svelte';
   import VideoTile from './VideoTile.svelte';
@@ -161,15 +161,25 @@
    */
   const INTEREST_SETTLE_MS = 250;
 
-  /**
-   * The device-pixel width at or below which a publisher's smaller encoding is
-   * enough. The bottom rung of the ladder is 640 wide, so a tile drawn no
-   * larger than that gains nothing from the full picture — it would be scaled
-   * back down to this before anyone saw it.
-   */
-  const SMALL_TILE_WIDTH = 640;
-
   let gridEl = $state<HTMLDivElement | undefined>();
+
+  /**
+   * Which tiles exist, as a value that only changes when that does.
+   *
+   * The observer below must not be torn down for anything else, and `remotes`
+   * is rebuilt whenever *anyone speaks* — it carries a speaking flag, so it
+   * changes identity several times a second on a live call. An effect watching
+   * it re-ran that often, and each re-run cancelled the pending report before
+   * its settle elapsed, so after the first one no interest was ever sent
+   * again: every tile in the room stayed unsubscribed while the observer
+   * looked like it was working.
+   */
+  const tileKey = $derived(
+    remotes
+      .map((r) => r.id)
+      .sort()
+      .join(','),
+  );
 
   /**
    * Reports which tiles are on screen, so the backend can stop subscribing to
@@ -185,8 +195,16 @@
    * expanded are read: solo view renders exactly one tile, and everyone else
    * stops being visible in the most literal sense.
    */
+  // The tiles can stop being worth the full picture without any of them
+  // moving: making the window smaller changes every tile's size and none of
+  // their visibility, so the observer below never fires for it.
   $effect(() => {
-    void remotes.length;
+    void store.tilesAreSmall;
+    store.refreshInterest();
+  });
+
+  $effect(() => {
+    void tileKey;
     void expanded;
     const root = gridEl;
     if (!root) return;
@@ -203,20 +221,11 @@
           else visible.delete(id);
         }
         clearTimeout(settle);
-        settle = setTimeout(() => {
-          // Reported, not decided. How big a tile is drawn is a fact about
-          // this window; whether the link can carry the full picture is a fact
-          // about the path, and the store holds both — which is also what lets
-          // a link that got worse while nobody scrolled still be acted on.
-          //
-          // The publisher cannot make this call either way: it sizes its
-          // encoders from its own grid, which is not the one the picture lands
-          // in.
-          const width = root.clientWidth
-            ? tileWidth(remotes.length + 1, root.clientWidth) * Math.min(devicePixelRatio, 2)
-            : 0;
-          store.setVisibleTiles([...visible], width > 0 && width <= SMALL_TILE_WIDTH);
-        }, INTEREST_SETTLE_MS);
+        // Reported, not decided: which tiles are on screen is all this can
+        // see. How big they are drawn and whether the link can carry the full
+        // picture are both the store's, which is what lets either change the
+        // answer without anybody scrolling.
+        settle = setTimeout(() => store.setVisibleTiles([...visible]), INTEREST_SETTLE_MS);
       },
       { root, rootMargin: INTEREST_MARGIN, threshold: 0 },
     );

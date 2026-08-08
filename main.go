@@ -150,11 +150,14 @@ func main() {
 		})
 
 	wailsApp.Window.NewWithOptions(application.WebviewWindowOptions{
-		Title:            "tlmst",
-		Width:            1280,
-		Height:           860,
-		MinWidth:         900,
-		MinHeight:        600,
+		Title:  "tlmst",
+		Width:  1280,
+		Height: 860,
+		// No minimum. The grid is built to cope with being small — it drops to
+		// one column, and a tile narrow enough stops being worth the full
+		// picture and takes the publisher's smaller encoding instead. A floor
+		// of 900 meant that second behaviour could not be reached at all
+		// except by filling the room, which is not how anyone would meet it.
 		BackgroundColour: application.NewRGB(11, 13, 18),
 		URL: startURL(launch{
 			relay:    *relayFlag,

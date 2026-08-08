@@ -43,6 +43,38 @@ const (
 	videoPriority   = 60
 )
 
+// videoLevel is how much of a participant's video this client is still asking
+// for. The relay demotes us down this ladder by giving up on a subscription;
+// time promotes us back up.
+type videoLevel int
+
+const (
+	videoFull  videoLevel = iota // the primary encoding
+	videoSmall                   // the publisher's smaller encoding
+	videoNone                    // audio only
+)
+
+func (l videoLevel) String() string {
+	switch l {
+	case videoSmall:
+		return "small"
+	case videoNone:
+		return "none"
+	default:
+		return "full"
+	}
+}
+
+// videoRecovery is how long a demotion holds before this client tries one step
+// back up.
+//
+// Long enough that a congested minute is not spent flapping: a step up costs a
+// fresh SUBSCRIBE, a new handle, a new decoder and a wait for the next keyframe
+// — up to the publisher's keyframe interval of blank tile, with no way to ask
+// for one sooner. Short enough that a burst of congestion does not pin someone
+// to a thumbnail for the rest of the call.
+const videoRecovery = 30 * time.Second
+
 // remote is one other participant in the room: their catalog
 // subscription, whichever media subscriptions their catalog declares, and
 // the bridge handles their frames travel under.
@@ -102,6 +134,18 @@ type remote struct {
 	version      string
 	video        *remoteTrack
 	audio        *remoteTrack
+	// level is how much of this participant's video is still being asked for,
+	// after any demotion the relay has forced on us. It only ever lowers what
+	// the frontend asked for, never raises it.
+	level videoLevel
+	// demotedFor is the handle the current demotion was decided on. A
+	// subscription's groups arrive on separate streams and the relay resets
+	// each of them, so the same verdict lands more than once; without this
+	// every stream of a dead subscription would demote another step.
+	demotedFor uint32
+	// recovery lifts the demotion once the link has been quiet. Replaced on
+	// each demotion, so the wait always runs from the most recent one.
+	recovery *time.Timer
 	// closed stops late catalog updates from resurrecting subscriptions
 	// after the participant has left.
 	closed bool
@@ -438,7 +482,11 @@ func (r *remote) missing() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	wantsSomeVideo := r.wantVideo != nil || r.wantVideoLow != nil
-	return (wantsSomeVideo && r.video == nil && wantsVideo) ||
+	// A demotion all the way off is deliberate, exactly as declining video is,
+	// and reading it as a failed subscription would send the retry loop after
+	// the very track the relay could not carry — and then tell the user this
+	// participant could not be reached.
+	return (wantsSomeVideo && r.video == nil && wantsVideo && r.level != videoNone) ||
 		(r.wantAudio != nil && r.audio == nil)
 }
 
@@ -537,16 +585,42 @@ func (r *remote) reconcile(video, videoLow, audio *bridge.TrackConfig) {
 // encoder died may offer only the small one; in both cases taking what exists
 // beats taking nothing, because nothing is a permanently blank tile.
 func (r *remote) chooseVideoLayer(video, videoLow *bridge.TrackConfig) (string, *bridge.TrackConfig) {
+	// Both room lookups first, and neither under this remote's lock:
+	// publishParticipants holds the room's and calls inward, so reaching back
+	// the other way would close the cycle.
 	if !r.room.wantsVideo(r.id) {
 		return VideoTrack, nil
 	}
-	if r.room.wantsLowLayer(r.id) && videoLow != nil {
+	wantsSmall := r.room.wantsLowLayer(r.id)
+
+	r.mu.Lock()
+	level := r.level
+	r.mu.Unlock()
+
+	// The demotion only ever lowers what the frontend asked for. It cannot
+	// raise it: a tile the size of a thumbnail does not want the full picture
+	// because the link happens to be quiet.
+	switch {
+	case level == videoNone:
+		return VideoTrack, nil
+
+	case level == videoSmall:
+		// Demoted by the relay. If this publisher offers nothing smaller then
+		// there is no smaller thing to ask for, and re-asking for the full
+		// picture would be offering back the load that was just refused — so
+		// the only step down left is off.
+		if videoLow != nil {
+			return VideoLowTrack, videoLow
+		}
+		return VideoTrack, nil
+
+	case wantsSmall && videoLow != nil:
 		return VideoLowTrack, videoLow
-	}
-	if video != nil {
+
+	case video != nil:
 		return VideoTrack, video
-	}
-	if videoLow != nil {
+
+	case videoLow != nil:
 		return VideoLowTrack, videoLow
 	}
 	return VideoTrack, nil
@@ -740,21 +814,24 @@ func (r *remote) readMedia(
 // capacity signal anybody sends us and was previously logged, at Debug,
 // identically to a group finishing normally.
 //
-// It is reported and not acted on. Re-subscribing immediately would ask the
-// relay for exactly the traffic it just decided we cannot carry, and would do
-// it in a loop; choosing what to subscribe to instead is admission control,
-// which does not exist yet. So the tile stays frozen — as it already did — but
-// the log now says why, which is the difference between a mystery and a
-// measurement.
+// Acting on it is not optional. The relay does not merely reset the stream, it
+// terminates the subscription — so a track this happens to is not being
+// delivered again, and nothing else would ever rebuild it. That tile stayed
+// frozen for the rest of the call.
+//
+// Rebuilding it as it was would ask for exactly the traffic the relay just
+// refused, and would ask again every lag window. So the rebuild steps down
+// instead: the full picture becomes the publisher's smaller encoding, and the
+// smaller encoding becomes audio only.
 func (r *remote) reportMediaEnd(track *remoteTrack, err error) {
 	if r.ctx.Err() != nil {
 		return // we tore this down ourselves
 	}
 	if code, ok := streamReset(err); ok {
 		if overloadReset(code) {
-			r.log.Warn("the relay stopped forwarding a track: we are not keeping up",
-				"handle", track.handle, "code", resetName(code),
-				"consequence", "this track is not being delivered until its subscription is rebuilt")
+			// On its own goroutine: this one is draining a stream, and the
+			// rebuild waits on a SUBSCRIBE round trip.
+			go r.demote(track, resetName(code))
 			return
 		}
 		r.log.Info("media stream reset by the peer",
@@ -763,6 +840,106 @@ func (r *remote) reportMediaEnd(track *remoteTrack, err error) {
 	}
 	if !errors.Is(err, io.EOF) {
 		r.log.Debug("media read ended", "handle", track.handle, "err", err)
+	}
+}
+
+// demote rebuilds a subscription the relay gave up on, one step smaller.
+//
+// Audio is never demoted. There is no smaller version of it, it is what a call
+// is, and at 32 kbps it is not what filled the link — so it is rebuilt as it
+// was, through the ordinary retry path.
+func (r *remote) demote(track *remoteTrack, code string) {
+	if r.ctx.Err() != nil {
+		return
+	}
+
+	if track.kind == bridge.KindAudio {
+		r.log.Warn("the relay stopped forwarding audio: we are not keeping up",
+			"handle", track.handle, "code", code, "action", "rebuilding it unchanged")
+		r.dropTrack(&r.audio)
+		r.scheduleResubscribe()
+		return
+	}
+
+	r.mu.Lock()
+	// Only the subscription that is still current, and only once for it. Every
+	// open group of a dead subscription is reset separately, so this arrives
+	// once per stream for a verdict that was reached once.
+	if r.closed || r.video == nil || r.video.handle != track.handle ||
+		r.demotedFor == track.handle {
+		r.mu.Unlock()
+		return
+	}
+	r.demotedFor = track.handle
+	from := r.level
+	if r.level < videoNone {
+		r.level++
+	}
+	to := r.level
+	video, videoLow, audio := r.wantVideo, r.wantVideoLow, r.wantAudio
+	r.mu.Unlock()
+
+	r.log.Warn("the relay stopped forwarding a track: we are not keeping up",
+		"handle", track.handle, "code", code,
+		"from", from.String(), "to", to.String())
+
+	r.applying.Lock()
+	r.reconcile(video, videoLow, audio)
+	r.applying.Unlock()
+
+	r.scheduleRecovery()
+}
+
+// scheduleRecovery tries one step back up once the link has been quiet for
+// videoRecovery. Without it a single congested moment would hold a participant
+// at a thumbnail — or at nothing — for the rest of the call.
+func (r *remote) scheduleRecovery() {
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
+	if r.recovery != nil {
+		r.recovery.Stop()
+	}
+	r.recovery = time.AfterFunc(videoRecovery, r.recover)
+	r.mu.Unlock()
+}
+
+// recover restores one step of what was demoted, and schedules the next step
+// if there is still ground to make up.
+//
+// One step at a time on purpose. Going straight back to the full picture after
+// a demotion to none would re-offer the whole load that the relay refused, and
+// find out whether it fits by being cut off again.
+func (r *remote) recover() {
+	if r.ctx.Err() != nil {
+		return
+	}
+
+	r.mu.Lock()
+	if r.closed || r.level == videoFull {
+		r.mu.Unlock()
+		return
+	}
+	from := r.level
+	r.level--
+	to := r.level
+	// Cleared so the next verdict on the rebuilt subscription is acted on.
+	r.demotedFor = 0
+	video, videoLow, audio := r.wantVideo, r.wantVideoLow, r.wantAudio
+	more := r.level != videoFull
+	r.mu.Unlock()
+
+	r.log.Info("the link has been quiet; asking for more video again",
+		"from", from.String(), "to", to.String())
+
+	r.applying.Lock()
+	r.reconcile(video, videoLow, audio)
+	r.applying.Unlock()
+
+	if more {
+		r.scheduleRecovery()
 	}
 }
 
@@ -783,6 +960,10 @@ func scaleTimestamp(p loc.Properties) uint64 {
 func (r *remote) close() {
 	r.mu.Lock()
 	r.closed = true
+	if r.recovery != nil {
+		r.recovery.Stop()
+		r.recovery = nil
+	}
 	r.mu.Unlock()
 
 	r.dropTrack(&r.video)

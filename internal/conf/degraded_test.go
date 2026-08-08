@@ -336,3 +336,51 @@ func TestSkewStaysFlatOnAHealthyPath(t *testing.T) {
 // bottleneck produces — the congested path measured in hundreds — so the
 // assertion is not tuned to a particular machine's timing.
 const congestedDriftFloor float64 = 5
+
+// The relay does not merely reset a stream when it gives up on a subscriber:
+// it terminates the subscription. Nothing else rebuilds one, so before this
+// the tile that happened to went blank for the rest of the call — the exact
+// failure the reset was warning about, made permanent by not being answered.
+//
+// The answer is not to re-subscribe as we were, which would offer back the
+// load that was just refused and be cut off again a lag window later. It is to
+// come back smaller.
+func TestOverloadDemotesRatherThanFreezing(t *testing.T) {
+	relayServer := startRelay(t)
+	addr := relayServer.Addr()
+	alice := simulcastPublisher(t, addr, "demote", "alice")
+
+	link := startShaper(t, addr, 32_000, 64)
+	spy := newLogSpy(t)
+	bobRoom, bobRec := joinRoomWithCounters(
+		t, link.Addr(), "demote", "bob", telemetry.NewRegistry(), slog.New(spy))
+	_ = bobRoom
+
+	waitFor(t, "bob to take the full picture", 15*time.Second, func() bool {
+		v, ok := bobRec.trackFor("video")
+		return ok && v.Config.Width == 1280
+	})
+
+	stop := make(chan struct{})
+	publishPaced(t, alice, stop)
+	defer close(stop)
+
+	waitFor(t, "the relay to give up on the full picture", 25*time.Second, func() bool {
+		return spy.sawAttr("msg",
+			"the relay stopped forwarding a track: we are not keeping up")
+	})
+
+	// The subscription the relay killed is rebuilt, and rebuilt smaller.
+	waitFor(t, "video to come back at the smaller encoding", 20*time.Second, func() bool {
+		v, ok := bobRec.trackFor("video")
+		return ok && v.Config.Width == 640
+	})
+
+	if !spy.sawAttr("to", "small") {
+		t.Error("the demotion was not reported as a step down the ladder")
+	}
+	_, _, _, errs := bobRec.snapshot()
+	if len(errs) > 0 {
+		t.Errorf("being demoted was reported to the user as a failure: %v", errs)
+	}
+}

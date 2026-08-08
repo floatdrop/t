@@ -164,20 +164,40 @@
   <section class="wide">
     <h3>Decoders</h3>
     {#if store.playbackStats.length}
-      <!-- Nine columns will not fit a narrow drawer, so the table scrolls
-           inside its own box rather than spilling out of the panel. -->
+      <!-- Eleven columns will not fit a narrow drawer, so the table scrolls
+           inside its own box rather than spilling out of the panel.
+
+           Every width is declared and the layout is fixed, so a column cannot
+           resize under its own contents. These numbers change four times a
+           second, and a table that reflows on each of them is one nobody can
+           read a trend off: the eye tracks a column that is holding still, not
+           one that jumps a few pixels whenever a value gains a digit. -->
       <div class="scroll-x">
-        <table>
+        <table class="decoders">
+          <colgroup>
+            <col style="width: 96px" /><col style="width: 54px" />
+            <col style="width: 110px" /><col style="width: 96px" />
+            <col style="width: 58px" /><col style="width: 58px" />
+            <col style="width: 58px" /><col style="width: 68px" />
+            <col style="width: 80px" /><col style="width: 82px" />
+            <col style="width: 78px" />
+          </colgroup>
           <thead>
             <tr>
               <th scope="col">Participant</th><th scope="col">Kind</th>
               <th scope="col">Codec</th><th scope="col">Resolution</th>
               <th scope="col">fps</th><th scope="col">Queue</th>
+              <!-- Frames decoded and waiting for their turn against the audio
+                   clock. Its own column beside the decode queue, which is the
+                   other depth: the two answer different questions — one is the
+                   decoder falling behind, the other is presentation holding
+                   frames back on purpose. -->
+              <th scope="col">Held</th>
               <th scope="col">Dropped</th><th scope="col">Buffered</th>
+              <th scope="col">Underruns</th>
               <!-- How far the picture led the sound at the last presented
-                   frame, and how many frames are waiting behind it. Nothing
-                   corrects from this, but without it a sync regression is
-                   invisible. -->
+                   frame. Nothing corrects from this, but without it a sync
+                   regression is invisible. -->
               <th scope="col">A/V</th>
             </tr>
           </thead>
@@ -196,21 +216,23 @@
                 </td>
                 <td>{s.fps.toFixed(1)}</td>
                 <td>{s.decodeQueue}</td>
+                <td>{s.queued ?? '—'}</td>
                 <td>{s.dropped}</td>
                 <td>
                   {#if s.buffered !== undefined}
                     {(s.buffered / 48).toFixed(0)} ms
-                    {#if s.underruns}<span class="warn"> · {s.underruns} underruns</span>{/if}
                   {:else}
                     —
                   {/if}
+                </td>
+                <td class={s.underruns ? 'warn' : ''}>
+                  {s.underruns ?? '—'}
                 </td>
                 <td>
                   {#if s.avOffsetMs !== undefined}
                     <span class={Math.abs(s.avOffsetMs) > 80 ? 'warn' : ''}>
                       {s.avOffsetMs > 0 ? '+' : ''}{s.avOffsetMs.toFixed(0)} ms
                     </span>
-                    {#if s.queued}<span class="muted"> · {s.queued} held</span>{/if}
                   {:else if s.kind === 'video'}
                     <!-- No audio from this participant, so the frame is
                          presented as soon as it decodes. -->
@@ -326,6 +348,22 @@
     white-space: nowrap;
   }
 
+  /* The decoders table is the exception: its columns come from the colgroup
+     and stay there, because everything in it is a live number. Sizing to
+     content would mean the whole row shifting sideways whenever a value
+     crosses ten, or a participant's fps gains a digit — which is precisely
+     when someone is staring at it. */
+  .scroll-x table.decoders {
+    table-layout: fixed;
+    width: max-content;
+  }
+
+  .decoders th,
+  .decoders td {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   .codec {
     text-align: left;
   }
@@ -381,10 +419,6 @@
 
   .warn {
     color: var(--warn);
-  }
-
-  .muted {
-    color: var(--text-dim);
   }
 
   .errors {

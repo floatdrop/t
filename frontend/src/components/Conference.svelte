@@ -222,7 +222,7 @@
   // moving: making the window smaller changes every tile's size and none of
   // their visibility, so the observer below never fires for it.
   $effect(() => {
-    void store.tilesAreSmall;
+    void store.geometryKey;
     store.refreshInterest();
   });
 

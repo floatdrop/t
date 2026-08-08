@@ -59,6 +59,30 @@ const SPEAKING_TIMEOUT_MS = 400;
  */
 const RESIZE_SETTLE_MS = 300;
 
+/**
+ * How fast a publisher's audio must be falling behind its own clock to count
+ * as congestion, in milliseconds per second.
+ *
+ * A healthy path measures within a tenth of this and a real bottleneck a
+ * hundred times it, so there is a wide gap to sit in. The panel warns past
+ * 1 ms/s, which is where clock drift between two machines stops being a
+ * plausible explanation; acting is held to ten times that.
+ */
+const DRIFT_CONGESTED_MS_PER_SEC = 10;
+
+/** How long the drift must hold before the picture is taken down. */
+const DRIFT_CONGESTED_HOLD_MS = 2000;
+
+/** How long it must stay quiet before the full picture is asked for again. */
+const DRIFT_QUIET_MS = 15000;
+
+/**
+ * How many publishers must be drifting at once for the cause to be our own
+ * downlink rather than one publisher's uplink. Capped by how many there are:
+ * in a two-person call there is no second opinion to be had.
+ */
+const DRIFT_MIN_PUBLISHERS = 2;
+
 /** How many times to try building a sink before giving up on a participant. */
 const PLAYBACK_ADD_ATTEMPTS = 3;
 
@@ -363,6 +387,7 @@ class Store {
 
         case 'metrics':
           this.metrics = msg.metrics;
+          this.#updateCongestion(msg.metrics);
           this.history = appendCapped(this.history, msg.metrics, HISTORY_LENGTH);
           break;
 
@@ -473,6 +498,13 @@ class Store {
     // moved — otherwise the deduplication would swallow it and the call would
     // quietly pay for every tile in the room.
     this.#interestKey = null;
+    // The tiles those ids named are gone, and a fresh session subscribes to
+    // everything until told otherwise; the observer re-reports as soon as the
+    // grid rebuilds.
+    this.#visibleTiles = [];
+    this.linkCongested = false;
+    this.#driftingSince = null;
+    this.#quietSince = null;
   }
 
   detach(): void {
@@ -841,17 +873,36 @@ class Store {
   }
 
   /**
-   * Tells the backend whose video is worth receiving — the tiles on screen,
-   * plus whatever a scroll is about to bring on.
+   * What the grid can see: which tiles are on screen, and whether they are
+   * being drawn small enough that a publisher's smaller encoding would do.
+   *
+   * The view reports; this decides. Keeping the decision here is what lets
+   * congestion change the answer — the observer only fires when someone
+   * scrolls, and a link that got worse while the view held still would
+   * otherwise never be acted on.
+   */
+  setVisibleTiles(ids: string[], smallEnough: boolean): void {
+    this.#visibleTiles = ids;
+    this.#tilesAreSmall = smallEnough;
+    this.#sendInterest();
+  }
+
+  /**
+   * Tells the backend whose video is worth receiving, and at which size.
+   *
+   * Two independent reasons to take the smaller encoding, and either is
+   * sufficient: the tile cannot show more than that, or the link cannot carry
+   * more than that. Geometry is a fact about the window and congestion is a
+   * fact about the path, so they are asked separately and answered together.
    *
    * Sorted and compared against the last set before sending, because the
-   * observer fires on every scroll and the answer usually has not changed.
-   * Re-sending it would make every remote reconsider its subscriptions for
-   * nothing.
+   * observer fires on every scroll and the metrics arrive four times a second,
+   * while the answer usually has not changed. Re-sending it would make every
+   * remote reconsider its subscriptions for nothing.
    */
-  setVideoInterest(ids: string[], low: string[] = []): void {
-    const wanted = [...ids].sort();
-    const small = [...low].sort();
+  #sendInterest(): void {
+    const wanted = [...this.#visibleTiles].sort();
+    const small = this.#tilesAreSmall || this.linkCongested ? wanted : [];
     const key = `${wanted.join(',')}|${small.join(',')}`;
     if (key === this.#interestKey) return;
     this.#interestKey = key;
@@ -860,6 +911,80 @@ class Store {
 
   /** The last interest set sent, so an unchanged one is not sent twice. */
   #interestKey: string | null = null;
+  #visibleTiles: string[] = [];
+  #tilesAreSmall = false;
+
+  /**
+   * Whether the inbound path is failing to carry what is being sent to us.
+   *
+   * Driven by the drift meter — how fast each publisher's audio is arriving
+   * later than the clock that produced it — which leads the relay's own
+   * verdict by several seconds. The relay only tells us we could not keep up
+   * after it has already stopped forwarding; this is the part that can be seen
+   * coming.
+   */
+  linkCongested = $state(false);
+
+  #driftingSince: number | null = null;
+  #quietSince: number | null = null;
+
+  /**
+   * Decides whether the inbound path is over capacity, from the per-publisher
+   * drift readings in one metrics sample.
+   *
+   * The count is what matters, not any single reading. Drift is measured per
+   * publisher on their audio, so one publisher drifting alone says something
+   * about *their* uplink or the relay's path for that one stream — and taking
+   * our own picture down for that would be answering the wrong question. Several
+   * drifting together is the shared thing they have in common, which is our
+   * downlink.
+   *
+   * With only one other participant the two causes cannot be told apart. It is
+   * acted on anyway: the cost of being wrong is one layer switch, and the cost
+   * of doing nothing is a call that stays broken.
+   */
+  #updateCongestion(m: Metrics): void {
+    const inbound = (m.tracks ?? []).filter(
+      (t) => !t.label.startsWith('out/') && t.label.endsWith('/audio'),
+    );
+    const measured = inbound.filter((t) => t.skewMillisPerSec !== undefined);
+    if (measured.length === 0) return;
+
+    const drifting = measured.filter(
+      (t) => (t.skewMillisPerSec ?? 0) > DRIFT_CONGESTED_MS_PER_SEC,
+    ).length;
+    const needed = Math.min(DRIFT_MIN_PUBLISHERS, measured.length);
+    const bad = drifting >= needed;
+    const now = performance.now();
+
+    if (bad) {
+      this.#quietSince = null;
+      this.#driftingSince ??= now;
+      // Held for a moment before acting: a single sample can catch a burst
+      // that is already draining, and a layer switch costs a keyframe wait.
+      if (!this.linkCongested && now - this.#driftingSince >= DRIFT_CONGESTED_HOLD_MS) {
+        this.linkCongested = true;
+        bridge.report('WARN', 'inbound path is falling behind; taking smaller video', {
+          drifting: String(drifting),
+          publishers: String(measured.length),
+        });
+        this.#sendInterest();
+      }
+      return;
+    }
+
+    this.#driftingSince = null;
+    this.#quietSince ??= now;
+    // Far longer than the drop, and deliberately so. Going back up costs a
+    // fresh SUBSCRIBE, a new handle, a new decoder and a wait for the next
+    // keyframe, so being wrong upwards is visible in a way being wrong
+    // downwards is not.
+    if (this.linkCongested && now - this.#quietSince >= DRIFT_QUIET_MS) {
+      this.linkCongested = false;
+      bridge.report('INFO', 'inbound path has been quiet; asking for full video again');
+      this.#sendInterest();
+    }
+  }
 
   clearLogs(): void {
     this.logs = [];

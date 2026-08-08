@@ -78,6 +78,11 @@
       default:
         return { level: 'down', label: 'Not connected' };
     }
+    // Said out loud, because the picture visibly changes and the alternative
+    // is a call that quietly got worse for no reason anyone can see.
+    if (store.linkCongested) {
+      return { level: 'degraded', label: 'Connected · reduced video to fit the connection' };
+    }
     const loss = store.metrics?.lossPercent ?? 0;
     if (loss >= LOSS_DEGRADED_PERCENT) {
       return { level: 'degraded', label: `Connected · ${loss.toFixed(1)}% packet loss` };
@@ -199,18 +204,18 @@
         }
         clearTimeout(settle);
         settle = setTimeout(() => {
-          const wanted = [...visible];
-          // Which layer, measured rather than assumed: a tile is only as big
-          // as the grid draws it, and asking for the full picture to paint it
-          // into a thumbnail spends bitrate on pixels that are scaled away
-          // before anyone sees them. The publisher cannot make this call — it
-          // sizes its encoders from its own window, which is not the one the
-          // picture lands in.
+          // Reported, not decided. How big a tile is drawn is a fact about
+          // this window; whether the link can carry the full picture is a fact
+          // about the path, and the store holds both — which is also what lets
+          // a link that got worse while nobody scrolled still be acted on.
+          //
+          // The publisher cannot make this call either way: it sizes its
+          // encoders from its own grid, which is not the one the picture lands
+          // in.
           const width = root.clientWidth
             ? tileWidth(remotes.length + 1, root.clientWidth) * Math.min(devicePixelRatio, 2)
             : 0;
-          const low = width > 0 && width <= SMALL_TILE_WIDTH ? wanted : [];
-          store.setVideoInterest(wanted, low);
+          store.setVisibleTiles([...visible], width > 0 && width <= SMALL_TILE_WIDTH);
         }, INTEREST_SETTLE_MS);
       },
       { root, rootMargin: INTEREST_MARGIN, threshold: 0 },

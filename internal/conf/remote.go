@@ -854,7 +854,16 @@ func (r *remote) subscribeTrack(slot **remoteTrack, name string, kind uint8, cfg
 		"track", name, "alias", sub.TrackAlias(), "handle", handle, "codec", cfg.Codec)
 
 	if kind == bridge.KindVideo {
-		r.backfillGroup(subMsg.RequestID, track, counter)
+		// On its own goroutine: it is a FETCH round trip with no deadline, and
+		// nothing here needs its result — the objects it brings are forwarded
+		// from the handler it registers. Done inline it sat in front of
+		// everything behind this subscribe, holding `applying` across the trip:
+		// the participant's audio waited for it, so did any catalog arriving
+		// meanwhile, and against a track with nothing published yet the wait
+		// was long enough to time tests out. A congested link is exactly where
+		// that trip is slowest and where audio can least afford to queue behind
+		// a picture.
+		go r.backfillGroup(subMsg.RequestID, track, counter)
 	}
 	return nil
 }
@@ -979,17 +988,26 @@ func (r *remote) readMediaFetch(
 // dropTrack closes one media subscription and tells the frontend to
 // retire its decoder.
 func (r *remote) dropTrack(slot **remoteTrack) {
+	// The fetch is read under the same lock that backfillGroup writes it
+	// under: that now runs on its own goroutine, so a track dropped while its
+	// backfill is still being set up would otherwise race the assignment and
+	// leave the FETCH open — still delivering a whole group to a handle the
+	// frontend has been told to retire.
 	r.mu.Lock()
 	track := *slot
 	*slot = nil
+	var fetch *session.FetchRequest
+	if track != nil {
+		fetch = track.fetch
+	}
 	r.mu.Unlock()
 	if track == nil {
 		return
 	}
 
 	track.sub.Close()
-	if track.fetch != nil {
-		track.fetch.Close()
+	if fetch != nil {
+		fetch.Close()
 	}
 	r.room.counters.Forget(track.label)
 	r.room.sink.SendControl(&bridge.ServerMessage{

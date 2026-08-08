@@ -22,6 +22,7 @@
 
   const RELAY_KEY = 'tlmst.relay';
   const NICK_KEY = 'tlmst.nickname';
+  const ROOM_KEY = 'tlmst.room';
 
   /** Where calls go unless told otherwise. */
   const DEFAULT_RELAY = 'https://t.tel.yandex.net/';
@@ -34,7 +35,17 @@
   const params = new URLSearchParams(location.search);
 
   let relay = $state(params.get('relay') ?? localStorage.getItem(RELAY_KEY) ?? DEFAULT_RELAY);
-  let room = $state(params.get('room') ?? '');
+  /**
+   * The room to join, kept between runs like the relay and the nickname.
+   *
+   * Leave returns to this screen, and a room left empty is filled with a fresh
+   * random one on mount — so without this, leaving a call and changing your
+   * mind gave you a different room than the one you had just been in, with no
+   * way back to it short of someone re-sending the invite. Rejoining what you
+   * just left is the common case, not a new room every time; the ↻ button is
+   * there for when it really is a new one.
+   */
+  let room = $state(params.get('room') ?? localStorage.getItem(ROOM_KEY) ?? '');
   /**
    * Whoever the system says is using the machine, unless something more
    * deliberate has said otherwise: an explicit -nickname wins, then a name kept
@@ -188,6 +199,7 @@
     joinError = '';
     localStorage.setItem(RELAY_KEY, relay);
     localStorage.setItem(NICK_KEY, nickname);
+    localStorage.setItem(ROOM_KEY, room);
     try {
       await store.join(relay, room, nickname);
     } catch (err) {
@@ -254,7 +266,10 @@
         <button
           type="button"
           class="ghost"
-          onclick={() => (room = randomRoom())}
+          onclick={() => {
+            room = randomRoom();
+            localStorage.setItem(ROOM_KEY, room);
+          }}
           title="New room"
         >↻</button>
       </div>

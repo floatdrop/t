@@ -82,6 +82,14 @@ const RENDER_STALL_MS = 500;
  */
 const CANVAS_RESIZE_INTERVAL_MS = 500;
 
+/** Picks the best available way to paint into a canvas. See [Painter]. */
+function painterFor(canvas: HTMLCanvasElement): Painter | null {
+  const bitmap = canvas.getContext('bitmaprenderer');
+  if (bitmap) return { kind: 'bitmap', ctx: bitmap };
+  const two = canvas.getContext('2d');
+  return two ? { kind: '2d', ctx: two } : null;
+}
+
 /** How often to check that the presentation loop is still being called. */
 const RENDER_WATCHDOG_MS = 250;
 
@@ -126,6 +134,11 @@ export interface PlaybackStats {
    * every time and is what a flickering or frozen tile looks like.
    */
   resizes?: number;
+  /**
+   * Video only: frames dropped because a bitmap conversion was still running.
+   * See VideoSink.paintSkipped — expected to be zero.
+   */
+  paintSkipped?: number;
   /** Codec string the decoder was configured with. */
   codec: string;
   /**
@@ -149,12 +162,52 @@ export interface PlaybackStats {
   underruns?: number;
 }
 
+/**
+ * How a decoded frame reaches a canvas.
+ *
+ * 'bitmap' is the preferred path: an ImageBitmapRenderingContext takes
+ * ownership of an ImageBitmap outright, so the frame is handed over rather
+ * than blitted, and the canvas takes its size from the bitmap — no separate
+ * resize, and nothing to throttle. It is also the path that avoids drawing a
+ * WebCodecs VideoFrame straight into a 2D context, which WebKit has a history
+ * of not doing well.
+ *
+ * '2d' is the fallback for a browser that will not give us the other context,
+ * because a slower picture is better than a black one.
+ */
+type Painter =
+  | { kind: 'bitmap'; ctx: ImageBitmapRenderingContext }
+  | { kind: '2d'; ctx: CanvasRenderingContext2D };
+
 interface VideoSink {
   kind: 'video';
   track: RemoteTrack;
   decoder: VideoDecoder;
   canvas: HTMLCanvasElement | null;
-  ctx: CanvasRenderingContext2D | null;
+  painter: Painter | null;
+  /**
+   * Set while a frame is being turned into an ImageBitmap.
+   *
+   * That conversion is asynchronous, and the presentation loop offers a frame
+   * every display refresh whether or not the last one has landed. Without this
+   * two conversions race and the older one can win, putting an older picture
+   * on screen — so a frame offered while one is in flight is dropped instead.
+   * At most one display interval is lost, and the next frame chosen is the
+   * fresher one anyway.
+   */
+  painting: boolean;
+  /**
+   * Frames dropped because a bitmap conversion was still in flight.
+   *
+   * The conversion is asynchronous and the presentation loop offers a frame
+   * every display refresh, so one that arrives while the last is still being
+   * converted is discarded rather than queued behind it. Expected to be zero,
+   * or near it, because a conversion should finish inside a display interval —
+   * a number that climbs with the frame count means this path is the thing
+   * limiting the picture, which is otherwise invisible: the tile simply runs
+   * at half the rate it is being sent.
+   */
+  paintSkipped: number;
   /** Latest decoded frame, held until a canvas is attached to paint it. */
   pending: VideoFrame | null;
   /** H.264 cannot start on a delta frame; gate until the first keyframe. */
@@ -164,7 +217,7 @@ interface VideoSink {
   /** When the canvas was last resized, and how often — see the interval. */
   lastResizeMs: number;
   resizes: number;
-  /** Latched once a paint has thrown, so the warning is not repeated. */
+  /** Latched once a paint has failed, so the warning is not repeated. */
   paintFailed: boolean;
   /** Resolution of the most recently decoded frame. */
   width: number;
@@ -352,9 +405,11 @@ export class Playback {
       kind: 'video',
       track,
       canvas: null,
-      ctx: null,
+      painter: null,
       pending: null,
       sawKeyFrame: false,
+      painting: false,
+      paintSkipped: 0,
       decoded: 0,
       dropped: 0,
       lastResizeMs: 0,
@@ -612,7 +667,7 @@ export class Playback {
     const sink = this.#sinks.get(handle);
     if (!sink || sink.kind !== 'video') return;
     sink.canvas = canvas;
-    sink.ctx = canvas ? canvas.getContext('2d') : null;
+    sink.painter = canvas ? painterFor(canvas) : null;
     if (canvas && sink.pending) {
       const frame = sink.pending;
       sink.pending = null;
@@ -799,7 +854,7 @@ export class Playback {
     const frame = sink.queue[index];
     sink.queue.splice(0, index + 1);
 
-    if (!sink.canvas || !sink.ctx) {
+    if (!sink.canvas || !sink.painter) {
       // No tile mounted yet. Keep only the newest frame so a late-mounting
       // canvas paints something immediately instead of staying black.
       sink.pending?.close();
@@ -826,8 +881,39 @@ export class Playback {
   }
 
   #paint(sink: VideoSink, frame: VideoFrame): void {
-    if (!sink.canvas || !sink.ctx) {
+    const painter = sink.painter;
+    if (!sink.canvas || !painter) {
       frame.close();
+      return;
+    }
+
+    if (painter.kind === 'bitmap') {
+      // One conversion at a time — see VideoSink.painting.
+      if (sink.painting) {
+        sink.paintSkipped++;
+        frame.close();
+        return;
+      }
+      sink.painting = true;
+      createImageBitmap(frame)
+        .then((bitmap) => {
+          // The canvas may have gone while this was in flight: a tile
+          // unmounted, a layer switched. Nothing to transfer into, and an
+          // ImageBitmap that is not transferred has to be released by hand.
+          if (sink.painter?.kind === 'bitmap') {
+            // Takes ownership of the bitmap and sizes the canvas from it, so
+            // there is no separate resize on this path and nothing to hold.
+            sink.painter.ctx.transferFromImageBitmap(bitmap);
+            sink.resizes = 0;
+          } else {
+            bitmap.close();
+          }
+        })
+        .catch((err: unknown) => this.#paintFailed(sink, err))
+        .finally(() => {
+          sink.painting = false;
+          frame.close();
+        });
       return;
     }
 
@@ -845,26 +931,35 @@ export class Playback {
       // Scaled to whatever the backing store currently is, rather than drawn
       // at the frame's own size. They are the same whenever the resize above
       // was taken, and while one is being held this is what keeps the picture
-      // filling the tile instead of being cropped or letterboxed into a
-      // canvas that has not caught up yet.
-      sink.ctx.drawImage(frame, 0, 0, sink.canvas.width, sink.canvas.height);
+      // filling the tile instead of being cropped into a canvas that has not
+      // caught up yet.
+      painter.ctx.drawImage(frame, 0, 0, sink.canvas.width, sink.canvas.height);
     } catch (err) {
-      // Said out loud, not left in the devtools console. A canvas that will
-      // not accept a frame is a tile frozen on its last picture, which is
-      // indistinguishable from every other reason a tile stops moving —
-      // latched so a failure that repeats per frame does not bury the log.
-      if (!sink.paintFailed) {
-        sink.paintFailed = true;
-        bridge.report('WARN', 'canvas would not accept a decoded frame', {
-          participant: sink.track.participant,
-          handle: String(sink.track.handle),
-          err: String(err),
-        });
-      }
+      this.#paintFailed(sink, err);
     } finally {
       frame.close();
     }
   }
+
+  /**
+   * Reports a canvas that will not take a frame, once.
+   *
+   * Left in the devtools console this was invisible to the app, and what it
+   * produces — a tile frozen on its last picture — is indistinguishable from
+   * every other reason a tile stops moving. Latched, because a failure that
+   * repeats at the frame rate would bury the log.
+   */
+  #paintFailed(sink: VideoSink, err: unknown): void {
+    if (sink.paintFailed) return;
+    sink.paintFailed = true;
+    bridge.report('WARN', 'canvas would not accept a decoded frame', {
+      participant: sink.track.participant,
+      handle: String(sink.track.handle),
+      painter: sink.painter?.kind ?? 'none',
+      err: String(err),
+    });
+  }
+
 
   #play(sink: AudioSink, data: AudioData): void {
     sink.decoded++;
@@ -908,6 +1003,7 @@ export class Playback {
         row.width = sink.width;
         row.height = sink.height;
         row.resizes = sink.resizes;
+        row.paintSkipped = sink.paintSkipped;
         row.queued = sink.queue.length;
         if (sink.avOffsetMs !== null) row.avOffsetMs = sink.avOffsetMs;
       }

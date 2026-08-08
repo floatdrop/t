@@ -1,44 +1,26 @@
 name: Set up the tlmst build environment
 description: >-
-  Checks out the moq-go dependency beside an already-checked-out tlmst, then
-  installs Go, Node, the wails3 CLI, and any platform build dependencies.
-  The caller must have checked tlmst out into a `tlmst` directory already —
-  that is how this action itself became reachable.
-
-inputs:
-  moq-go-ref:
-    description: Git ref of floatdrop/moq-go to build against.
-    required: false
-    default: draft-19
+  Installs Go, Node, the wails3 CLI, and any platform build dependencies, then
+  builds the frontend so the Go embed resolves. The caller must have checked
+  the repository out already — that is how this action itself became reachable.
 
 runs:
   using: composite
   steps:
-    # go.mod resolves moq-go through `replace … => ../moq-go`, because the
-    # module has no published versions yet. The two repositories therefore
-    # have to sit side by side, which is why callers check tlmst out into a
-    # subdirectory instead of the workspace root.
-    - name: Check out moq-go
-      uses: actions/checkout@v4
-      with:
-        repository: floatdrop/moq-go
-        ref: ${{ inputs.moq-go-ref }}
-        path: moq-go
-
     - name: Install Go
       uses: actions/setup-go@v5
       with:
         # Read from go.mod so the toolchain never drifts from what the module
         # requires.
-        go-version-file: tlmst/go.mod
-        cache-dependency-path: tlmst/go.sum
+        go-version-file: go.mod
+        cache-dependency-path: go.sum
 
     - name: Install Node
       uses: actions/setup-node@v4
       with:
         node-version: 22
         cache: npm
-        cache-dependency-path: tlmst/frontend/package-lock.json
+        cache-dependency-path: frontend/package-lock.json
 
     # Wails' Linux backend needs cgo and links against GTK4 and WebKitGTK 6.0
     # — see the pkg-config line in wails/v3/pkg/application/linux_cgo.go. GTK3
@@ -68,7 +50,6 @@ runs:
     # CLI and the library cannot disagree.
     - name: Install the wails3 CLI
       shell: bash
-      working-directory: tlmst
       run: |
         set -euo pipefail
         version=$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v3)
@@ -78,7 +59,7 @@ runs:
 
     - name: Install frontend dependencies
       shell: bash
-      working-directory: tlmst/frontend
+      working-directory: frontend
       run: npm ci
 
     # main.go embeds frontend/dist, which is gitignored, so *nothing* in Go
@@ -89,5 +70,5 @@ runs:
     # checksum-skipped.
     - name: Build the frontend
       shell: bash
-      working-directory: tlmst/frontend
+      working-directory: frontend
       run: npm run build

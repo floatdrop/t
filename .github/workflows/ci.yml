@@ -23,13 +23,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: tlmst
 
-      - uses: ./tlmst/.github/actions/setup
+      - uses: ./.github/actions/setup
 
       - name: gofmt
-        working-directory: tlmst
         run: |
           # build/ios ships unformatted in the Wails template; it is not ours.
           unformatted=$(gofmt -l . | grep -v '^build/' || true)
@@ -40,11 +37,10 @@ jobs:
           fi
 
       - name: go vet
-        working-directory: tlmst
         run: go vet . ./internal/...
 
       - name: Frontend typecheck
-        working-directory: tlmst/frontend
+        working-directory: frontend
         run: npx svelte-check --tsconfig ./tsconfig.json --output human
 
       # -race because the conference layer is goroutine-dense: a router
@@ -52,7 +48,6 @@ jobs:
       # `./...` would pull in build/ios, a Wails template package that does
       # not build on the desktop.
       - name: go test -race
-        working-directory: tlmst
         run: go test . ./internal/... -race -count=1 -timeout 10m
 
   # The build matrix proves each platform still compiles and links. It does
@@ -73,11 +68,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: tlmst
 
-      - uses: ./tlmst/.github/actions/setup
+      - uses: ./.github/actions/setup
 
       - name: Build
-        working-directory: tlmst
         run: wails3 task build

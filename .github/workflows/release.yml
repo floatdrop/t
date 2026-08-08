@@ -6,11 +6,6 @@ on:
   # Runnable by hand so the packaging and signing path can be exercised
   # without cutting a tag.
   workflow_dispatch:
-    inputs:
-      moq-go-ref:
-        description: Git ref of floatdrop/moq-go to build against.
-        required: false
-        default: draft-19
 
 permissions:
   contents: read
@@ -32,12 +27,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: tlmst
 
-      - uses: ./tlmst/.github/actions/setup
-        with:
-          moq-go-ref: ${{ inputs.moq-go-ref || 'draft-19' }}
+      - uses: ./.github/actions/setup
 
       - name: Derive the version
         id: version
@@ -77,7 +68,6 @@ jobs:
       # result in a .app, and ad-hoc signs it.
       - name: Build the macOS app bundle
         if: runner.os == 'macOS'
-        working-directory: tlmst
         # Namespaced, not the root `package`: only the darwin Taskfile defines
         # the universal variant, and the root only exposes a GOOS dispatcher.
         run: wails3 task darwin:package:universal
@@ -90,7 +80,6 @@ jobs:
       # plain sight.
       - name: Sign the macOS app
         if: runner.os == 'macOS' && steps.signing.outputs.macos == 'true'
-        working-directory: tlmst
         env:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -133,7 +122,6 @@ jobs:
           runner.os == 'macOS'
           && steps.signing.outputs.macos == 'true'
           && steps.signing.outputs.notarize == 'true'
-        working-directory: tlmst
         env:
           MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
           MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
@@ -152,7 +140,7 @@ jobs:
 
       - name: Archive the macOS app bundle
         if: runner.os == 'macOS'
-        working-directory: tlmst/bin
+        working-directory: bin
         run: |
           # ditto, not zip: it preserves the symlinks and extended attributes
           # a .app depends on — including the signature, which plain zip
@@ -163,18 +151,16 @@ jobs:
       # ---- Linux ------------------------------------------------------
       - name: Build the Linux binary
         if: runner.os == 'Linux'
-        working-directory: tlmst
         run: wails3 task build
 
       - name: Archive the Linux binary
         if: runner.os == 'Linux'
-        working-directory: tlmst/bin
+        working-directory: bin
         run: tar -czf "tlmst-${{ steps.version.outputs.version }}-linux-amd64.tar.gz" tlmst
 
       # ---- Windows ----------------------------------------------------
       - name: Build the Windows binary
         if: runner.os == 'Windows'
-        working-directory: tlmst
         run: wails3 task build
 
       # An unsigned Windows binary runs but trips SmartScreen. `wails3 tool
@@ -182,7 +168,6 @@ jobs:
       # have, so there is no reason to locate signtool by hand here.
       - name: Sign the Windows binary
         if: runner.os == 'Windows' && steps.signing.outputs.windows == 'true'
-        working-directory: tlmst
         shell: bash
         env:
           WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
@@ -202,7 +187,7 @@ jobs:
 
       - name: Archive the Windows binary
         if: runner.os == 'Windows'
-        working-directory: tlmst/bin
+        working-directory: bin
         shell: pwsh
         run: |
           Compress-Archive -Path tlmst.exe `
@@ -214,7 +199,7 @@ jobs:
       # including Linux, where there is no code-signing convention at all.
       - name: Checksum the archives
         shell: bash
-        working-directory: tlmst/bin
+        working-directory: bin
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -233,9 +218,9 @@ jobs:
           name: tlmst-${{ matrix.name }}
           if-no-files-found: error
           path: |
-            tlmst/bin/*.zip
-            tlmst/bin/*.tar.gz
-            tlmst/bin/*.sha256
+            bin/*.zip
+            bin/*.tar.gz
+            bin/*.sha256
 
   release:
     name: Publish the release

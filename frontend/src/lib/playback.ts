@@ -65,6 +65,28 @@ const RENDER_STALL_MS = 500;
 /** How often to check that the presentation loop is still being called. */
 const RENDER_WATCHDOG_MS = 250;
 
+/** How long to wait for the player worklet to load before failing. */
+const MODULE_TIMEOUT_MS = 10000;
+
+/**
+ * Rejects if work has not settled within ms.
+ *
+ * For platform promises that are awaited on a path someone is waiting on: an
+ * addModule that never settles is a join that never finishes, with no error to
+ * show for it.
+ */
+async function withDeadline<T>(work: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`playback: ${what} did not settle within ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([work, expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Per-track playback counters for the debug panel. */
 export interface PlaybackStats {
   handle: number;
@@ -446,7 +468,10 @@ export class Playback {
       this.#audioReady = (async () => {
         const ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
         watchAudioContext(ctx, 'playback');
-        await addPlayerModule(ctx);
+        // Bounded, because join() awaits resume() which awaits this: a module
+        // that never loads leaves the join button on "Connecting…" with no
+        // timeout behind it and nothing to report.
+        await withDeadline(addPlayerModule(ctx), MODULE_TIMEOUT_MS, 'pcm-player addModule');
         const limiter = ctx.createDynamicsCompressor();
         limiter.threshold.value = LIMITER.threshold;
         limiter.knee.value = LIMITER.knee;

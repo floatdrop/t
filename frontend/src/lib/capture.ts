@@ -311,6 +311,15 @@ function declarationKind(msg: Declaration): 'video' | 'audio' {
 const PLAY_TIMEOUT_MS = 3000;
 
 /**
+ * How long to wait for a worklet module to load before treating it as failed.
+ *
+ * Generous, because it fetches and compiles, and a machine under load doing
+ * both while encoding video can be slow. Bounded at all because everything
+ * behind it in the serial queue waits on it.
+ */
+const MODULE_TIMEOUT_MS = 10000;
+
+/**
  * How long the frame pump may go without a callback before it is taken to have
  * stopped rather than to be running slowly.
  *
@@ -339,10 +348,24 @@ const MAX_PUMP_RESTARTS = 5;
  * never settles" is a real outcome and the caller has something better to do
  * than wait for it forever.
  */
-async function withTimeout<T>(work: Promise<T>, ms: number, what: string): Promise<T | null> {
+async function withTimeout<T>(
+  work: Promise<T>,
+  ms: number,
+  what: string,
+  fatal = false,
+): Promise<T | null> {
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const expired = new Promise<null>((resolve) => {
+  const expired = new Promise<null>((resolve, reject) => {
     timer = setTimeout(() => {
+      // Two shapes of expiry, and the caller knows which it has. Some work can
+      // be carried on without — a video element that has not started playing
+      // yet will deliver frames when it does. Some cannot: there is no version
+      // of "carry on" that produces audio without the tap module, so that one
+      // has to fail rather than leave a pipeline half-built and believed.
+      if (fatal) {
+        reject(new Error(`capture: ${what} did not settle within ${ms}ms`));
+        return;
+      }
       bridge.report('WARN', 'timed out waiting on the platform; carrying on', {
         what,
         afterMs: String(ms),
@@ -1025,7 +1048,13 @@ export class Capture {
     const ctx = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: 'interactive' });
     watchAudioContext(ctx, 'capture');
     try {
-      await addTapModule(ctx);
+      // Bounded like play(): addModule fetches and compiles, and the whole of
+      // start() — and so the join that awaits it — is behind this one await,
+      // inside a queue that serialises every later pipeline change. One that
+      // never settles is a call with no microphone, no device switch, no mute
+      // and no Auto step for the rest of its life, with the device menu stuck
+      // showing itself busy.
+      await withTimeout(addTapModule(ctx), MODULE_TIMEOUT_MS, 'pcm-tap addModule', true);
     } catch (err) {
       // No tap means no PCM at all: WebKit has no MediaStreamTrackProcessor,
       // so this worklet is the only path from the microphone to the encoder.

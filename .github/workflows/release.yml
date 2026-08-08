@@ -256,5 +256,6 @@ jobs:
               anyway".
             - **Linux** — nothing to bypass.
 
-            See "Running an unsigned build" in the README for the details, and
-            "Signing" for the secrets that would make this section unnecessary.
+            See "Running an unsigned build" in `docs/README.md` for the details,
+            and "Signing" for the secrets that would make this section
+            unnecessary.

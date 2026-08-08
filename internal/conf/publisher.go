@@ -26,34 +26,31 @@ var ErrNoPublication = errors.New("conf: no publication for track")
 // has arrived yet — a group must open on one.
 var ErrAwaitingKeyFrame = errors.New("conf: waiting for first keyframe")
 
-// SUBGROUP_DELIVERY_TIMEOUT (§8) per track: how long after a group has been
-// closed we keep trying to get the rest of it there.
+// SUBGROUP_DELIVERY_TIMEOUT (§8) on published video: how long after a group
+// has been closed we keep trying to get the rest of it there.
 //
 // Without one, QUIC's reliability is applied to media that has no use for it.
-// A group whose tail is still being retransmitted is spending capacity on
-// frames whose moment has passed, on the same connection as the frames that
-// have not — so the retransmission of stale media is what makes the next media
+// A group whose tail is still being retransmitted spends capacity on frames
+// whose moment has passed, on the same connection as the frames whose moment
+// has not — so retransmitting stale video is part of what makes the next video
 // stale. The timer starts at Close, when the group is complete and every byte
-// of it is already in the send buffer, so this bounds how long a *finished*
-// group may keep occupying the link and nothing else.
+// is already in the send buffer, so this bounds how long a *finished* group may
+// keep occupying the link and nothing about how one is written.
 //
-// Both values are the point past which a subscriber would not use the data
-// anyway. Audio: the player trims its buffer back to 60 ms once more than
-// 250 ms has queued, so a 500 ms group still undelivered a second after it
-// closed would be dropped on arrival. Video: a group is one GOP, and the next
-// keyframe — which is where a subscriber recovers to regardless — is due two
-// seconds after this one opened.
+// Two seconds because a group is one GOP: the next keyframe, which is where a
+// subscriber recovers to regardless, is due two seconds after this one opened.
 //
-// The matching OBJECT_DELIVERY_TIMEOUT is deliberately left off. It reads as
-// "how stale may an object be" but moq-go implements it as elapsed time since
-// the *first* object of the subgroup, which makes it a cap on how long a group
-// may stay open: any value below the keyframe interval would reset every video
-// group on a healthy link. The keyframe interval is the frontend's, and this
-// side does not know it.
-const (
-	audioSubgroupTimeout = 1 * time.Second
-	videoSubgroupTimeout = 2 * time.Second
-)
+// Audio deliberately has none, and used to. The reasoning for the one it had
+// was wrong — it claimed a late group would be discarded on arrival anyway,
+// but the player trims on how much is *queued*, not on how late it is, so
+// uniformly late audio is played late rather than dropped. What that timeout
+// actually did was convert late audio into missing audio, silently: moq-go
+// resets the stream from a detached goroutine with no error path back, so up
+// to half a second of speech could be abandoned to every subscriber with
+// nothing logged and no counter moving. And lateness now has a precise remedy
+// — the subscriber notices the slip and rebuilds its subscription at the live
+// edge — so the blunt one is not worth the holes it costs.
+const videoSubgroupTimeout = 2 * time.Second
 
 // publisher owns the local participant's three publications: the MSF
 // catalog and the two LOC media tracks.
@@ -133,7 +130,7 @@ func newPublisher(
 	if p.videoLow, err = p.newTrack(ctx, VideoLowTrack, videoSubgroupTimeout); err != nil {
 		return nil, err
 	}
-	if p.audio, err = p.newTrack(ctx, AudioTrack, audioSubgroupTimeout); err != nil {
+	if p.audio, err = p.newTrack(ctx, AudioTrack, 0); err != nil {
 		return nil, err
 	}
 
@@ -180,7 +177,7 @@ func (p *publisher) publish(ctx context.Context, name string) (*session.Publicat
 func (p *publisher) newTrack(
 	ctx context.Context,
 	name string,
-	subgroupTimeout time.Duration,
+	subgroupTimeout time.Duration, // zero disables it — see videoSubgroupTimeout
 ) (*trackPublisher, error) {
 	pub, err := p.publish(ctx, name)
 	if err != nil {

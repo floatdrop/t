@@ -37,6 +37,16 @@ import (
 // of when the link is tight.
 //
 // Well below the 128 default, so anything left unset sorts behind all of it.
+//
+// Inert today, and worth saying so. The relay computes the §7.2 effective
+// priority from this and hands it to SetSendPriority, which type-asserts the
+// transport for a per-stream scheduling knob — and moq-go's own documentation
+// records that none of its adapters implement one, because quic-go exposes no
+// public per-stream priority API and webtransport-go follows suit. So this is
+// correct protocol behaviour that changes no scheduling on either transport
+// this app can use. It is kept because it costs a parameter, it is what a
+// relay that can act on it needs, and it lights up the day a transport grows
+// the knob — not because anything measured moved.
 const (
 	catalogPriority = 10
 	audioPriority   = 20
@@ -864,13 +874,9 @@ func (r *remote) backfillGroup(
 		// were sent in. Measured, the gate alone passes and this alone does
 		// not.
 		//
-		// What it is for is making the gate cheap. Live objects now wait for
-		// the backfill, so a backfill left at the 128 default — behind every
-		// other participant's live video — would stall this tile for up to
-		// backfillWait. Level with live video is where it belongs, since it is
-		// the same pictures and they are needed first. Unmeasured: telling 60
-		// from 128 needs several publishers on a squeezed downlink, which
-		// nothing here sets up.
+		// Level with live video is still where this belongs — it is the same
+		// pictures and they are needed first — but see the priority constants:
+		// nothing acts on any of them on either transport available here.
 		Parameters: message.Parameters{
 			message.SubscriberPriorityParam(videoPriority),
 		},

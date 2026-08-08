@@ -235,6 +235,19 @@
     const visible = new Set<string>();
     let settle: ReturnType<typeof setTimeout> | undefined;
 
+    /**
+     * Whose video to ask for: what is on screen, except in solo view.
+     *
+     * Expanding renders exactly one tile, so on visibility alone every other
+     * participant would be dropped — and collapsing would rebuild all of them
+     * at once, each a SUBSCRIBE, a new handle, a new decoder and a backfilled
+     * group that its live stream now waits behind. In a nine-way call that is
+     * eight of those arriving together, for a view change that Escape undoes.
+     * The others are one keypress away; they stay subscribed.
+     */
+    const wantedTiles = (): string[] =>
+      expanded !== null ? remotes.map((r) => r.id) : [...visible];
+
     const observer = new IntersectionObserver(
       (entries) => {
         for (const entry of entries) {
@@ -248,7 +261,7 @@
         // see. How big they are drawn and whether the link can carry the full
         // picture are both the store's, which is what lets either change the
         // answer without anybody scrolling.
-        settle = setTimeout(() => store.setVisibleTiles([...visible]), INTEREST_SETTLE_MS);
+        settle = setTimeout(() => store.setVisibleTiles(wantedTiles()), INTEREST_SETTLE_MS);
       },
       { root, rootMargin: INTEREST_MARGIN, threshold: 0 },
     );
@@ -272,7 +285,7 @@
       }
       visible.clear();
       for (const id of seen) visible.add(id);
-      store.setVisibleTiles(seen);
+      store.setVisibleTiles(wantedTiles());
     }, INTEREST_SWEEP_MS);
 
     return () => {

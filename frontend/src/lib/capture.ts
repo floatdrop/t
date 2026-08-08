@@ -48,6 +48,22 @@ const MAX_FRAMERATE = 30;
 const LOW_LAYER_FRAME_DIVISOR = 2;
 
 /**
+ * What the small layer is worth, as a share of the bottom rung's asking price.
+ *
+ * VIDEO_LADDER's minBitrate is what a rung needs at MAX_FRAMERATE, and this
+ * layer runs at half that — but halving the frame rate does not halve what it
+ * costs, because a frame whose predecessor is further away has more to encode.
+ * Around two thirds is the usual shape, and it is the ladder's number scaled
+ * rather than a second number to keep in step with it.
+ */
+const LOW_LAYER_BITRATE_FACTOR = 0.65;
+
+/** What the small layer asks for, given the above. */
+export function lowLayerBitrate(): number {
+  return Math.round(VIDEO_LADDER[0].minBitrate * LOW_LAYER_BITRATE_FACTOR);
+}
+
+/**
  * How close to a full frame interval two presentations may be and still count
  * as two frames.
  *
@@ -774,6 +790,21 @@ export class Capture {
     await withTimeout(el.play(), PLAY_TIMEOUT_MS, 'video element play()');
     this.#video = el;
 
+    // What the small layer will take, and what that leaves the primary.
+    //
+    // It used to be spent on top of the selection: a user who chose 1.5 Mbps
+    // sent 1.9, which on an asymmetric uplink is a real overrun of a number
+    // the interface presents as the budget. It comes out of the selection now,
+    // and is skipped when there is not room for both — below that point a
+    // second encoding is not a saving to offer anyone, it is just less of the
+    // picture everybody actually watches.
+    const floor = VIDEO_LADDER[0];
+    const lowBitrate =
+      width > floor.width && settings.bitrate - lowLayerBitrate() >= floor.minBitrate
+        ? lowLayerBitrate()
+        : 0;
+    const primaryBitrate = settings.bitrate - lowBitrate;
+
     const encoder = new VideoEncoder({
       output: (chunk, meta) => this.#onVideoChunk(chunk, meta),
       // Carries what it was configured for: a failure here closes the encoder
@@ -793,7 +824,7 @@ export class Capture {
       codec,
       width,
       height,
-      bitrate: settings.bitrate,
+      bitrate: primaryBitrate,
       framerate,
       latencyMode: 'realtime',
       // Annex B puts SPS/PPS in the bitstream ahead of every keyframe, so
@@ -813,7 +844,8 @@ export class Capture {
       asked: `${settings.width}x${settings.height}`,
       granted: `${grantedWidth}x${grantedHeight}`,
       framerate: String(Math.round(framerate)),
-      bitrate: String(settings.bitrate),
+      bitrate: String(primaryBitrate),
+      selected: String(settings.bitrate),
       state: encoder.state,
     });
 
@@ -828,11 +860,11 @@ export class Capture {
         width,
         height,
         framerate,
-        bitrate: settings.bitrate,
+        bitrate: primaryBitrate,
       },
     });
 
-    this.#startLowLayer(width, height, framerate, codec);
+    this.#startLowLayer(width, height, framerate, codec, lowBitrate);
 
     const keyEvery = Math.max(1, Math.round(framerate * KEYFRAME_INTERVAL_SEC));
 
@@ -1137,11 +1169,17 @@ export class Capture {
    * bitrate, which is why the layer is skipped entirely when the primary is
    * already at or below the small rung and a copy would buy nothing.
    */
-  #startLowLayer(width: number, height: number, framerate: number, codec: string): void {
+  #startLowLayer(
+    width: number,
+    height: number,
+    framerate: number,
+    codec: string,
+    bitrate: number,
+  ): void {
     this.#stopLowLayer();
 
     const rung = VIDEO_LADDER[0];
-    if (width <= rung.width) {
+    if (bitrate <= 0 || width <= rung.width) {
       // The primary is already this small or smaller, so a second copy of it
       // would be the same picture twice. If a larger primary had one, that
       // declaration has to go with it rather than being left behind pointing
@@ -1156,8 +1194,18 @@ export class Capture {
       // Scaled through a canvas rather than by handing an oversized frame to a
       // smaller encoder: encoders differ on whether they will scale one, and
       // this is the WebView where that kind of optimism has cost the most.
-      canvas = new OffscreenCanvas(rung.width, Math.round((rung.width * height) / width));
+      // Even dimensions: some H.264 encoders refuse an odd one, and an
+      // arbitrary screen-share geometry will produce one about half the time.
+      const scaled = Math.round((rung.width * height) / width);
+      canvas = new OffscreenCanvas(rung.width, scaled + (scaled % 2));
       ctx = canvas.getContext('2d');
+      if (ctx) {
+        // The default is 'low' — bilinear with no mip chain, which aliases
+        // badly downscaling 1920 to 640. A screen share is the case that
+        // suffers most, and the subscriber whose tile is small enough to be
+        // given this layer is the one most likely to be reading text off it.
+        ctx.imageSmoothingQuality = 'high';
+      }
     } catch (err) {
       bridge.report('WARN', 'no small video layer: canvas unavailable', { err: String(err) });
       return;
@@ -1179,7 +1227,7 @@ export class Capture {
         codec,
         width: canvas.width,
         height: canvas.height,
-        bitrate: rung.minBitrate,
+        bitrate,
         framerate: framerate / LOW_LAYER_FRAME_DIVISOR,
         latencyMode: 'realtime',
         avc: { format: 'annexb' },
@@ -1201,12 +1249,12 @@ export class Capture {
         width: canvas.width,
         height: canvas.height,
         framerate: framerate / LOW_LAYER_FRAME_DIVISOR,
-        bitrate: rung.minBitrate,
+        bitrate,
       },
     });
     bridge.report('INFO', 'small video layer configured', {
       size: `${canvas.width}x${canvas.height}`,
-      bitrate: String(rung.minBitrate),
+      bitrate: String(bitrate),
       framerate: String(Math.round(framerate / LOW_LAYER_FRAME_DIVISOR)),
     });
   }

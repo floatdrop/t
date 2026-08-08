@@ -61,7 +61,15 @@ type App struct {
 	// openURL hands a link to the OS. Supplied by main, which owns the Wails
 	// application; nil in tests, where nothing should be opening anything.
 	openURL func(string) error
+	// lastKeyFrameAsk rate limits requestKeyFrame, whose trigger arrives at
+	// the frame rate.
+	lastKeyFrameAsk time.Time
 }
+
+// keyFrameAskInterval is the shortest gap between keyframe requests. Longer
+// than an encode takes to turn one round, short enough that a group which
+// failed to open costs a moment rather than the keyframe interval.
+const keyFrameAskInterval = 500 * time.Millisecond
 
 // Reconnect backoff. Short enough that a relay restart is barely noticed,
 // capped so a relay that is gone for good is retried without hammering it.
@@ -152,7 +160,36 @@ func (a *App) HandleMedia(_ context.Context, f *bridge.MediaFrame) error {
 		// frontend's encoders wind down. Not an error worth surfacing.
 		return nil
 	}
-	return room.WriteFrame(f)
+	err := room.WriteFrame(f)
+	if errors.Is(err, conf.ErrAwaitingKeyFrame) {
+		a.requestKeyFrame()
+	}
+	return err
+}
+
+// requestKeyFrame asks the frontend's encoder for an immediate keyframe.
+//
+// The publisher refuses to open a group on a delta frame, so any time it has
+// no open group — the first frames of a session, or after a write failed and
+// reset the subgroup — every frame is turned away until the encoder's own
+// schedule comes round, which is a whole keyframe interval of frozen picture
+// for every subscriber. The reconnect path has always asked for one; the write
+// path, which reaches the same state for a different reason, never did.
+//
+// Rate limited because the trigger repeats at the frame rate: without it a
+// stalled publisher would ask thirty times a second for something that takes
+// one encode to deliver.
+func (a *App) requestKeyFrame() {
+	a.mu.Lock()
+	if time.Since(a.lastKeyFrameAsk) < keyFrameAskInterval {
+		a.mu.Unlock()
+		return
+	}
+	a.lastKeyFrameAsk = time.Now()
+	a.mu.Unlock()
+
+	a.log.Debug("asking for a keyframe to reopen the video group")
+	a.server.SendControl(&bridge.ServerMessage{Type: bridge.MsgRequestKeyFrame})
 }
 
 // HandleConnect starts streaming backend logs to the freshly connected

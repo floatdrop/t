@@ -73,9 +73,17 @@
       params.delete('join');
       const rest = params.toString();
       history.replaceState(null, '', rest ? `${location.pathname}?${rest}` : location.pathname);
-      // Wait for the backend socket: join() needs it to send anything.
-      await waitForBackend(10000);
-      await join();
+      try {
+        // Wait for the backend socket: join() needs it to send anything.
+        await waitForBackend(10000);
+        await join();
+      } catch (err) {
+        // Said out loud, as the invite path already does. Without this a
+        // backend that never connects — or a relay that refuses — leaves an
+        // unhandled rejection and a form sitting idle, which reads as the flag
+        // having been ignored rather than as a launch that failed.
+        joinError = err instanceof Error ? err.message : String(err);
+      }
     })();
   });
 

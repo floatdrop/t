@@ -83,6 +83,10 @@ const reattachGrace = 5 * time.Second
 // failed to open costs a moment rather than the keyframe interval.
 const keyFrameAskInterval = 500 * time.Millisecond
 
+// graceMargin is how far before a GOAWAY's deadline the replacement is dialled,
+// so the new session is being established as the old one ends.
+const graceMargin = 500 * time.Millisecond
+
 // Reconnect backoff. Short enough that a relay restart is barely noticed,
 // capped so a relay that is gone for good is retried without hammering it.
 const (
@@ -413,14 +417,35 @@ func (a *App) superviseSession(ctx context.Context, room *conf.Room) {
 			return
 
 		case <-room.Migrating():
-			// GOAWAY: the session still works, and the point of being told
-			// is to move before being disconnected. Acting now spends none
-			// of the grace period.
 			m := room.Migration()
 			detail = "the relay asked us to move"
 			preferred = m.Relay
 			a.log.Info("migrating on the relay's request",
 				"new_relay", preferred, "grace", m.Grace)
+
+			// A GOAWAY that names a replacement is somewhere to go, and going
+			// at once is right — the grace period is for arranging the move,
+			// not for finishing the call.
+			//
+			// One that names none means "come back to me" (§10.4), and there
+			// the same haste is self-defeating: it tears down a session that
+			// still works in order to dial the relay that has just said it is
+			// shutting down. Measured against a relay restarting on SIGTERM,
+			// that first attempt failed every time and spent a full handshake
+			// timeout doing it, while the session it replaced would have been
+			// carrying media for those seconds.
+			//
+			// So when there is nowhere else to go, the grace is spent
+			// publishing, and the redial waits for the session to actually end
+			// or for the window to run out.
+			if preferred == "" && m.Grace > 0 {
+				if !a.waitOutGrace(ctx, room, m.Grace) {
+					return // the user left, or the app is shutting down
+				}
+				if err := room.LostErr(); err != nil {
+					detail = err.Error()
+				}
+			}
 
 		case <-room.Lost():
 			detail = "the relay connection dropped"
@@ -450,6 +475,30 @@ func (a *App) superviseSession(ctx context.Context, room *conf.Room) {
 		}
 		room = next
 	}
+}
+
+// waitOutGrace keeps a session that has been asked to move but given nowhere
+// to go, until it ends on its own or its grace runs out.
+//
+// Reports false if the user left or the app is shutting down, in which case
+// there is nothing left to reconnect.
+func (a *App) waitOutGrace(ctx context.Context, room *conf.Room, grace time.Duration) bool {
+	// A little short of the deadline, so the replacement is being dialled as
+	// the old session ends rather than after it has.
+	wait := max(grace-graceMargin, 0)
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-room.Lost():
+		a.log.Info("the draining relay closed the session; reconnecting now")
+	case <-timer.C:
+		a.log.Info("grace period spent on the old session; reconnecting", "grace", grace)
+	}
+	return true
 }
 
 // redial re-joins the room with exponential backoff, returning nil if the

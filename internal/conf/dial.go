@@ -57,8 +57,18 @@ func dial(ctx context.Context, log *slog.Logger, addr string, insecure bool) (*d
 		// tear down a session over a brief stall. Media traffic refreshes
 		// the timer anyway, so this only bites when the path is genuinely
 		// gone.
-		MaxIdleTimeout:                   10 * time.Second,
-		KeepAlivePeriod:                  2 * time.Second,
+		MaxIdleTimeout:  10 * time.Second,
+		KeepAlivePeriod: 2 * time.Second,
+		// How long a dial may spend finding out that nobody is there.
+		//
+		// Separate from MaxIdleTimeout above, which governs a session that was
+		// established and went quiet; this one governs never establishing at
+		// all. Left unset it is quic-go's 5 s, and a reconnect loop pays that
+		// in full for every attempt against a relay that is down — which is
+		// most of the time a restarting relay is unreachable. Three seconds is
+		// many round trips on any path this app is usable on, and nearly twice
+		// as fast to give up and try again.
+		HandshakeIdleTimeout:             3 * time.Second,
 		EnableDatagrams:                  true,
 		EnableStreamResetPartialDelivery: true, // §11.4.3 RESET_STREAM_AT
 		Tracer: func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace {

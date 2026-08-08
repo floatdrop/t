@@ -1,6 +1,7 @@
 package conf
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -8,6 +9,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"errors"
 	"log/slog"
 	"math/big"
@@ -409,6 +411,81 @@ func TestAudioLevelRoundTrip(t *testing.T) {
 	}
 	if levels[29*20_000]&0x80 != 0 {
 		t.Error("the last silent frame gained a voice-activity bit it was not sent with")
+	}
+}
+
+// TestAudioConfigOpensEveryGroup covers the promise made in conf.go's package
+// comment: a subscriber can configure a decoder from the first object it sees,
+// without waiting for the catalog to come round again.
+//
+// The frames themselves cannot carry that, which is the whole point. WebCodecs
+// emits a codec description on the encoder's first output and never again, so
+// only the opening object of a track has one — and a subscriber that joins a
+// call in progress will never see it. Every group has to open with the
+// description whether the frame brought one or not.
+func TestAudioConfigOpensEveryGroup(t *testing.T) {
+	relayServer := startRelay(t)
+	addr := relayServer.Addr()
+
+	// OpusHead, as the frontend sends it: base64 in the declaration, and the
+	// same bytes are what should appear on the wire.
+	opusHead := []byte("OpusHead\x01\x01\x38\x01\x80\xbb\x00\x00\x00\x00\x00")
+
+	alice, _ := joinRoom(t, addr, "room-config", "alice")
+	if err := alice.DeclareTrack(&bridge.TrackConfig{
+		Kind: "audio", Codec: "opus", SampleRate: 48000, Channels: 1,
+		Description: base64.StdEncoding.EncodeToString(opusHead),
+	}); err != nil {
+		t.Fatalf("declare audio: %v", err)
+	}
+
+	_, bobRec := joinRoom(t, addr, "room-config", "bob")
+	waitFor(t, "bob to subscribe to audio", 10*time.Second, func() bool {
+		_, tracks, _, _ := bobRec.snapshot()
+		return len(tracks) == 1
+	})
+
+	// Three groups' worth at the 25-object cadence, and not one frame carries
+	// a config — exactly what a live encoder produces after its first output.
+	const frames = audioGroupObjects * 3
+	for i := range frames {
+		if err := alice.WriteFrame(audioFrame(uint64(i)*20_000, 80)); err != nil {
+			t.Fatalf("write audio %d: %v", i, err)
+		}
+	}
+
+	waitFor(t, "bob to receive every audio frame", 10*time.Second, func() bool {
+		got, _ := bobRec.countsFor("audio")
+		return got >= frames
+	})
+
+	got, _, _, _ := bobRec.snapshot()
+	// Keyed by timestamp rather than arrival order, for the reason
+	// TestAudioLevelRoundTrip explains: groups in flight together may be
+	// delivered in either order.
+	configs := make(map[uint64][]byte, frames)
+	for _, f := range got {
+		if f.Kind == bridge.KindAudio {
+			configs[f.Timestamp] = f.Config
+		}
+	}
+
+	for group := range 3 {
+		ts := uint64(group*audioGroupObjects) * 20_000
+		config, ok := configs[ts]
+		if !ok {
+			t.Fatalf("no frame arrived to open group %d (timestamp %dus)", group, ts)
+		}
+		if !bytes.Equal(config, opusHead) {
+			t.Errorf("group %d opened with config %q, want the declared OpusHead %q",
+				group, config, opusHead)
+		}
+	}
+
+	// Only the first object of a group carries it: repeating it on all 25
+	// would be 25 copies of a constant per group, for no one.
+	if config := configs[20_000]; len(config) != 0 {
+		t.Errorf("the second object of group 0 carried a config (%q); only the first should", config)
 	}
 }
 

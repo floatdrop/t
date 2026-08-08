@@ -164,6 +164,19 @@ func (p *publisher) declareConfig(cfg *bridge.TrackConfig) error {
 	}
 	p.mu.Unlock()
 
+	// The same description the catalog carries in its initDataList, kept where
+	// the objects are written so each group can open with it.
+	description, err := decodeDescription(cfg.Description)
+	if err != nil {
+		return err
+	}
+	switch cfg.Kind {
+	case "video":
+		p.video.setConfig(description)
+	case "audio":
+		p.audio.setConfig(description)
+	}
+
 	p.log.Info("local encoder configured",
 		"kind", cfg.Kind, "codec", cfg.Codec,
 		"width", cfg.Width, "height", cfg.Height,
@@ -314,6 +327,21 @@ type trackPublisher struct {
 	// objectsInGroup counts objects written to the current group, for
 	// the audio cadence.
 	objectsInGroup int
+	// config is the codec description to stamp on the first object of each
+	// group. Held here because the frames do not carry one: WebCodecs emits a
+	// description on the encoder's first output and never again, so without a
+	// copy only the very first group of a track would have one — and it is
+	// every group *after* the first that a mid-stream subscriber lands on.
+	config []byte
+}
+
+// setConfig supplies the codec description to stamp on each group. Called
+// from declareConfig, which is also what a reconnect replays, so a new
+// session's groups carry it without the encoder having to emit it again.
+func (t *trackPublisher) setConfig(config []byte) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.config = config
 }
 
 // writeVideo appends a video frame. A keyframe closes the current group
@@ -395,12 +423,24 @@ func (t *trackPublisher) writeObject(f *bridge.MediaFrame) error {
 	// The codec config goes on the first object of every group, so a
 	// subscriber can configure a decoder from the first object it sees
 	// without waiting for the catalog to come round again.
-	if len(f.Config) > 0 {
+	//
+	// Which it now does. This used to attach whatever config the frame
+	// happened to carry, and a frame carries one only on the encoder's first
+	// output — so the claim held for object 0 of group 0 and nothing else. A
+	// subscriber joining a call in progress, which is the only kind of
+	// subscriber this is for, landed on a group with no config on it at all.
+	config := f.Config
+	if len(config) > 0 {
+		t.config = config
+	} else if t.object == 0 {
+		config = t.config
+	}
+	if len(config) > 0 {
 		switch f.Kind {
 		case bridge.KindVideo:
-			props.VideoConfig = f.Config
+			props.VideoConfig = config
 		case bridge.KindAudio:
-			props.AudioConfig = f.Config
+			props.AudioConfig = config
 		}
 	}
 

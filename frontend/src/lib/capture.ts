@@ -440,6 +440,8 @@ export class Capture {
   #pump: (() => void) | null = null;
   #lastPumpMs = 0;
   #pumpRestarts = 0;
+  #lastTapMs = 0;
+  #audioRestarts = 0;
   #captureWatchdog: ReturnType<typeof setInterval> | null = null;
   #videoFor: VideoSettings | null = null;
   #audioFor: AudioSettings | null = null;
@@ -891,6 +893,7 @@ export class Capture {
   #startCaptureWatchdog(): void {
     if (this.#captureWatchdog !== null) return;
     this.#captureWatchdog = setInterval(() => {
+      this.#checkTap();
       if (!this.#videoRunning || !this.#video || !this.#pump) return;
       if (document.visibilityState !== 'visible') return;
       const sinceMs = performance.now() - this.#lastPumpMs;
@@ -920,11 +923,60 @@ export class Capture {
     }, CAPTURE_WATCHDOG_MS);
   }
 
-  #stopCaptureWatchdog(): void {
+  /**
+   * Rebuilds the audio pipeline if the tap stops delivering blocks.
+   *
+   * The microphone side has the same shape as the frame pump and needs the
+   * same suspicion. A worklet posting to a port can go quiet — its context
+   * interrupted, the processor throwing, the node disconnected by something
+   * outside this code — and nothing downstream would know: audioRunning stays
+   * true, the encoder stays configured, the catalog still declares audio, and
+   * no drop is counted because nothing arrived to drop. The only visible trace
+   * is audioFps reaching zero in a panel nobody has open.
+   *
+   * Unlike the pump there is nothing to re-arm — a port is not a callback that
+   * can be requested again — so recovery means building the pipeline afresh,
+   * through the same queue every other pipeline change goes through. The
+   * settings are the ones it was already running.
+   */
+  #checkTap(): void {
+    if (!this.#audioRunning || !this.#audioFor) return;
+    if (document.visibilityState !== 'visible') return;
+    if (performance.now() - this.#lastTapMs < CAPTURE_STALL_MS) return;
+
+    const settings = this.#audioFor;
+    this.#audioRestarts++;
+    if (this.#audioRestarts > MAX_PUMP_RESTARTS && this.#audioEncoder) {
+      this.#failAudio(this.#audioEncoder, 'capture tap will not restart; withdrawing audio', {
+        restarts: String(this.#audioRestarts),
+      });
+      return;
+    }
+
+    bridge.report('WARN', 'capture tap went quiet; rebuilding the audio pipeline', {
+      quietMs: String(Math.round(performance.now() - this.#lastTapMs)),
+      attempt: String(this.#audioRestarts),
+    });
+    // Pushed out to the next tick of this watchdog rather than awaited: the
+    // interval must not be held open by the rebuild it asked for.
+    this.#lastTapMs = performance.now();
+    void this.#serial(async () => {
+      if (!this.#audioRunning) return;
+      this.#stopAudio();
+      await this.#open(null, settings);
+      await this.#start(null, settings);
+      this.#lastTapMs = performance.now();
+    }).catch((err: unknown) => {
+      bridge.report('ERROR', 'could not rebuild the audio pipeline', { err: String(err) });
+    });
+  }
+
+  #stopCaptureWatchdogIfIdle(): void {
+    this.#pump = this.#videoRunning ? this.#pump : null;
     if (this.#captureWatchdog === null) return;
+    if (this.#videoRunning || this.#audioRunning) return;
     clearInterval(this.#captureWatchdog);
     this.#captureWatchdog = null;
-    this.#pump = null;
   }
 
   /**
@@ -1138,6 +1190,9 @@ export class Capture {
       this.#onTapBlock(ev.data);
     };
     this.#audioBitrate = settings.bitrate;
+    this.#lastTapMs = performance.now();
+    this.#audioRestarts = 0;
+    this.#startCaptureWatchdog();
   }
 
   /**
@@ -1158,6 +1213,12 @@ export class Capture {
    * behind without bound.
    */
   #onTapBlock(block: TapBlock): void {
+    // Proof the tap is still delivering, for the watchdog. The audio side has
+    // the same self-perpetuating shape as the frame pump — a worklet posting
+    // to a port — and the same failure: it can simply stop, with the encoder
+    // still configured and the track still declared.
+    this.#lastTapMs = performance.now();
+
     // Both clocks are the AudioContext's, so this is a real waiting time and
     // not an artefact of two unrelated clocks.
     const lateUs = (this.#audioCtx?.currentTime ?? 0) * 1e6 - block.captureUs - AUDIO_BLOCK_US;
@@ -1452,7 +1513,7 @@ export class Capture {
   /** Releases the camera, its encoder and the frame pump. */
   #stopVideo(): void {
     this.#videoRunning = false;
-    this.#stopCaptureWatchdog();
+    this.#stopCaptureWatchdogIfIdle();
 
     if (this.#videoEncoder && this.#videoEncoder.state !== 'closed') this.#videoEncoder.close();
     this.#videoEncoder = null;
@@ -1475,6 +1536,7 @@ export class Capture {
   #stopAudio(): void {
     const wasSpeaking = this.#voice.speaking;
     this.#audioRunning = false;
+    this.#stopCaptureWatchdogIfIdle();
 
     if (this.#audioEncoder && this.#audioEncoder.state !== 'closed') this.#audioEncoder.close();
     this.#audioEncoder = null;

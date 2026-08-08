@@ -21,10 +21,23 @@ import (
 // runaway frontend can make the backend buffer.
 const maxFrameBytes = 4 << 20
 
-// sendQueueDepth bounds the per-connection outbound queue. Media is
-// live: when the queue is full the oldest frames are worthless, so
-// Send drops rather than blocking the MOQ read path (see Server.Send).
+// sendQueueDepth bounds the per-connection outbound media queue. Media is
+// live: when the queue is full the oldest frames are worthless, so enqueuing
+// discards them rather than blocking the MOQ read path (see Server.SendMedia).
+//
+// Deep enough to hold more than one keyframe interval at 30 fps, which is what
+// makes discarding the oldest safe: the frames kept always contain a recent
+// keyframe, so a subscriber that fell behind can resume from the queue instead
+// of waiting for the publisher's next scheduled one.
 const sendQueueDepth = 256
+
+// controlQueueDepth bounds the outbound control queue, which is separate
+// because control messages are not interchangeable the way frames are. A
+// dropped remoteTrack announcement is a participant who never gets a decoder;
+// a dropped state is a session phase the frontend never learns about. They are
+// small, they are rare, and there is no version of "too many" worth reaching
+// for — this is sized so the question does not arise.
+const controlQueueDepth = 1024
 
 // Handler consumes what arrives from the frontend. Both methods are
 // called from the connection's read goroutine, one at a time.
@@ -57,10 +70,13 @@ type Server struct {
 }
 
 type conn struct {
-	ws     *websocket.Conn
-	out    chan outbound
-	ctx    context.Context
-	cancel context.CancelFunc
+	ws *websocket.Conn
+	// Two queues, because the two kinds fail differently: a frame that cannot
+	// be sent should be abandoned, and a control message never should.
+	media   chan outbound
+	control chan outbound
+	ctx     context.Context
+	cancel  context.CancelFunc
 
 	dropped atomic.Uint64
 }
@@ -137,7 +153,13 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	ws.SetReadLimit(maxFrameBytes)
 
 	ctx, cancel := context.WithCancel(r.Context())
-	c := &conn{ws: ws, out: make(chan outbound, sendQueueDepth), ctx: ctx, cancel: cancel}
+	c := &conn{
+		ws:      ws,
+		media:   make(chan outbound, sendQueueDepth),
+		control: make(chan outbound, controlQueueDepth),
+		ctx:     ctx,
+		cancel:  cancel,
+	}
 
 	s.mu.Lock()
 	if old := s.conn; old != nil {
@@ -196,16 +218,41 @@ func (s *Server) readLoop(ctx context.Context, c *conn) {
 }
 
 func (c *conn) writeLoop(log *slog.Logger) {
+	write := func(msg outbound) bool {
+		if err := c.ws.Write(c.ctx, msg.typ, msg.data); err != nil {
+			if c.ctx.Err() == nil && !isNormalClose(err) {
+				log.Warn("bridge: write failed", "err", err)
+			}
+			c.cancel()
+			return false
+		}
+		return true
+	}
+
 	for {
+		// Control first, and drained before any frame is considered. A state
+		// change is what tells the frontend how to interpret the frames around
+		// it, so it should not wait behind a queue of them.
 		select {
 		case <-c.ctx.Done():
 			return
-		case msg := <-c.out:
-			if err := c.ws.Write(c.ctx, msg.typ, msg.data); err != nil {
-				if c.ctx.Err() == nil && !isNormalClose(err) {
-					log.Warn("bridge: write failed", "err", err)
-				}
-				c.cancel()
+		case msg := <-c.control:
+			if !write(msg) {
+				return
+			}
+			continue
+		default:
+		}
+
+		select {
+		case <-c.ctx.Done():
+			return
+		case msg := <-c.control:
+			if !write(msg) {
+				return
+			}
+		case msg := <-c.media:
+			if !write(msg) {
 				return
 			}
 		}
@@ -219,7 +266,7 @@ func (s *Server) SendControl(msg *ServerMessage) {
 		s.log.Error("bridge: marshal control", "type", msg.Type, "err", err)
 		return
 	}
-	s.enqueue(outbound{websocket.MessageText, b})
+	s.enqueueControl(outbound{websocket.MessageText, b})
 }
 
 // SendError is shorthand for a MsgError control message.
@@ -228,25 +275,71 @@ func (s *Server) SendError(detail string) {
 }
 
 // SendMedia queues an encoded frame for the frontend. It never blocks: if
-// the frontend is not draining fast enough the frame is dropped, because
-// a late frame in a live conference is worth less than a stalled reader.
+// the frontend is not draining fast enough a frame is dropped, because a late
+// frame in a live conference is worth less than a stalled reader.
+//
+// The frame dropped is the oldest queued one, not this one. The distinction is
+// the whole point and it used to go the other way, which is what a full queue
+// exposed: a WebView that stops reading — and one does, for as long as macOS
+// is resizing its window — left the queue holding several seconds of stale
+// video while every frame produced from then on, keyframes included, was
+// discarded on arrival. When the WebView came back it drained history nobody
+// could use and had nothing current to show, so the picture stayed frozen
+// until the publisher's next scheduled keyframe, up to a keyframe interval
+// after the resize had finished.
+//
+// Keeping the newest instead means the queue always holds the live edge, and
+// at this depth that edge spans more than one keyframe interval — so there is
+// always something decodable in it.
 func (s *Server) SendMedia(f *MediaFrame) {
 	buf := make([]byte, 0, FrameHeaderLen+len(f.Config)+len(f.Payload))
-	s.enqueue(outbound{websocket.MessageBinary, AppendFrame(buf, f)})
+	s.enqueueMedia(outbound{websocket.MessageBinary, AppendFrame(buf, f)})
 }
 
-func (s *Server) enqueue(msg outbound) {
-	s.mu.Lock()
-	c := s.conn
-	s.mu.Unlock()
+// enqueueControl queues a control message, which is never dropped for
+// backpressure: unlike frames, no two of them are interchangeable.
+func (s *Server) enqueueControl(msg outbound) {
+	c := s.current()
 	if c == nil {
 		return
 	}
 	select {
-	case c.out <- msg:
-	default:
-		c.dropped.Add(1)
+	case c.control <- msg:
+	case <-c.ctx.Done():
 	}
+}
+
+// enqueueMedia queues a frame, making room by discarding the oldest if it
+// must. Never blocks: the caller is a MOQ read loop, and stalling it would
+// hold up every other track on the session.
+func (s *Server) enqueueMedia(msg outbound) {
+	c := s.current()
+	if c == nil {
+		return
+	}
+	for {
+		select {
+		case c.media <- msg:
+			return
+		case <-c.ctx.Done():
+			return
+		default:
+		}
+		// Full. Take the oldest off the front and count it, then try again —
+		// another producer may have refilled the slot in between, which is why
+		// this loops rather than assuming one drop is enough.
+		select {
+		case <-c.media:
+			c.dropped.Add(1)
+		default:
+		}
+	}
+}
+
+func (s *Server) current() *conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conn
 }
 
 // Connected reports whether a frontend is currently attached.

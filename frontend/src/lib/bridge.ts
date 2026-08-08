@@ -77,9 +77,11 @@ export class Bridge {
   }
 
   /** Sends a JSON control message. Silently drops when disconnected. */
-  send(msg: ClientMessage): void {
-    if (this.#ws?.readyState !== WebSocket.OPEN) return;
+  /** Sends a control message. Reports whether the socket took it. */
+  send(msg: ClientMessage): boolean {
+    if (this.#ws?.readyState !== WebSocket.OPEN) return false;
     this.#ws.send(JSON.stringify(msg));
+    return true;
   }
 
   /**

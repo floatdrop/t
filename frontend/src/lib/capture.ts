@@ -11,6 +11,7 @@
  */
 
 import { bridge } from './bridge';
+import type { ClientMessage } from './protocol';
 import {
   HANDLE_LOCAL_AUDIO,
   HANDLE_LOCAL_VIDEO,
@@ -295,6 +296,17 @@ const MAX_AUDIO_LATE_US = 80_000;
  */
 const MAX_AUDIO_ENCODE_QUEUE = Math.max(1, Math.round(MAX_AUDIO_LATE_US / OPUS_FRAME_US));
 
+/**
+ * A message the backend must not miss: what this participant publishes, and
+ * what it has stopped publishing.
+ */
+type Declaration = Extract<ClientMessage, { type: 'track' } | { type: 'untrack' }>;
+
+/** Which track a declaration is about, for superseding an earlier one. */
+function declarationKind(msg: Declaration): 'video' | 'audio' {
+  return msg.type === 'track' ? (msg.track.kind as 'video' | 'audio') : msg.untrack;
+}
+
 /** How long to wait for the capture element to start playing before going on. */
 const PLAY_TIMEOUT_MS = 3000;
 
@@ -385,6 +397,22 @@ export class Capture {
    */
   #videoRunning = false;
   #audioRunning = false;
+  /**
+   * Declarations the socket would not take, newest per kind, retried until it
+   * does.
+   *
+   * A declaration is not a message to lose. The socket refuses silently when
+   * it is not open, and the audio one cannot be rebuilt afterwards: WebCodecs
+   * emits a decoder description on the encoder's first output and never again,
+   * so the OpusHead that message carries exists once. Dropped, it takes the
+   * catalog's audio track with it for the life of that pipeline — nobody hears
+   * you, and the flag saying it was sent is already set.
+   *
+   * The same holds for untrack in the other direction: one that does not
+   * arrive leaves the catalog advertising a track nothing is feeding.
+   */
+  #undelivered: Declaration[] = [];
+
   /** The live frame pump, so the watchdog can re-arm the chain it drives. */
   #pump: (() => void) | null = null;
   #lastPumpMs = 0;
@@ -725,7 +753,7 @@ export class Capture {
     // Declare the track now rather than on first output: the backend needs
     // it in its catalog before remote participants can subscribe, and
     // waiting for a chunk would delay that by a frame interval.
-    bridge.send({
+    this.#declare({
       type: 'track',
       track: {
         kind: 'video',
@@ -749,6 +777,7 @@ export class Capture {
       // quiet is not mistaken for a chain that has ended.
       this.#lastPumpMs = performance.now();
       this.#pumpRestarts = 0;
+      this.#flushUndelivered();
 
       // An encoder that is no longer configured has been closed by its own
       // error callback, and closing is terminal — it cannot be reconfigured, so
@@ -897,7 +926,7 @@ export class Capture {
     if (this.#videoEncoder !== encoder) return;
     this.#videoRunning = false;
     bridge.report('ERROR', reason, attrs);
-    bridge.send({ type: 'untrack', untrack: 'video' });
+    this.#declare({ type: 'untrack', untrack: 'video' });
     this.onFailure?.('Your camera stopped publishing — the encoder failed. Others cannot see you.');
   }
 
@@ -919,7 +948,7 @@ export class Capture {
     if (this.#audioEncoder !== encoder) return;
     this.#audioRunning = false;
     bridge.report('ERROR', reason, attrs);
-    bridge.send({ type: 'untrack', untrack: 'audio' });
+    this.#declare({ type: 'untrack', untrack: 'audio' });
     // Cleared so the ring does not stay latched on a participant who has
     // stopped publishing anything to be speaking with.
     if (this.#voice.speaking) {
@@ -927,6 +956,39 @@ export class Capture {
       this.onVoice?.(this.#voice);
     }
     this.onFailure?.('Your microphone stopped publishing — the encoder failed. Others cannot hear you.');
+  }
+
+  /**
+   * Sends a message the backend must not miss, keeping it if the socket will
+   * not take it now.
+   *
+   * Keyed by kind and type so a retry queue cannot grow: a later declaration
+   * for the same track supersedes an earlier one, and an untrack supersedes
+   * the declaration it withdraws.
+   */
+  #declare(msg: Declaration): void {
+    // At most one held message per kind: a later declaration supersedes an
+    // earlier one, and an untrack supersedes the declaration it withdraws, so
+    // the queue cannot grow however long the socket stays shut.
+    this.#undelivered = this.#undelivered.filter((m) => declarationKind(m) !== declarationKind(msg));
+    if (!bridge.send(msg)) {
+      this.#undelivered.push(msg);
+    }
+  }
+
+  /**
+   * Retries whatever the socket would not take. Called from the frame and
+   * audio paths, which run often and cost nothing when there is nothing held.
+   */
+  #flushUndelivered(): void {
+    if (this.#undelivered.length === 0) return;
+    const held = this.#undelivered.filter((msg) => !bridge.send(msg));
+    if (held.length !== this.#undelivered.length) {
+      bridge.report('INFO', 'delivered a declaration the socket had refused', {
+        remaining: String(held.length),
+      });
+    }
+    this.#undelivered = held;
   }
 
   #onVideoChunk(chunk: EncodedVideoChunk, meta?: EncodedVideoChunkMetadata): void {
@@ -979,7 +1041,7 @@ export class Capture {
       bridge.report('ERROR', 'microphone capture unavailable: the tap worklet would not load', {
         err: String(err),
       });
-      bridge.send({ type: 'untrack', untrack: 'audio' });
+      this.#declare({ type: 'untrack', untrack: 'audio' });
       this.onFailure?.('Your microphone could not start. Others cannot hear you.');
       return;
     }
@@ -1183,6 +1245,7 @@ export class Capture {
   #opusStartUs = 0;
 
   #onAudioChunk(chunk: EncodedAudioChunk, meta?: EncodedAudioChunkMetadata): void {
+    this.#flushUndelivered();
     const payload = new Uint8Array(chunk.byteLength);
     chunk.copyTo(payload);
 
@@ -1195,7 +1258,7 @@ export class Capture {
       // in the catalog's initDataList, where a late subscriber finds it.
       if (!this.#audioConfigSent) {
         this.#audioConfigSent = true;
-        bridge.send({
+        this.#declare({
           type: 'track',
           track: {
             kind: 'audio',
@@ -1335,8 +1398,8 @@ export class Capture {
       // each subscriber holding a decoder that will never be fed again, sitting
       // on the last frame it got. Withdrawing a kind that was never declared is
       // a no-op on the backend, so this needs no memory of what came before.
-      if (!this.#videoRunning) bridge.send({ type: 'untrack', untrack: 'video' });
-      if (!this.#audioRunning) bridge.send({ type: 'untrack', untrack: 'audio' });
+      if (!this.#videoRunning) this.#declare({ type: 'untrack', untrack: 'video' });
+      if (!this.#audioRunning) this.#declare({ type: 'untrack', untrack: 'audio' });
     }
 
     bridge.report('INFO', 'capture devices switched', {

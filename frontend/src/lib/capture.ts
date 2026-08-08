@@ -562,7 +562,7 @@ export class Capture {
       // isConfigSupported is willing to approve sizes the platform then refuses
       // to encode.
       error: (err) =>
-        bridge.report('ERROR', 'video encoder failed', {
+        this.#failVideo(encoder, 'video encoder failed', {
           err: String(err),
           source: settings.source,
           size: `${width}x${height}`,
@@ -627,12 +627,11 @@ export class Capture {
       // it anyway turned one failure into a warning per frame, thirty times a
       // second, burying the line that said what had actually gone wrong.
       if (this.#videoEncoder.state !== 'configured') {
-        bridge.report('ERROR', 'video encoder is not configured; stopping capture', {
+        this.#failVideo(this.#videoEncoder, 'video encoder is not configured; stopping capture', {
           state: this.#videoEncoder.state,
           source: settings.source,
           size: `${width}x${height}`,
         });
-        this.#videoRunning = false;
         return;
       }
 
@@ -679,6 +678,31 @@ export class Capture {
     this.#rememberVideo(settings);
     this.#videoRunning = true;
     el.requestVideoFrameCallback(pump);
+  }
+
+  /**
+   * Gives up on the video pipeline once its encoder has failed.
+   *
+   * A closed encoder is terminal, but the catalog outlives it, and that is the
+   * part that matters to everyone else: a declared video track with nothing
+   * behind it leaves every subscriber holding a decoder and waiting on a frame
+   * that is never coming, on a tile indistinguishable from a peer still
+   * connecting. The declaration is sent as soon as the encoder is configured —
+   * deliberately, so a subscriber can be ready before the first frame — which
+   * means every failure after that point has something to withdraw.
+   *
+   * Withdrawing a kind that was never declared is a no-op on the backend, so
+   * this needs no memory of what has already been sent.
+   *
+   * Guarded on the encoder still being the current one. A failure reported by
+   * an encoder that has since been replaced belongs to a pipeline that is
+   * already gone, and untracking on its behalf would withdraw the live one.
+   */
+  #failVideo(encoder: VideoEncoder, reason: string, attrs: Record<string, string>): void {
+    if (this.#videoEncoder !== encoder) return;
+    this.#videoRunning = false;
+    bridge.report('ERROR', reason, attrs);
+    bridge.send({ type: 'untrack', untrack: 'video' });
   }
 
   #onVideoChunk(chunk: EncodedVideoChunk, meta?: EncodedVideoChunkMetadata): void {

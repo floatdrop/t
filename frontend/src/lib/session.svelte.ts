@@ -99,6 +99,8 @@ export interface RemoteView {
   /** The build they are running, empty from a peer that does not publish one. */
   version: string;
   videoHandle: number | null;
+  /** How much of their video we are taking — see Participant.videoLevel. */
+  videoLevel: string;
   audioHandle: number | null;
   /** True while they are speaking, for the tile's border. */
   speaking: boolean;
@@ -268,6 +270,7 @@ class Store {
         nickname: p.nickname || video?.nickname || audio?.nickname || p.id,
         version: p.version ?? '',
         videoHandle: video?.handle ?? null,
+        videoLevel: p.videoLevel ?? 'full',
         audioHandle: audio?.handle ?? null,
         speaking: this.speakingPeers.includes(p.id),
       };

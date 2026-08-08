@@ -171,6 +171,14 @@ export interface Participant {
   version?: string;
   hasVideo: boolean;
   hasAudio: boolean;
+  /**
+   * How much of their video we are still taking: "full", "small" or "none".
+   *
+   * Distinct from hasVideo, which says what they publish. A peer the backend
+   * gave up on and a peer with the camera off both show no picture, and only
+   * this tells them apart.
+   */
+  videoLevel?: string;
 }
 
 /** A released version newer than the one running. */

@@ -369,6 +369,7 @@
           nickname={remote.nickname}
           version={remote.version}
           videoHandle={remote.videoHandle}
+          videoLevel={remote.videoLevel}
           hasAudio={remote.audioHandle !== null}
           label={remote.id}
           speaking={remote.speaking}

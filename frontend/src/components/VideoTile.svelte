@@ -34,6 +34,14 @@
     localSource?: VideoSource;
     label?: string;
     /**
+     * How much of this participant's video we are taking. Anything but "full"
+     * is the backend having reduced it to fit the connection, which the tile
+     * says out loud — otherwise it is indistinguishable from a camera that is
+     * off, and the picture quietly getting worse for no visible reason is the
+     * thing people report as a bug about the wrong subsystem.
+     */
+    videoLevel?: string;
+    /**
      * The build this participant is running. Shown on hover rather than as a
      * badge: it matters on the day two people see different things and nowhere
      * else, and a version on every tile is a permanent tax for that day.
@@ -55,6 +63,7 @@
     localVideoId = '',
     localSource = 'camera',
     label = '',
+    videoLevel = 'full',
     version = '',
     speaking = false,
     expanded = false,
@@ -135,6 +144,11 @@
     <span class="badges">
       {#if speaking}<span class="badge speaking-badge" title="speaking">●</span>{/if}
       {#if hasAudio}<span class="badge" title="publishing audio">🔊</span>{/if}
+      {#if !isLocal && videoLevel === 'small'}
+        <span class="badge" title="reduced to fit the connection">◱</span>
+      {:else if !isLocal && videoLevel === 'none'}
+        <span class="badge warn" title="video dropped to fit the connection">⚠</span>
+      {/if}
       {#if label}<span class="badge mono">{label}</span>{/if}
     </span>
   </div>
@@ -285,5 +299,11 @@
   .badge {
     font-size: 11px;
     color: var(--text-dim);
+  }
+
+  /* The one badge that is not neutral information: video this client had to
+     give up on entirely, which otherwise reads as a camera that is off. */
+  .badge.warn {
+    color: var(--warn);
   }
 </style>

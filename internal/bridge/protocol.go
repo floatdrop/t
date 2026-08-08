@@ -277,6 +277,11 @@ type Participant struct {
 	Version  string `json:"version,omitempty"`
 	HasVideo bool   `json:"hasVideo"`
 	HasAudio bool   `json:"hasAudio"`
+	// VideoLevel is how much of their video this client is still taking:
+	// "full", "small", or "none". Distinct from HasVideo, which says what they
+	// publish — a peer we have given up on and a peer with the camera off both
+	// show no picture, and only this tells them apart.
+	VideoLevel string `json:"videoLevel,omitempty"`
 }
 
 // RemoteTrack announces an inbound track and the handle its frames will

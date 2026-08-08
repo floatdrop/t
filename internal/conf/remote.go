@@ -127,6 +127,22 @@ const audioRebuildCooldown = 5 * time.Second
 // to a thumbnail for the rest of the call.
 const videoRecovery = 30 * time.Second
 
+// videoRecoveryMax is as long as the wait between attempts to climb back gets.
+//
+// Without a ceiling the wait would be fixed, and a link that cannot hold the
+// full picture never settles: it steps up on schedule, is cut off a lag window
+// later, steps up again — a black tile for most of every cycle, for the rest of
+// the call, each turn costing a SUBSCRIBE, a decoder and a backfilled group.
+// That is worst against a publisher offering no small layer, where the ladder
+// has nothing between the full picture and nothing at all.
+//
+// So a step up that does not survive lengthens the next wait, and the reduced
+// state becomes somewhere to stay rather than somewhere to bounce off. Five
+// minutes is long enough to stop being the thing anyone notices, and short
+// enough that a link which genuinely recovered is not written off for the
+// evening.
+const videoRecoveryMax = 5 * time.Minute
+
 // remote is one other participant in the room: their catalog
 // subscription, whichever media subscriptions their catalog declares, and
 // the bridge handles their frames travel under.
@@ -204,6 +220,12 @@ type remote struct {
 	// escape a slip, so a link that cannot hold the live edge does not rebuild
 	// them continuously.
 	resyncedAt time.Time
+	// recoveryWait is how long the next attempt to climb back waits. It grows
+	// each time a step up fails to survive, and resets once one does.
+	recoveryWait time.Duration
+	// recoveredAt is when the last step up happened, so demote can tell one
+	// that survived from one that was cut off almost immediately.
+	recoveredAt time.Time
 	// recovery lifts the demotion once the link has been quiet. Replaced on
 	// each demotion, so the wait always runs from the most recent one.
 	recovery *time.Timer
@@ -1166,12 +1188,25 @@ func (r *remote) demote(track *remoteTrack, code string) {
 		r.level++
 	}
 	to := r.level
+	// Cut off again soon after climbing back: the link has not recovered, so
+	// wait longer before believing it has. Doubling rather than resetting is
+	// what gives the reduced state somewhere to settle.
+	backoff := ""
+	if !r.recoveredAt.IsZero() && time.Since(r.recoveredAt) < r.recoveryWait {
+		r.recoveryWait = min(r.recoveryWait*2, videoRecoveryMax)
+		backoff = r.recoveryWait.String()
+	}
 	video, videoLow, audio := r.wantVideo, r.wantVideoLow, r.wantAudio
 	r.mu.Unlock()
 
-	r.log.Warn("the relay stopped forwarding a track: we are not keeping up",
+	fields := []any{
 		"handle", track.handle, "code", code,
-		"from", from.String(), "to", to.String())
+		"from", from.String(), "to", to.String(),
+	}
+	if backoff != "" {
+		fields = append(fields, "next_attempt_in", backoff)
+	}
+	r.log.Warn("the relay stopped forwarding a track: we are not keeping up", fields...)
 
 	r.applying.Lock()
 	r.reconcile(video, videoLow, audio)
@@ -1192,7 +1227,10 @@ func (r *remote) scheduleRecovery() {
 	if r.recovery != nil {
 		r.recovery.Stop()
 	}
-	r.recovery = time.AfterFunc(videoRecovery, r.recover)
+	if r.recoveryWait <= 0 {
+		r.recoveryWait = videoRecovery
+	}
+	r.recovery = time.AfterFunc(r.recoveryWait, r.recover)
 	r.mu.Unlock()
 }
 
@@ -1215,8 +1253,13 @@ func (r *remote) recover() {
 	from := r.level
 	r.level--
 	to := r.level
+	r.recoveredAt = time.Now()
 	// Cleared so the next verdict on the rebuilt subscription is acted on.
 	r.demotedFor = 0
+	// All the way back means the link held: start again from the short wait.
+	if r.level == videoFull {
+		r.recoveryWait = videoRecovery
+	}
 	video, videoLow, audio := r.wantVideo, r.wantVideoLow, r.wantAudio
 	more := r.level != videoFull
 	r.mu.Unlock()
@@ -1320,5 +1363,11 @@ func (r *remote) participant() bridge.Participant {
 		Version:  r.version,
 		HasVideo: r.catalogVideo,
 		HasAudio: r.catalogAudio,
+		// What we are actually taking, which HasVideo above deliberately does
+		// not say — it reports what they publish. Without this a participant
+		// this client gave up on looked exactly like one who switched their
+		// camera off, while HasVideo insisted the camera was on: a blank tile
+		// and two signals disagreeing about why.
+		VideoLevel: r.level.String(),
 	}
 }

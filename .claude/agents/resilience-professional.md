@@ -103,6 +103,25 @@ output so only a decoder that never works gives up. `capture.ts` withdraws the
 video track when its encoder dies, guarded on that encoder still being the
 current one, and degrades rather than dies when the denoiser will not load.
 
+**The failure the WebView keeps producing is a callback chain that ends.**
+Presentation, capture and every worklet port are self-perpetuating: each
+callback asks for the next one. That has exactly one failure mode, and it is
+silent — if a callback is never delivered the chain stops, the handle still
+holds the id of the scheduled callback so it reads as running, and nothing is
+left to notice. A WKWebView window that another window covers has its page
+suspended, and measured on a real call the presentation loop came back 29
+seconds later while the page around it looked healthy: audio runs on the audio
+thread and counters run on timers, so neither shows it.
+
+So `playback.ts` watches its own loop from a timer — deliberately a different
+clock, since it has to survive whatever stopped the thing it is watching — and
+restarts it after `RENDER_STALL_MS`, at WARN rather than quietly. Treat any
+new self-driving loop as needing the same, and treat a promise the platform
+need not settle the same way: `capture.ts` bounds `el.play()` with
+`PLAY_TIMEOUT_MS` and carries on, because the whole of `start()` sits behind it
+and a join awaits `start()` — an unbounded wait there is a call that reaches
+"joined", shows a conference, publishes nothing and says nothing.
+
 ## Loss and congestion
 
 **There is no bandwidth-driven adaptation, and that is deliberate** — no
@@ -115,18 +134,41 @@ the link cannot carry it, nothing turns the tap down. **The bounded queues and
 their drop policies are the entire pressure-relief system.** Judge a change to
 any of them as load-bearing, not as tidying.
 
-The drop policy is the same everywhere, and it is always *drop the newest
-work rather than grow the queue*, because a queue that drains at 1× keeps
-whatever delay it accumulated for the rest of the call:
+Every queue on the path is bounded and sheds rather than grows, because a queue
+that drains at 1× keeps whatever delay it accumulated for the rest of the call.
+*Which* end it sheds from is the part to think about, and it is not uniform —
+it follows from whether the work is still worth doing by the time it is looked
+at:
 
-- Capture drops a video frame when `encodeQueueSize > 2`, and counts it.
+- Capture drops a video frame when `encodeQueueSize > 2`, and counts it. The
+  frame not yet encoded is the one to abandon: the camera will produce another
+  immediately.
 - The audio tap drops a block that waited longer than `MAX_AUDIO_LATE_US`
   (80 ms), and `MAX_AUDIO_ENCODE_QUEUE` holds the far side of the encoder to
   the same 80 ms budget expressed as four 20 ms packets.
-- `bridge.sendFrame` refuses a frame when `bufferedAmount` is past 4 MB;
-  the Go side's `sendQueueDepth` 256 drops and increments `dropped`.
+- `bridge.sendFrame` refuses a frame when `bufferedAmount` is past 4 MB. The Go
+  side's media queue (`sendQueueDepth` 256) discards the **oldest** frame and
+  counts it in `DroppedFrames()`, which is sampled into every metrics message.
+  Oldest, not newest, and the distinction is load-bearing: it used to go the
+  other way, and a WebView that stopped reading — which one does, for as long
+  as macOS is resizing its window — kept several seconds of stale video while
+  every current frame, keyframes included, was discarded on arrival. The
+  picture could not resume until the publisher's next scheduled keyframe. The
+  queue is deep enough to span more than one keyframe interval, which is what
+  makes discarding the oldest safe.
+- Control messages are on a **separate** queue and are never dropped for
+  backpressure. No two of them are interchangeable the way frames are: a lost
+  `remoteTrack` is a participant who never gets a decoder, a lost `state` is a
+  phase the frontend never learns. Waiting does not recover either, which is
+  the only thing that makes dropping a frame acceptable.
 - Playback's ring buffer trims from `MAX_BUFFER` 250 ms back to `TRIM_TO`
-  60 ms and says so at WARN; the decoder queue is capped at `MAX_QUEUE` 60.
+  120 ms and says so at WARN, reporting the depth it trimmed *from* — what is
+  left after a trim is the floor by construction and measures nothing. The
+  floor is twice the preroll rather than equal to it, measured: on a VPN path
+  every trim fired between 253 and 269 ms, and deepening the cushion took the
+  same nine minutes from twenty-four trims to seven, because the fill is
+  episodic rather than a steady drift. The decoder queue is capped at
+  `MAX_QUEUE` 60 and counts what it sheds.
 
 The stream mapping is itself a loss strategy. Video is one group per GOP on one
 subgroup stream, so **a relay under congestion drops a whole group and lands the
@@ -177,6 +219,12 @@ separately, make the link bad rather than broken and follow it again:
   re-established, or the user sits in a joined session watching black tiles.
 - **Is the scope of the repair right?** One dead subscription should not tear
   down the session; a dead session should not be papered over per-subscription.
+- **Does anything drive this, if the thing that normally drives it stops?** A
+  loop that schedules its own next call, a promise the platform may never
+  settle, a memoised promise that caches a rejection, a `void`ed call whose
+  rejection reaches nobody — each is a single point with no second path. Ask
+  what restarts it, and if the answer is "the callback that just failed to
+  arrive", that is the finding.
 - **Is partial failure survivable?** A worklet, a denoiser, a FETCH backfill or
   one participant's track failing should cost a feature, not the call. Check
   what the code does when the degraded path is the one taken — and that
@@ -197,9 +245,14 @@ Then, for the link that is slow rather than gone:
   bitrate adaptation, an unbounded queue is how congestion turns into permanent
   delay instead of a brief gap. Sending late media is worse than sending none:
   the backlog drains at 1×, so the delay is kept for the rest of the call.
-- **Is the right thing dropped?** Shed the newest work at the source, not the
-  oldest at the sink — except in the playout buffer, where the oldest is
-  already stale and trimming to `TRIM_TO` is what recovers the delay.
+- **Is the right thing dropped, and from which end?** At the source, shed the
+  newest work: the camera is about to produce another frame, so the one not yet
+  encoded is the cheap one to abandon. Downstream of the source it inverts —
+  everything queued is already captured, and the newest is the only part still
+  worth delivering, so the bridge's media queue and the playout buffer both
+  shed from the front. Getting that backwards does not lose a little more; it
+  keeps history and throws away the present, which is a picture that cannot
+  resume until the next keyframe and a sound that stays behind for the call.
 - **Does the call recover on its own once the link improves?** A drop under
   congestion must leave the pipeline able to resume: video needs a keyframe to
   reopen a group, so check whether a change can drop the *only* keyframe and
@@ -223,9 +276,17 @@ Then, for the link that is slow rather than gone:
 A recovery that is silent is a recovery nobody can trust. Every attempt should
 be able to answer *what broke, which attempt this is, where it dialled, and why
 it failed* — `redial` logs exactly that. Backpressure has the same rule: the
-bridge's `sendQueueDepth` 256 drops rather than blocks, and counts what it
-dropped, because dropping without a counter is indistinguishable from a quiet
-network.
+bridge's media queue drops rather than blocks, and counts what it dropped in
+`DroppedFrames()`, which every metrics message carries — because dropping
+without a counter is indistinguishable from a quiet network, and loss there is
+ours rather than the link's while every transport counter still reads healthy.
+
+A counter that cannot move is worse than none, since it reads as evidence. The
+buffer-trim warning reported what was left after the trim, which is the floor
+by construction, so it logged the same figure whether the buffer had reached
+260 ms or two seconds — and a nine-minute measurement of it was worthless until
+it reported the depth it trimmed *from*. Check that what a signal reports is
+the quantity it is supposed to be evidence of.
 
 Congestion is worse in this respect than failure, because it produces no event
 at all. What there is to read is `internal/telemetry/quictrace.go`, which folds

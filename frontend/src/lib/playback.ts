@@ -52,6 +52,19 @@ const MAX_DECODER_RESTARTS = 5;
  */
 const MAX_QUEUE = 60;
 
+/**
+ * How long the presentation loop may go without a tick before it is taken to
+ * have stopped rather than to be running slowly.
+ *
+ * Well beyond any real frame interval — half a second is fifteen frames at 30
+ * fps — so a display that is merely struggling is never mistaken for one that
+ * has stopped. See #startWatchdog.
+ */
+const RENDER_STALL_MS = 500;
+
+/** How often to check that the presentation loop is still being called. */
+const RENDER_WATCHDOG_MS = 250;
+
 /** Per-track playback counters for the debug panel. */
 export interface PlaybackStats {
   handle: number;
@@ -166,6 +179,9 @@ export class Playback {
   /** Shared limiter every participant's gain feeds. */
   #limiter: DynamicsCompressorNode | null = null;
   #renderHandle: number | null = null;
+  /** performance.now() of the last presentation tick, for the watchdog. */
+  #lastTickMs = 0;
+  #watchdog: ReturnType<typeof setInterval> | null = null;
   #lastSample = 0;
   #stats: PlaybackStats[] = [];
 
@@ -602,11 +618,53 @@ export class Playback {
     const tick = () => {
       this.#renderHandle = requestAnimationFrame(tick);
       const now = performance.now();
+      this.#lastTickMs = now;
       for (const sink of this.#sinks.values()) {
         if (sink.kind === 'video') this.#present(sink, now);
       }
     };
+    this.#lastTickMs = performance.now();
     this.#renderHandle = requestAnimationFrame(tick);
+    this.#startWatchdog();
+  }
+
+  /**
+   * Restarts the presentation loop if it stops being called.
+   *
+   * The loop keeps itself alive by requesting the next frame from inside the
+   * current one, which is the ordinary shape and has exactly one failure mode:
+   * if a callback is never delivered, the chain ends and there is nothing left
+   * to notice. #renderHandle still holds the id of that scheduled callback, so
+   * it reads as running and #startRender declines to start a second one, and
+   * the only other caller is a track being added.
+   *
+   * WebKit does drop them. Resizing a window on macOS blocks the main thread
+   * for the drag, and the loop does not always come back afterwards: measured
+   * on a real call, every remote tile froze on its last frame while the page
+   * around it carried on — audio playing, counters ticking, plots moving,
+   * because timers and the audio thread are untouched. Nothing in the app was
+   * wrong and nothing could recover it, since presentation is the one thing
+   * with no other way of being driven.
+   *
+   * A timer is the right watchdog precisely because it is a different clock:
+   * it survives what stopped the thing it is watching. Only while something is
+   * visible to present — a hidden page is *supposed* to stop painting, and
+   * restarting the loop into it would be a wasted request every tick.
+   */
+  #startWatchdog(): void {
+    if (this.#watchdog !== null) return;
+    this.#watchdog = setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      if (this.#renderHandle === null) return;
+      if (performance.now() - this.#lastTickMs < RENDER_STALL_MS) return;
+
+      bridge.report('WARN', 'presentation loop stalled; restarting it', {
+        sinceMs: String(Math.round(performance.now() - this.#lastTickMs)),
+      });
+      cancelAnimationFrame(this.#renderHandle);
+      this.#renderHandle = null;
+      this.#startRender();
+    }, RENDER_WATCHDOG_MS);
   }
 
   #stopRenderIfIdle(): void {
@@ -616,6 +674,10 @@ export class Playback {
     }
     cancelAnimationFrame(this.#renderHandle);
     this.#renderHandle = null;
+    if (this.#watchdog !== null) {
+      clearInterval(this.#watchdog);
+      this.#watchdog = null;
+    }
   }
 
   /** Presents whichever queued frame is due against the audio clock. */

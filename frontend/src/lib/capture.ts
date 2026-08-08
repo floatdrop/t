@@ -761,6 +761,7 @@ export class Capture {
     this.#videoRunning = false;
     bridge.report('ERROR', reason, attrs);
     bridge.send({ type: 'untrack', untrack: 'video' });
+    this.onFailure?.('Your camera stopped publishing — the encoder failed. Others cannot see you.');
   }
 
   #onVideoChunk(chunk: EncodedVideoChunk, meta?: EncodedVideoChunkMetadata): void {
@@ -814,6 +815,7 @@ export class Capture {
         err: String(err),
       });
       bridge.send({ type: 'untrack', untrack: 'audio' });
+      this.onFailure?.('Your microphone could not start. Others cannot hear you.');
       return;
     }
     this.#audioCtx = ctx;
@@ -1072,6 +1074,17 @@ export class Capture {
    * decides what to fall back to; capture only reports the fact.
    */
   onVideoSourceLost: (() => void) | null = null;
+
+  /**
+   * Notified when a kind has stopped publishing and will not resume on its
+   * own — a dead encoder, a worklet that would not load.
+   *
+   * A sentence for a person rather than the attributes the log gets, because
+   * this is the one class of failure its owner cannot see: the local tile is
+   * drawn from the capture stream and keeps moving, and the speaking ring is
+   * driven by a denoiser that is no longer being fed.
+   */
+  onFailure: ((detail: string) => void) | null = null;
 
   /** Samples the counters into per-second rates for the debug panel. */
   sampleStats(): CaptureStats {

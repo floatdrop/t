@@ -231,6 +231,18 @@
     </div>
   {/if}
 
+  {#if store.errors.length > 0}
+    <div class="fault-banner" role="alert">
+      <span>
+        {store.errors[store.errors.length - 1]}
+        {#if store.errors.length > 1}
+          <em>and {store.errors.length - 1} more</em>
+        {/if}
+      </span>
+      <button class="ghost" onclick={() => store.dismissFaults()}>Dismiss</button>
+    </div>
+  {/if}
+
   {#if store.session.phase === 'reconnecting'}
     <p class="banner">
       Lost the relay — reconnecting…{store.session.detail
@@ -381,5 +393,27 @@
     color: var(--warn);
     font-size: 12px;
     flex: none;
+  }
+
+  /* Red rather than the reconnecting banner's amber: reconnecting is the app
+     handling something, while these are the things it cannot handle and has
+     stopped trying. Dismissible for the same reason — nothing here clears on
+     its own, so it would otherwise sit there for the rest of the call. */
+  .fault-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 6px 14px;
+    background: color-mix(in srgb, var(--err) 16%, transparent);
+    border-top: 1px solid color-mix(in srgb, var(--err) 45%, transparent);
+    color: var(--err);
+    font-size: 12px;
+    flex: none;
+  }
+
+  .fault-banner em {
+    color: color-mix(in srgb, var(--err) 70%, var(--text-dim));
+    font-style: normal;
   }
 </style>

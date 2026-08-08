@@ -105,6 +105,18 @@ class Store {
   logs = $state<LogEntry[]>([]);
   metrics = $state<Metrics | null>(null);
   history = $state<Metrics[]>([]);
+  /**
+   * Faults worth interrupting someone mid-call for, newest last.
+   *
+   * The debug log has every one of these already, and that was the whole
+   * problem: a call whose microphone never started, or whose camera died on
+   * its way into the encoder, looks entirely normal from the inside. The
+   * person it happened to is the last to know, because their own tile is drawn
+   * from the capture stream rather than the encode path. So the failures that
+   * cost a participant their picture or their voice are said out loud here,
+   * where the conference view can show them, rather than only in a panel
+   * nobody has open.
+   */
   errors = $state<string[]>([]);
 
   captureStats = $state<CaptureStats>({
@@ -327,6 +339,8 @@ class Store {
               kind: track.config.kind,
               err: String(err),
             });
+            const who = track.nickname || track.participant;
+            this.reportFault(`Cannot play ${track.config.kind} from ${who}.`);
           });
           break;
         }
@@ -355,7 +369,7 @@ class Store {
           break;
 
         case 'error':
-          this.errors = appendCapped(this.errors, msg.error, 20);
+          this.reportFault(msg.error);
           break;
       }
     });
@@ -365,6 +379,11 @@ class Store {
     // Voice activity, local and remote, drives the tiles' speaking border.
     capture.onVoice = (state) => {
       this.speaking = state.speaking;
+    };
+    // What capture cannot recover from. It reports these to the log as well,
+    // but the log is not where someone in a call is looking.
+    capture.onFailure = (detail) => {
+      this.reportFault(detail);
     };
     // A screen share that ended outside the app leaves the setting claiming to
     // share something that is gone, so put it back where it was.
@@ -646,6 +665,23 @@ class Store {
       this.#syncPreview();
     }
     await this.refreshDevices();
+  }
+
+  /**
+   * Records a fault for the conference view to show.
+   *
+   * Repeats are collapsed to the one already at the end rather than stacked: a
+   * decoder that fails on every frame would otherwise push the same sentence
+   * twenty times and bury whatever else went wrong.
+   */
+  reportFault(detail: string): void {
+    if (!detail || this.errors[this.errors.length - 1] === detail) return;
+    this.errors = appendCapped(this.errors, detail, 20);
+  }
+
+  /** Clears the faults, once someone has read them. */
+  dismissFaults(): void {
+    this.errors = [];
   }
 
   /**

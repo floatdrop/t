@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/webtransport-go"
 
 	"github.com/floatdrop/moq-go/pkg/moqt"
 )
@@ -26,19 +27,35 @@ import (
 // streamReset reports the MOQT reset code a peer sent on a data stream.
 //
 // Only a remote reset counts: a stream this client cancelled itself surfaces
-// the same type, and reporting our own teardown as a signal from the relay
+// the same types, and reporting our own teardown as a verdict from the relay
 // would be worse than saying nothing.
 //
-// Raw QUIC only. Over WebTransport the transport surfaces its own error type,
-// so this returns false there and the caller falls back to the generic path —
-// the same behaviour as before this existed, on the path the app documents as
-// the less exercised one.
+// Both transports, because the app speaks both and they raise different types
+// for the same event. Over WebTransport the reset arrives as an HTTP/3 stream
+// error, which webtransport-go maps back to the application code the peer
+// actually sent and re-raises as its own type — the same number, wearing a
+// different coat. Decoding only the QUIC one meant every reset over a
+// WebTransport relay read as an ordinary end of stream, so a subscriber there
+// was never told it had been dropped for falling behind and never came back
+// smaller: the freeze this exists to prevent, on the transport where it was
+// hardest to notice.
 func streamReset(err error) (moqt.StreamResetCode, bool) {
-	var se *quic.StreamError
-	if !errors.As(err, &se) || !se.Remote {
-		return 0, false
+	var qErr *quic.StreamError
+	if errors.As(err, &qErr) {
+		if !qErr.Remote {
+			return 0, false
+		}
+		return moqt.StreamResetCode(qErr.ErrorCode), true
 	}
-	return moqt.StreamResetCode(se.ErrorCode), true
+
+	var wtErr *webtransport.StreamError
+	if errors.As(err, &wtErr) {
+		if !wtErr.Remote {
+			return 0, false
+		}
+		return moqt.StreamResetCode(wtErr.ErrorCode), true
+	}
+	return 0, false
 }
 
 // overloadReset reports whether a reset code means the relay stopped

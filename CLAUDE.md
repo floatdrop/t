@@ -39,11 +39,11 @@ wails3 task run            # bundle bin/tlmst.dev.app and launch it
 wails3 task package        # signed/packaged production build
 wails3 task dev            # Wails dev mode with Vite HMR
 
-go test . ./internal/... -race        # NOT ./... — build/ios is a Wails
-                                      # template package that does not build
-                                      # on the desktop
+go test . ./cmd/... ./internal/... -race   # NOT ./... — build/ios is a Wails
+                                          # template package that does not
+                                          # build on the desktop
 go test ./internal/conf -run TestTwoParticipants -race -v   # single test
-go vet . ./internal/...
+go vet . ./cmd/... ./internal/...
 gofmt -l . | grep -v '^build/'        # build/ ships unformatted from the template
 
 cd frontend && npx svelte-check --tsconfig ./tsconfig.json   # frontend typecheck
@@ -59,6 +59,12 @@ how two instances get started against it without clicking through twice:
 bin/tlmst.dev.app/Contents/MacOS/tlmst -relay localhost:4433 -room demo \
     -nickname alice -join -debug
 ```
+
+`cmd/shaper` puts a userspace bottleneck in front of one participant, which is
+the only way to see the congestion paths work — the drift meter, the relay's
+TOO_FAR_BEHIND verdict and the demotion ladder never fire on a healthy link.
+Point one instance at it and leave the rest on the relay directly; its doc
+comment explains why the rate matters more than it looks.
 
 The frontend's tests cover the plain-TypeScript policy modules — the arithmetic
 that decides what to send and what to ask for (`layout.ts`, `congestion.ts`).

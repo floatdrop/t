@@ -192,6 +192,8 @@ export interface CaptureStats {
   encodeQueue: number;
   audioFps: number;
   audioKbps: number;
+  /** Packets waiting inside the audio encoder — see MAX_AUDIO_ENCODE_QUEUE. */
+  audioEncodeQueue: number;
   keyFrames: number;
   dropped: number;
   /** What the browser actually applied to the microphone track. */
@@ -279,6 +281,21 @@ const OPUS_FRAME_US = (OPUS_FRAME_SAMPLES / SAMPLE_RATE) * 1e6;
 const MAX_AUDIO_LATE_US = 80_000;
 
 /**
+ * How many packets may be waiting inside the audio encoder before a new one is
+ * dropped rather than handed to it.
+ *
+ * The same budget as MAX_AUDIO_LATE_US, applied on the far side of the encoder.
+ * That threshold bounds how long a block may wait *before* being encoded, which
+ * is only half the queue: an encoder that has fallen behind — a machine that is
+ * throttling, contention from several decoders and the denoiser — holds the
+ * rest, and holds it in a place nothing was looking at. The consequence is the
+ * one this file is built around: encoding a backlog sends the audio anyway and
+ * the queue drains at exactly 1x, so every listener stays that far behind for
+ * the remainder of the call.
+ */
+const MAX_AUDIO_ENCODE_QUEUE = Math.max(1, Math.round(MAX_AUDIO_LATE_US / OPUS_FRAME_US));
+
+/**
  * How long the capture clock may be wrong before the epoch is corrected.
  *
  * The estimate is the smallest skew seen across a window, so the window has to
@@ -357,7 +374,7 @@ export class Capture {
   #lastSample = 0;
   #stats: CaptureStats = {
     videoFps: 0, videoKbps: 0, encodeQueue: 0,
-    audioFps: 0, audioKbps: 0, keyFrames: 0, dropped: 0,
+    audioFps: 0, audioKbps: 0, audioEncodeQueue: 0, keyFrames: 0, dropped: 0,
     echoCancellation: false, noiseSuppression: false, autoGainControl: false,
     denoiseActive: false,
   };
@@ -956,6 +973,14 @@ export class Capture {
     if (this.#opusLength < OPUS_FRAME_SAMPLES) return;
     this.#opusLength = 0;
 
+    // Dropped rather than queued once the encoder is behind, for the same
+    // reason the tap drops a block that waited too long: the packet goes out
+    // either way, and queueing it keeps the delay for good.
+    if (this.#audioEncoder.encodeQueueSize > MAX_AUDIO_ENCODE_QUEUE) {
+      this.#dropped++;
+      return;
+    }
+
     const timestamp = Math.round(this.#audioEpochUs + this.#opusStartUs);
     try {
       const data = new AudioData({
@@ -1060,6 +1085,7 @@ export class Capture {
         encodeQueue: this.#videoEncoder?.encodeQueueSize ?? 0,
         audioFps: this.#audioFrames / elapsed,
         audioKbps: (this.#audioBytes * 8) / 1000 / elapsed,
+        audioEncodeQueue: this.#audioEncoder?.encodeQueueSize ?? 0,
         keyFrames: this.#stats.keyFrames + this.#keyFrames,
         dropped: this.#stats.dropped + this.#dropped,
         echoCancellation: this.#stats.echoCancellation,

@@ -71,6 +71,7 @@
       <div><dt>Encoder queue</dt><dd>{cap.encodeQueue}</dd></div>
       <div><dt>Audio encode</dt><dd>{cap.audioFps.toFixed(1)} fps</dd></div>
       <div><dt>Audio bitrate</dt><dd>{Math.round(cap.audioKbps)} kbps</dd></div>
+      <div><dt>Audio encoder queue</dt><dd>{cap.audioEncodeQueue}</dd></div>
       <div><dt>Keyframes</dt><dd>{cap.keyFrames}</dd></div>
       <div><dt>Frames dropped</dt><dd>{cap.dropped}</dd></div>
     </dl>

@@ -109,7 +109,7 @@ class Store {
 
   captureStats = $state<CaptureStats>({
     videoFps: 0, videoKbps: 0, encodeQueue: 0,
-    audioFps: 0, audioKbps: 0, keyFrames: 0, dropped: 0,
+    audioFps: 0, audioKbps: 0, audioEncodeQueue: 0, keyFrames: 0, dropped: 0,
     echoCancellation: false, noiseSuppression: false, autoGainControl: false,
     denoiseActive: false,
   });

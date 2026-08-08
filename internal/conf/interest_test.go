@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"tlmst/internal/bridge"
+	"tlmst/internal/telemetry"
 )
 
 // retired reports whether the backend told the frontend to drop this handle.
@@ -105,6 +106,66 @@ func TestDecliningVideoIsNotAFailedSubscription(t *testing.T) {
 	_, _, _, errs := bobRec.snapshot()
 	if len(errs) > 0 {
 		t.Errorf("declining video was reported to the user as a failure: %v", errs)
+	}
+}
+
+// inboundKbps measures what this subscriber is actually being sent over a
+// window, the way the debug panel's aggregate does.
+func inboundKbps(s *telemetry.Sampler, window time.Duration) float64 {
+	s.Sample(time.Now()) // baseline; rates are per interval
+	time.Sleep(window)
+	return s.Sample(time.Now()).SubscribeKbps
+}
+
+// TestVisibilityGatingCutsInboundBitrate is the measurement rather than the
+// mechanism: how much does not asking actually save?
+//
+// Deliberately on an unshaped link. A bottleneck would answer a different
+// question — under congestion the received rate is capped by the link whatever
+// is subscribed, so both readings would come out near the bottleneck and the
+// saving would look like nothing. What is worth knowing is how much less is
+// asked for, which is visible only when the path can carry everything.
+func TestVisibilityGatingCutsInboundBitrate(t *testing.T) {
+	relayServer := startRelay(t)
+	addr := relayServer.Addr()
+
+	alice := publisherWithBothTracks(t, addr, "measure", "alice")
+	carol := publisherWithBothTracks(t, addr, "measure", "carol")
+
+	counters := telemetry.NewRegistry()
+	bob, bobRec := joinRoomWithCounters(t, addr, "measure", "bob", counters, testLogger(t))
+	waitFor(t, "bob to subscribe to both publishers", 15*time.Second, func() bool {
+		_, tracks, _, _ := bobRec.snapshot()
+		return len(tracks) == 4
+	})
+
+	stop := make(chan struct{})
+	publishPaced(t, alice, stop)
+	publishPaced(t, carol, stop)
+	defer close(stop)
+
+	sampler := telemetry.NewSampler(counters, nil)
+	const window = 3 * time.Second
+
+	everyone := inboundKbps(sampler, window)
+
+	// One of the two tiles scrolled off screen.
+	bob.SetVideoInterest([]string{alice.State().ID})
+	time.Sleep(time.Second) // let the subscription actually go away
+
+	oneVisible := inboundKbps(sampler, window)
+
+	saved := 100 * (1 - oneVisible/everyone)
+	t.Logf("both tiles visible: %.0f kbps; one scrolled off: %.0f kbps (%.0f%% less)",
+		everyone, oneVisible, saved)
+
+	// Two publishers, one video declined. Video is the overwhelming majority
+	// of each, so the saving should be close to half — well clear of a third,
+	// which is the floor this asserts so it is not measuring timing jitter.
+	if saved < 33 {
+		t.Errorf("declining one of two videos saved only %.0f%% of inbound "+
+			"bitrate (%.0f -> %.0f kbps); the subscription is still being paid for",
+			saved, everyone, oneVisible)
 	}
 }
 

@@ -207,6 +207,11 @@ export class Playback {
   onFailure: ((participant: string, detail: string) => void) | null = null;
 
   #sinks = new Map<number, Sink>();
+  /**
+   * Handles being built right now. A removal that arrives before the sink is
+   * inserted is recorded here rather than lost — see add().
+   */
+  #wanted = new Set<number>();
   #audioCtx: AudioContext | null = null;
   #audioReady: Promise<AudioContext> | null = null;
   /** Shared limiter every participant's gain feeds. */
@@ -223,8 +228,21 @@ export class Playback {
     this.remove(track.handle);
     if (track.config.kind === 'video') {
       this.#addVideo(track);
-    } else {
+      return;
+    }
+    // Marked as wanted before the await, and checked after it. #addAudio waits
+    // on the shared context, and a trackGone arriving inside that window finds
+    // no sink to remove — it is not inserted until the far side — so without
+    // this the participant who just left is installed immediately afterwards
+    // and never removed, holding a worklet node and a decoder for the rest of
+    // the call.
+    this.#wanted.add(track.handle);
+    try {
       await this.#addAudio(track);
+    } finally {
+      if (!this.#wanted.delete(track.handle)) {
+        this.remove(track.handle);
+      }
     }
   }
 
@@ -518,6 +536,8 @@ export class Playback {
 
   /** Retires a track's decoder. */
   remove(handle: number): void {
+    // Withdraws a build in flight, so it is torn down when it lands.
+    this.#wanted.delete(handle);
     const sink = this.#sinks.get(handle);
     if (!sink) return;
     this.#sinks.delete(handle);

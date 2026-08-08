@@ -65,6 +65,14 @@ const (
 	watchRetryLimit = 5
 )
 
+// How long to wait before retrying a track subscription that failed, the
+// ceiling on that wait, and how many attempts before giving up and saying so.
+const (
+	trackRetryDelay = 500 * time.Millisecond
+	trackRetryMax   = 5 * time.Second
+	trackRetryLimit = 5
+)
+
 // audioGroupObjects is how many audio frames share one group. At the
 // 20 ms Opus framing WebCodecs produces, 25 objects is a 500 ms group:
 // long enough that stream setup is negligible, short enough that losing

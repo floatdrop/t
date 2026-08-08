@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/floatdrop/moq-go/pkg/moqt/loc"
 	"github.com/floatdrop/moq-go/pkg/moqt/message"
@@ -57,11 +58,18 @@ type remote struct {
 	// this is dropped. Publisher group IDs are monotonic, which is what
 	// makes them usable as the sequence number here.
 	catalogGroup uint64
-	hasCatalog   bool
-	nickname     string
-	version      string
-	video        *remoteTrack
-	audio        *remoteTrack
+	// wantVideo/wantAudio are the configs the last applied catalog asked for,
+	// kept so a subscribe that failed can be tried again against what the
+	// publisher actually wants rather than waiting for them to republish.
+	wantVideo *bridge.TrackConfig
+	wantAudio *bridge.TrackConfig
+	// retrying marks a resubscribe loop already in flight for this remote.
+	retrying   bool
+	hasCatalog bool
+	nickname   string
+	version    string
+	video      *remoteTrack
+	audio      *remoteTrack
 	// closed stops late catalog updates from resurrecting subscriptions
 	// after the participant has left.
 	closed bool
@@ -251,9 +259,98 @@ func (r *remote) onCatalog(group uint64, payload []byte) {
 	r.room.publishParticipants()
 }
 
+// remember records what the current catalog asks for, so a failed subscribe
+// has something to be retried against.
+func (r *remote) remember(video, audio *bridge.TrackConfig) {
+	r.mu.Lock()
+	r.wantVideo, r.wantAudio = video, audio
+	r.mu.Unlock()
+}
+
+// missing reports whether a track the catalog asked for has no subscription.
+func (r *remote) missing() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return (r.wantVideo != nil && r.video == nil) || (r.wantAudio != nil && r.audio == nil)
+}
+
+// scheduleResubscribe starts the retry loop, unless one is already running.
+func (r *remote) scheduleResubscribe() {
+	r.mu.Lock()
+	if r.retrying || r.closed {
+		r.mu.Unlock()
+		return
+	}
+	r.retrying = true
+	r.mu.Unlock()
+	go r.resubscribe()
+}
+
+// resubscribe retries the tracks the catalog asked for and did not get.
+//
+// Without this a single rejected SUBSCRIBE is permanent. Nothing re-runs
+// reconcile except the publisher republishing their catalog, and they only do
+// that when their track availability changes — which a participant who is
+// simply talking never does. So one transient failure and you never see that
+// person for the rest of the call, while the frontend renders them as though
+// their camera were merely off, because that is what a participant with no
+// video track looks like.
+func (r *remote) resubscribe() {
+	defer func() {
+		r.mu.Lock()
+		r.retrying = false
+		r.mu.Unlock()
+	}()
+
+	delay := trackRetryDelay
+	for attempt := 1; attempt <= trackRetryLimit; attempt++ {
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+
+		r.mu.Lock()
+		closed, video, audio := r.closed, r.wantVideo, r.wantAudio
+		r.mu.Unlock()
+		if closed || !r.missing() {
+			return
+		}
+
+		// Through reconcile under the same lock a catalog would take, so a
+		// retry and an arriving catalog cannot both subscribe the same track.
+		r.applying.Lock()
+		r.reconcile(video, audio)
+		r.applying.Unlock()
+
+		if !r.missing() {
+			r.log.Info("track subscription recovered", "attempt", attempt)
+			return
+		}
+		delay = min(delay*2, trackRetryMax)
+	}
+
+	r.log.Warn("giving up on a participant's tracks", "attempts", trackRetryLimit)
+	r.room.sink.SendControl(&bridge.ServerMessage{
+		Type:  bridge.MsgError,
+		Error: fmt.Sprintf("Could not subscribe to %s's media.", r.displayName()),
+	})
+}
+
+// displayName is the nickname if the catalog carried one, else the id.
+func (r *remote) displayName() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.nickname != "" {
+		return r.nickname
+	}
+	return r.id
+}
+
 // reconcile brings the media subscriptions in line with the wanted
 // configs. A nil config means the track should not be subscribed.
 func (r *remote) reconcile(video, audio *bridge.TrackConfig) {
+	r.remember(video, audio)
 	r.syncTrack(&r.video, VideoTrack, bridge.KindVideo, video)
 	r.syncTrack(&r.audio, AudioTrack, bridge.KindAudio, audio)
 }
@@ -291,6 +388,7 @@ func (r *remote) syncTrack(slot **remoteTrack, name string, kind uint8, want *br
 	}
 	if err := r.subscribeTrack(slot, name, kind, want); err != nil {
 		r.log.Warn("track subscribe failed", "track", name, "err", err)
+		r.scheduleResubscribe()
 	}
 }
 

@@ -203,11 +203,48 @@ export interface CaptureStats {
 }
 
 /**
- * H.264 baseline, level 3.1. Baseline keeps the bitstream to what every
- * decoder handles, and the probe confirmed both encode and decode support
- * with Annex B framing in this WebView.
+ * The H.264 levels this will ask for, lowest first, with the limits §A.3.1
+ * sets on each: macroblocks per frame, and macroblocks per second.
+ *
+ * A level is a ceiling on what a decoder must be prepared for, so naming one
+ * too low is naming a stream we do not send. 3.1 stops at 3600 macroblocks —
+ * exactly 1280x720, and not one row more — while 1080p needs 8160. Both the
+ * top rung of VIDEO_LADDER and every screen share ask for 1080p, so a fixed
+ * 3.1 described neither: WebKit is free to refuse the configuration outright,
+ * and a decoder that believes the string is entitled to size its buffers for
+ * 720p and meet a frame it has no room for.
+ *
+ * 5.1 is not a size anything here asks for. It is the catch to a source that
+ * outran the constraints put on it, so an unusual display cannot end the call
+ * by being large.
  */
-const VIDEO_CODEC = 'avc1.42E01F';
+const H264_LEVELS = [
+  { idc: 0x1f, maxFrameMBs: 3600, maxMBsPerSec: 108_000 }, // 3.1 — through 720p30
+  { idc: 0x28, maxFrameMBs: 8192, maxMBsPerSec: 245_760 }, // 4.0 — through 1080p30
+  { idc: 0x33, maxFrameMBs: 36864, maxMBsPerSec: 983_040 }, // 5.1 — the catch-all
+] as const;
+
+/**
+ * The codec string for one stream: H.264 baseline at the lowest level that can
+ * carry it.
+ *
+ * Baseline keeps the bitstream to what every decoder handles, and the probe
+ * confirmed both encode and decode support with Annex B framing in this
+ * WebView. The level is chosen per stream rather than fixed, so the string in
+ * the catalog describes the stream a subscriber is actually about to receive —
+ * the same reason the frame rate is capped before the encoder is configured
+ * rather than at the pump.
+ */
+function videoCodec(width: number, height: number, framerate: number): string {
+  // A macroblock is 16x16, and a partial one still costs a whole macroblock.
+  const frameMBs = Math.ceil(width / 16) * Math.ceil(height / 16);
+  const level =
+    H264_LEVELS.find(
+      (l) => frameMBs <= l.maxFrameMBs && frameMBs * framerate <= l.maxMBsPerSec,
+    ) ?? H264_LEVELS[H264_LEVELS.length - 1];
+  return `avc1.42E0${level.idc.toString(16).toUpperCase().padStart(2, '0')}`;
+}
+
 const AUDIO_CODEC = 'opus';
 
 /** Microphone sample rate. Opus is defined at 48 kHz. */
@@ -546,6 +583,10 @@ export class Capture {
     // something was actually rounded: the camera path is left exactly as it was.
     const crop = width !== grantedWidth || height !== grantedHeight;
 
+    // Chosen from the size and rate settled on just above, so the level names
+    // the stream being sent rather than the one that was asked for.
+    const codec = videoCodec(width, height, framerate);
+
     // A <video> element is the only source WebKit offers for constructing
     // VideoFrames from a live track.
     const el = document.createElement('video');
@@ -571,7 +612,7 @@ export class Capture {
         }),
     });
     encoder.configure({
-      codec: VIDEO_CODEC,
+      codec,
       width,
       height,
       bitrate: settings.bitrate,
@@ -588,7 +629,7 @@ export class Capture {
     // first and so claimed a configuration that had not happened yet, which is
     // exactly the wrong thing to find in a log when configuring is what failed.
     bridge.report('INFO', 'video encoder configured', {
-      codec: VIDEO_CODEC,
+      codec,
       source: settings.source,
       size: `${width}x${height}`,
       asked: `${settings.width}x${settings.height}`,
@@ -605,7 +646,7 @@ export class Capture {
       type: 'track',
       track: {
         kind: 'video',
-        codec: VIDEO_CODEC,
+        codec,
         width,
         height,
         framerate,

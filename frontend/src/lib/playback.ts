@@ -328,7 +328,12 @@ export class Playback {
         bridge.report('WARN', 'trimmed the audio buffer to bound its latency', {
           participant: track.participant,
           trims: String(sink.trimmed),
-          bufferedMs: String(Math.round((ev.data.available / 48000) * 1000)),
+          // How deep it had got, not how deep it is now: a trim leaves the
+          // buffer at its floor by construction, so reporting what is left
+          // logged the same ~60 ms every time and threw away the one number
+          // that says how far behind the sound had fallen.
+          droppedFromMs: String(Math.round((ev.data.trimmedFrom / 48000) * 1000)),
+          nowMs: String(Math.round((ev.data.available / 48000) * 1000)),
         });
       }
       // Only a playing buffer has a meaningful position; a prerolling or

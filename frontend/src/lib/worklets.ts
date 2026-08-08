@@ -133,6 +133,10 @@ class PCMPlayer extends AudioWorkletProcessor {
     // is a real fault, and silence about it is what let two seconds of delay
     // go unnoticed in the first place.
     this.trimmed = 0;
+    // How deep the buffer had got when it was last trimmed. Reported because
+    // the depth after a trim is always TRIM_TO by construction and so says
+    // nothing: this is the number that measures how far behind the audio was.
+    this.trimmedFrom = 0;
     // Hold output until this much audio has queued, so playback does not
     // start on the very first packet and then immediately starve.
     this.prerollFrames = 2880; // 60 ms
@@ -156,6 +160,7 @@ class PCMPlayer extends AudioWorkletProcessor {
       available: this.available,
       underruns: this.underruns,
       trimmed: this.trimmed,
+      trimmedFrom: this.trimmedFrom,
       playing: this.playing,
       haveClock: this.haveClock,
       playoutUs: this.writeUs - (this.available / sampleRate) * 1e6,
@@ -181,6 +186,7 @@ class PCMPlayer extends AudioWorkletProcessor {
   trim() {
     if (this.available <= MAX_BUFFER) return;
     const drop = this.available - TRIM_TO;
+    this.trimmedFrom = this.available;
     this.read = (this.read + drop) % CAPACITY;
     this.available -= drop;
     this.trimmed++;
@@ -249,6 +255,14 @@ export interface PlayerReport {
   underruns: number;
   /** How many times the queue has been trimmed back to bound its latency. */
   trimmed: number;
+  /**
+   * How deep the queue was, in samples, at the last trim.
+   *
+   * The depth *after* a trim is TRIM_TO by construction and so measures
+   * nothing. This is how far behind the audio had actually fallen, which is
+   * the only part worth logging.
+   */
+  trimmedFrom: number;
   /** False while prerolling or after a starve, when the clock is not moving. */
   playing: boolean;
   /** False until a timestamped chunk has arrived. */

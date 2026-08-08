@@ -322,6 +322,14 @@ class Store {
           if (wasJoined && msg.state.phase === 'reconnecting') {
             this.#dropRemoteState();
           }
+          // A backend reporting a joined room that this page is not publishing
+          // into means the WebView reloaded under a live call: the backend held
+          // the session open and withdrew the tracks, and it is on this side to
+          // pick them back up. Without this the reload lands in a conference
+          // showing everyone else and sending nothing.
+          if (msg.state.phase === 'joined' && !capture.stream) {
+            void this.#resumePublishing();
+          }
           break;
         }
 
@@ -707,6 +715,32 @@ class Store {
       this.reportFault(`Cannot play ${track.config.kind} from ${who}.`);
     }
   }
+
+  /**
+   * Starts publishing into a room the backend is already in.
+   *
+   * The reload path, and deliberately not a join: the session, the participant
+   * identifier and every remote subscription survived, so there is nothing to
+   * dial and nobody to rediscover. Only the half that lived in the page — the
+   * devices, the encoders, the declarations — has to be built again.
+   */
+  async #resumePublishing(): Promise<void> {
+    if (this.#resuming) return;
+    this.#resuming = true;
+    try {
+      await playback.resume();
+      await this.openPreview();
+      await capture.start(this.videoSettings, this.audioSettings);
+      bridge.report('INFO', 'resumed publishing into a room the backend still held');
+    } catch (err) {
+      bridge.report('ERROR', 'could not resume publishing after a reload', { err: String(err) });
+      this.reportFault('Could not restart your camera or microphone after a reload.');
+    } finally {
+      this.#resuming = false;
+    }
+  }
+
+  #resuming = false;
 
   /**
    * Records a fault for the conference view to show.

@@ -64,7 +64,16 @@ type App struct {
 	// lastKeyFrameAsk rate limits requestKeyFrame, whose trigger arrives at
 	// the frame rate.
 	lastKeyFrameAsk time.Time
+	// reattach leaves the room if no frontend comes back. See HandleDisconnect.
+	reattach *time.Timer
 }
+
+// reattachGrace is how long a room outlives the WebView that was driving it.
+//
+// Long enough to cover a reload and the bridge's own one-second reconnect,
+// short enough that a peer who has actually quit does not linger in everyone's
+// roster publishing nothing.
+const reattachGrace = 5 * time.Second
 
 // keyFrameAskInterval is the shortest gap between keyframe requests. Longer
 // than an encode takes to turn one round, short enough that a group which
@@ -196,6 +205,14 @@ func (a *App) requestKeyFrame() {
 // frontend, backfilling whatever the ring buffer already holds so a panel
 // opened mid-session is not empty.
 func (a *App) HandleConnect() {
+	// A frontend is here, so whatever room is held is theirs to resume.
+	a.mu.Lock()
+	if a.reattach != nil {
+		a.reattach.Stop()
+		a.reattach = nil
+	}
+	a.mu.Unlock()
+
 	for _, entry := range a.sink.Recent() {
 		e := entry
 		a.server.SendControl(&bridge.ServerMessage{Type: bridge.MsgLog, Log: &e})
@@ -222,12 +239,59 @@ func (a *App) HandleConnect() {
 	a.sendOffer()
 }
 
-// HandleDisconnect tears the session down when the WebView goes away: its
-// encoders and decoders died with it, so the publications have nothing
-// left to carry.
+// HandleDisconnect withdraws what the departed WebView was publishing, and
+// gives it a moment to come back before the room is left.
+//
+// The encoders and decoders died with the page, so the tracks have to go
+// immediately: leaving them declared would hold every peer on a decoder
+// waiting for media that cannot arrive. But the session itself is still good,
+// and a WebView that has gone away has usually not gone far — a reload, a
+// renderer restart, the bridge socket dropping and reconnecting a second
+// later. Tearing the room down for that means a full rejoin: a new
+// participant identifier, every peer resubscribing, and the user back at the
+// welcome screen wondering what they did.
+//
+// So the room is held briefly instead. If a frontend reattaches it finds the
+// session it left and starts publishing into it again; if none does, this is a
+// genuine departure and the room is left as before.
 func (a *App) HandleDisconnect() {
 	a.sink.SetEmit(nil)
-	a.leave()
+
+	a.mu.Lock()
+	room := a.room
+	a.mu.Unlock()
+	if room == nil {
+		return
+	}
+
+	// Withdrawn, not merely stopped. Nothing is feeding these now.
+	if err := room.UndeclareTrack("video"); err != nil {
+		a.log.Debug("withdrawing video after a disconnect", "err", err)
+	}
+	if err := room.UndeclareTrack("audio"); err != nil {
+		a.log.Debug("withdrawing audio after a disconnect", "err", err)
+	}
+
+	a.holdRoom()
+}
+
+// holdRoom starts the countdown to leaving, and forgets what the departed page
+// was publishing. Separate from HandleDisconnect so the decision can be tested
+// without a live session to withdraw tracks from.
+func (a *App) holdRoom() {
+	a.mu.Lock()
+	// Forgotten so a relay reconnect inside this window does not restore
+	// declarations for encoders that no longer exist.
+	a.declared = map[string]*bridge.TrackConfig{}
+	if a.reattach != nil {
+		a.reattach.Stop()
+	}
+	a.reattach = time.AfterFunc(reattachGrace, func() {
+		a.log.Info("no frontend reattached; leaving the room")
+		a.leave()
+	})
+	a.mu.Unlock()
+	a.log.Info("frontend disconnected; holding the room", "grace", reattachGrace)
 }
 
 // ---- session lifecycle ------------------------------------------------
@@ -516,6 +580,10 @@ func (a *App) reportState(phase string, cfg *conf.Config, detail string) {
 
 func (a *App) leave() {
 	a.mu.Lock()
+	if a.reattach != nil {
+		a.reattach.Stop()
+		a.reattach = nil
+	}
 	room, stopMet, stopSession := a.room, a.stopMet, a.stopSession
 	a.room, a.stopMet, a.stopSession = nil, nil, nil
 	a.joined = nil

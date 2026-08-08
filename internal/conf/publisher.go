@@ -71,14 +71,20 @@ type publisher struct {
 
 	catalog *session.Publication
 	video   *trackPublisher
-	audio   *trackPublisher
+	// videoLow is the smaller encoding of the same camera, published beside
+	// the primary one so a subscriber with a thumbnail-sized tile can take it
+	// instead. Always open; it carries objects only while the frontend is
+	// feeding it.
+	videoLow *trackPublisher
+	audio    *trackPublisher
 
 	// mu guards the declared configs and the catalog republish, which
 	// races the two independent encoder-config messages arriving from
 	// the frontend.
-	mu          sync.Mutex
-	videoConfig *bridge.TrackConfig
-	audioConfig *bridge.TrackConfig
+	mu             sync.Mutex
+	videoConfig    *bridge.TrackConfig
+	videoLowConfig *bridge.TrackConfig
+	audioConfig    *bridge.TrackConfig
 	// catalogGroup numbers successive catalog objects. Each catalog is a
 	// standalone group so a subscriber's Joining FETCH lands on the
 	// newest one.
@@ -122,6 +128,9 @@ func newPublisher(
 		return nil, err
 	}
 	if p.video, err = p.newTrack(ctx, VideoTrack, videoSubgroupTimeout); err != nil {
+		return nil, err
+	}
+	if p.videoLow, err = p.newTrack(ctx, VideoLowTrack, videoSubgroupTimeout); err != nil {
 		return nil, err
 	}
 	if p.audio, err = p.newTrack(ctx, AudioTrack, audioSubgroupTimeout); err != nil {
@@ -195,6 +204,8 @@ func (p *publisher) declareConfig(cfg *bridge.TrackConfig) error {
 	switch cfg.Kind {
 	case "video":
 		p.videoConfig = cfg
+	case KindVideoLow:
+		p.videoLowConfig = cfg
 	case "audio":
 		p.audioConfig = cfg
 	default:
@@ -212,6 +223,8 @@ func (p *publisher) declareConfig(cfg *bridge.TrackConfig) error {
 	switch cfg.Kind {
 	case "video":
 		p.video.setConfig(description)
+	case KindVideoLow:
+		p.videoLow.setConfig(description)
 	case "audio":
 		p.audio.setConfig(description)
 	}
@@ -238,6 +251,12 @@ func (p *publisher) undeclareConfig(kind string) error {
 			return nil // already withdrawn
 		}
 		p.videoConfig = nil
+	case KindVideoLow:
+		if p.videoLowConfig == nil {
+			p.mu.Unlock()
+			return nil
+		}
+		p.videoLowConfig = nil
 	case "audio":
 		if p.audioConfig == nil {
 			p.mu.Unlock()
@@ -289,7 +308,7 @@ func (p *publisher) republishCatalog() error {
 
 func (p *publisher) writeCatalog() error {
 	p.mu.Lock()
-	cat, err := buildCatalog(p.nickname, p.version, p.videoConfig, p.audioConfig)
+	cat, err := buildCatalog(p.nickname, p.version, p.videoConfig, p.videoLowConfig, p.audioConfig)
 	group := p.catalogGroup
 	p.catalogGroup++
 	p.mu.Unlock()
@@ -332,6 +351,11 @@ func (p *publisher) writeFrame(f *bridge.MediaFrame) error {
 			return ErrNoPublication
 		}
 		return p.video.writeVideo(f)
+	case bridge.HandleLocalVideoLow:
+		if p.videoLow == nil {
+			return ErrNoPublication
+		}
+		return p.videoLow.writeVideo(f)
 	case bridge.HandleLocalAudio:
 		if p.audio == nil {
 			return ErrNoPublication
@@ -367,7 +391,7 @@ func (p *publisher) close() {
 		}
 	}
 
-	for _, t := range []*trackPublisher{p.video, p.audio} {
+	for _, t := range []*trackPublisher{p.video, p.videoLow, p.audio} {
 		if t != nil {
 			t.close()
 		}

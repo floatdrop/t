@@ -15,6 +15,7 @@ import type { ClientMessage } from './protocol';
 import {
   HANDLE_LOCAL_AUDIO,
   HANDLE_LOCAL_VIDEO,
+  HANDLE_LOCAL_VIDEO_LOW,
   KIND_AUDIO,
   KIND_VIDEO,
   toBase64,
@@ -302,9 +303,17 @@ const MAX_AUDIO_ENCODE_QUEUE = Math.max(1, Math.round(MAX_AUDIO_LATE_US / OPUS_F
  */
 type Declaration = Extract<ClientMessage, { type: 'track' } | { type: 'untrack' }>;
 
-/** Which track a declaration is about, for superseding an earlier one. */
-function declarationKind(msg: Declaration): 'video' | 'audio' {
-  return msg.type === 'track' ? (msg.track.kind as 'video' | 'audio') : msg.untrack;
+/**
+ * Which track a declaration is about, for superseding an earlier one.
+ *
+ * The two video layers are separate kinds here on purpose: a declaration for
+ * the small one must not supersede the primary's, or bringing up the layer
+ * would withdraw the picture it is meant to accompany.
+ */
+type DeclarationKind = 'video' | 'videoLow' | 'audio';
+
+function declarationKind(msg: Declaration): DeclarationKind {
+  return msg.type === 'track' ? msg.track.kind : msg.untrack;
 }
 
 /** How long to wait for the capture element to start playing before going on. */
@@ -405,6 +414,15 @@ export class Capture {
 
   #video: HTMLVideoElement | null = null;
   #videoEncoder: VideoEncoder | null = null;
+  /**
+   * The second, smaller encoding of the same camera — see startLowLayer.
+   * Null whenever the primary is already small enough that a second copy
+   * would buy nothing.
+   */
+  #lowEncoder: VideoEncoder | null = null;
+  /** Where a frame is scaled down before the low encoder sees it. */
+  #lowCanvas: OffscreenCanvas | null = null;
+  #lowCtx: OffscreenCanvasRenderingContext2D | null = null;
   #audioEncoder: AudioEncoder | null = null;
   #audioCtx: AudioContext | null = null;
   #tap: AudioWorkletNode | null = null;
@@ -790,6 +808,8 @@ export class Capture {
       },
     });
 
+    this.#startLowLayer(width, height, framerate, codec);
+
     const keyEvery = Math.max(1, Math.round(framerate * KEYFRAME_INTERVAL_SEC));
 
     /** Least time between encoded frames — see FRAME_GAP_TOLERANCE. */
@@ -845,9 +865,14 @@ export class Capture {
             // leave the next scheduled one moments behind it.
             this.#frameIndex = 0;
           }
-          this.#videoEncoder.encode(frame, {
-            keyFrame: forced || this.#frameIndex % keyEvery === 0,
-          });
+          const key = forced || this.#frameIndex % keyEvery === 0;
+          this.#videoEncoder.encode(frame, { keyFrame: key });
+          // The same frame, the same keyframe decision. Aligned deliberately:
+          // a subscriber that switches layers has to land on a keyframe in the
+          // one it moves to, and there is no way to ask for one — so the only
+          // guarantee available is that both layers always have one at the
+          // same moment.
+          this.#encodeLowLayer(frame, key);
           this.#frameIndex++;
         } catch (err) {
           bridge.report('WARN', 'video frame capture failed', { err: String(err) });
@@ -1064,6 +1089,147 @@ export class Capture {
       });
     }
     this.#undelivered = held;
+  }
+
+  /**
+   * Brings up the second, smaller encoding of the same camera.
+   *
+   * Without it a subscriber has one choice per publisher: the full picture or
+   * nothing. That is the right answer for a tile drawn large and a poor one for
+   * a thumbnail, and it is nobody's correct answer in a call where two people
+   * have different window sizes — the resolution is picked from the
+   * publisher's own grid, so everyone gets a stream sized for a screen they
+   * cannot see.
+   *
+   * Both layers are published whenever video runs, rather than on request:
+   * nothing in MOQT tells a publisher that somebody subscribed, so there is no
+   * demand signal to light one up from. The cost is a second encoder and its
+   * bitrate, which is why the layer is skipped entirely when the primary is
+   * already at or below the small rung and a copy would buy nothing.
+   */
+  #startLowLayer(width: number, height: number, framerate: number, codec: string): void {
+    this.#stopLowLayer();
+
+    const rung = VIDEO_LADDER[0];
+    if (width <= rung.width) return;
+
+    let canvas: OffscreenCanvas;
+    let ctx: OffscreenCanvasRenderingContext2D | null;
+    try {
+      // Scaled through a canvas rather than by handing an oversized frame to a
+      // smaller encoder: encoders differ on whether they will scale one, and
+      // this is the WebView where that kind of optimism has cost the most.
+      canvas = new OffscreenCanvas(rung.width, Math.round((rung.width * height) / width));
+      ctx = canvas.getContext('2d');
+    } catch (err) {
+      bridge.report('WARN', 'no small video layer: canvas unavailable', { err: String(err) });
+      return;
+    }
+    if (!ctx) {
+      bridge.report('WARN', 'no small video layer: no 2d context');
+      return;
+    }
+
+    const encoder = new VideoEncoder({
+      output: (chunk) => this.#onLowChunk(chunk),
+      // Only the small layer is withdrawn. The primary is a separate encoder
+      // and a separate track, and a call that has lost its thumbnail is still
+      // a call.
+      error: (err) => this.#failLowLayer('small video layer failed', { err: String(err) }),
+    });
+    try {
+      encoder.configure({
+        codec,
+        width: canvas.width,
+        height: canvas.height,
+        bitrate: rung.minBitrate,
+        framerate,
+        latencyMode: 'realtime',
+        avc: { format: 'annexb' },
+      });
+    } catch (err) {
+      bridge.report('WARN', 'no small video layer: configure failed', { err: String(err) });
+      return;
+    }
+
+    this.#lowEncoder = encoder;
+    this.#lowCanvas = canvas;
+    this.#lowCtx = ctx;
+
+    this.#declare({
+      type: 'track',
+      track: {
+        kind: 'videoLow',
+        codec,
+        width: canvas.width,
+        height: canvas.height,
+        framerate,
+        bitrate: rung.minBitrate,
+      },
+    });
+    bridge.report('INFO', 'small video layer configured', {
+      size: `${canvas.width}x${canvas.height}`,
+      bitrate: String(rung.minBitrate),
+    });
+  }
+
+  /** Scales one frame down and encodes it into the small layer. */
+  #encodeLowLayer(frame: VideoFrame, keyFrame: boolean): void {
+    const encoder = this.#lowEncoder;
+    const canvas = this.#lowCanvas;
+    const ctx = this.#lowCtx;
+    if (!encoder || !canvas || !ctx) return;
+    if (encoder.state !== 'configured') return;
+    // The same bound the primary uses: a backed-up encoder is shed from
+    // rather than queued into, and the small layer is the one to shed first.
+    if (encoder.encodeQueueSize > 2) return;
+
+    let scaled: VideoFrame | null = null;
+    try {
+      ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+      scaled = new VideoFrame(canvas, { timestamp: frame.timestamp });
+      encoder.encode(scaled, { keyFrame });
+    } catch (err) {
+      this.#failLowLayer('small video layer encode failed', { err: String(err) });
+    } finally {
+      scaled?.close();
+    }
+  }
+
+  #onLowChunk(chunk: EncodedVideoChunk): void {
+    const payload = new Uint8Array(chunk.byteLength);
+    chunk.copyTo(payload);
+    // Not counted in the capture stats: those describe the picture being sent,
+    // and counting the same frames twice would read as double the framerate.
+    bridge.sendFrame({
+      kind: KIND_VIDEO,
+      handle: HANDLE_LOCAL_VIDEO_LOW,
+      timestamp: chunk.timestamp,
+      keyFrame: chunk.type === 'key',
+      payload,
+    });
+  }
+
+  /** Gives up on the small layer, leaving the primary running. */
+  #failLowLayer(reason: string, attrs: Record<string, string>): void {
+    if (!this.#lowEncoder) return;
+    bridge.report('WARN', reason, attrs);
+    this.#stopLowLayer();
+    this.#declare({ type: 'untrack', untrack: 'videoLow' });
+  }
+
+  #stopLowLayer(): void {
+    const encoder = this.#lowEncoder;
+    this.#lowEncoder = null;
+    this.#lowCanvas = null;
+    this.#lowCtx = null;
+    if (encoder && encoder.state !== 'closed') {
+      try {
+        encoder.close();
+      } catch {
+        // Already gone; nothing to release.
+      }
+    }
   }
 
   #onVideoChunk(chunk: EncodedVideoChunk, meta?: EncodedVideoChunkMetadata): void {
@@ -1515,6 +1681,7 @@ export class Capture {
     this.#videoRunning = false;
     this.#stopCaptureWatchdogIfIdle();
 
+    this.#stopLowLayer();
     if (this.#videoEncoder && this.#videoEncoder.state !== 'closed') this.#videoEncoder.close();
     this.#videoEncoder = null;
     if (this.#video) {

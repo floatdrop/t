@@ -36,7 +36,7 @@ const audioInitRef = "audio-config"
 // audio may each be nil, which is how a participant that publishes only
 // one of the two (or neither, before its encoders have started) is
 // described.
-func buildCatalog(nickname, version string, video, audio *bridge.TrackConfig) (msf.Catalog, error) {
+func buildCatalog(nickname, version string, video, videoLow, audio *bridge.TrackConfig) (msf.Catalog, error) {
 	live := true
 	// Both media tracks belong to one render group so a player knows
 	// they are meant to be presented together (§5.2.10).
@@ -45,17 +45,26 @@ func buildCatalog(nickname, version string, video, audio *bridge.TrackConfig) (m
 	var tracks []msf.Track
 	var initData []msf.InitData
 
-	if video != nil {
+	// Both video encodings are declared the same way and differ only in name
+	// and size: a subscriber picks whichever fits the tile it will draw.
+	for _, layer := range []struct {
+		name string
+		cfg  *bridge.TrackConfig
+	}{{VideoTrack, video}, {VideoLowTrack, videoLow}} {
+		if layer.cfg == nil {
+			continue
+		}
+		v := layer.cfg
 		tracks = append(tracks, msf.Track{
-			Name:        VideoTrack,
+			Name:        layer.name,
 			Packaging:   msf.PackagingLOC,
 			IsLive:      &live,
 			Role:        msf.RoleVideo,
-			Codec:       video.Codec,
-			Width:       video.Width,
-			Height:      video.Height,
-			Framerate:   video.Framerate,
-			Bitrate:     video.Bitrate,
+			Codec:       v.Codec,
+			Width:       v.Width,
+			Height:      v.Height,
+			Framerate:   v.Framerate,
+			Bitrate:     v.Bitrate,
 			Timescale:   timescaleMicros,
 			RenderGroup: &renderGroup,
 		})
@@ -120,7 +129,10 @@ type parsedCatalog struct {
 	// old enough not to say.
 	Version string
 	Video   *bridge.TrackConfig
-	Audio   *bridge.TrackConfig
+	// VideoLow is the smaller encoding, when the publisher offers one. Both
+	// carry MSF's video role, so they are told apart by track name.
+	VideoLow *bridge.TrackConfig
+	Audio    *bridge.TrackConfig
 	// Complete reports the §11.3 terminator catalog — the publisher has
 	// ended the broadcast and every track is done.
 	Complete bool
@@ -158,13 +170,25 @@ func parseCatalog(payload []byte) (parsedCatalog, error) {
 		}
 		switch tr.Role {
 		case msf.RoleVideo:
-			out.Video = &bridge.TrackConfig{
+			// Kind stays "video" for both: the layer is a fact about which
+			// track was subscribed, not about the pictures inside it, and the
+			// frontend decodes either identically.
+			cfg := &bridge.TrackConfig{
 				Kind:      "video",
 				Codec:     tr.Codec,
 				Width:     tr.Width,
 				Height:    tr.Height,
 				Framerate: tr.Framerate,
 				Bitrate:   tr.Bitrate,
+			}
+			// A publisher too old to simulcast names its only video track
+			// "video"; anything else with the video role that is not the low
+			// layer is ignored rather than guessed at.
+			switch tr.Name {
+			case VideoTrack:
+				out.Video = cfg
+			case VideoLowTrack:
+				out.VideoLow = cfg
 			}
 		case msf.RoleAudio:
 			channels, err := strconv.ParseUint(tr.ChannelConfig, 10, 32)

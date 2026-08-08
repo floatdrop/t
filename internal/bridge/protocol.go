@@ -51,7 +51,11 @@ const (
 const (
 	HandleLocalVideo = 0
 	HandleLocalAudio = 1
-	HandleRemoteBase = 16
+	// HandleLocalVideoLow is the second, smaller encoding of the same camera —
+	// see KindVideoLow. Its frames are KindVideo like any other picture; only
+	// the handle says which encoding they belong to.
+	HandleLocalVideoLow = 2
+	HandleRemoteBase    = 16
 )
 
 // MediaFrame is one encoded chunk in flight over the bridge.
@@ -109,6 +113,10 @@ type Interest struct {
 	// Video lists participant IDs whose video is wanted. An empty list means
 	// none, which is a real answer — everyone can be scrolled off screen.
 	Video []string `json:"video"`
+	// Low is the subset of Video whose tile is small enough that the
+	// publisher's smaller encoding will do. Anything here that is not also in
+	// Video is not subscribed at all: this says which encoding, never whether.
+	Low []string `json:"low,omitempty"`
 }
 
 // Client message types.

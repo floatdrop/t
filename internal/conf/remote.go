@@ -85,8 +85,9 @@ type remote struct {
 	// wantVideo/wantAudio are the configs the last applied catalog asked for,
 	// kept so a subscribe that failed can be tried again against what the
 	// publisher actually wants rather than waiting for them to republish.
-	wantVideo *bridge.TrackConfig
-	wantAudio *bridge.TrackConfig
+	wantVideo    *bridge.TrackConfig
+	wantVideoLow *bridge.TrackConfig
+	wantAudio    *bridge.TrackConfig
 	// retrying marks a resubscribe loop already in flight for this remote.
 	retrying   bool
 	hasCatalog bool
@@ -110,6 +111,10 @@ type remote struct {
 type remoteTrack struct {
 	handle uint32
 	kind   uint8
+	// name is the track subscribed, which for video says which encoding this
+	// is. Two layers can carry identical configs — same codec, same
+	// framerate — so the config alone cannot tell them apart.
+	name   string
 	config bridge.TrackConfig
 	sub    *session.Subscription
 	label  string
@@ -386,7 +391,7 @@ func (r *remote) onCatalog(group uint64, payload []byte) {
 	}
 	// §11.3 Complete means they have ended the broadcast, so it declares
 	// nothing whatever the track fields say.
-	r.catalogVideo = !cat.Complete && cat.Video != nil
+	r.catalogVideo = !cat.Complete && (cat.Video != nil || cat.VideoLow != nil)
 	r.catalogAudio = !cat.Complete && cat.Audio != nil
 	r.mu.Unlock()
 
@@ -400,20 +405,20 @@ func (r *remote) onCatalog(group uint64, payload []byte) {
 		// §11.3: the publisher ended its broadcast. Drop the media
 		// subscriptions but keep watching the catalog — the namespace is
 		// still announced, and they may start publishing again.
-		r.reconcile(nil, nil)
+		r.reconcile(nil, nil, nil)
 		r.room.publishParticipants()
 		return
 	}
 
-	r.reconcile(cat.Video, cat.Audio)
+	r.reconcile(cat.Video, cat.VideoLow, cat.Audio)
 	r.room.publishParticipants()
 }
 
 // remember records what the current catalog asks for, so a failed subscribe
 // has something to be retried against.
-func (r *remote) remember(video, audio *bridge.TrackConfig) {
+func (r *remote) remember(video, videoLow, audio *bridge.TrackConfig) {
 	r.mu.Lock()
-	r.wantVideo, r.wantAudio = video, audio
+	r.wantVideo, r.wantVideoLow, r.wantAudio = video, videoLow, audio
 	r.mu.Unlock()
 }
 
@@ -432,7 +437,8 @@ func (r *remote) missing() bool {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return (r.wantVideo != nil && r.video == nil && wantsVideo) ||
+	wantsSomeVideo := r.wantVideo != nil || r.wantVideoLow != nil
+	return (wantsSomeVideo && r.video == nil && wantsVideo) ||
 		(r.wantAudio != nil && r.audio == nil)
 }
 
@@ -474,6 +480,7 @@ func (r *remote) resubscribe() {
 
 		r.mu.Lock()
 		closed, video, audio := r.closed, r.wantVideo, r.wantAudio
+		videoLow := r.wantVideoLow
 		r.mu.Unlock()
 		if closed || !r.missing() {
 			return
@@ -482,7 +489,7 @@ func (r *remote) resubscribe() {
 		// Through reconcile under the same lock a catalog would take, so a
 		// retry and an arriving catalog cannot both subscribe the same track.
 		r.applying.Lock()
-		r.reconcile(video, audio)
+		r.reconcile(video, videoLow, audio)
 		r.applying.Unlock()
 
 		if !r.missing() {
@@ -511,25 +518,45 @@ func (r *remote) displayName() string {
 
 // reconcile brings the media subscriptions in line with the wanted
 // configs. A nil config means the track should not be subscribed.
-func (r *remote) reconcile(video, audio *bridge.TrackConfig) {
-	r.remember(video, audio)
-	// What they publish and what we can use are different questions. The
-	// answer to the second is the frontend's — it knows which tiles are on
-	// screen — and it only ever subtracts: a track the catalog does not
-	// declare cannot be wanted into existence.
-	wanted := video
-	if wanted != nil && !r.room.wantsVideo(r.id) {
-		wanted = nil
-	}
-	r.syncTrack(&r.video, VideoTrack, bridge.KindVideo, wanted)
+func (r *remote) reconcile(video, videoLow, audio *bridge.TrackConfig) {
+	r.remember(video, videoLow, audio)
+	name, wanted := r.chooseVideoLayer(video, videoLow)
+	r.syncTrack(&r.video, name, bridge.KindVideo, wanted)
 	r.syncTrack(&r.audio, AudioTrack, bridge.KindAudio, audio)
+}
+
+// chooseVideoLayer picks which of a publisher's video encodings to take.
+//
+// What they publish and what we can use are different questions. The answer to
+// the second is the frontend's — it knows how big each tile will be drawn, and
+// which are on screen at all — and it only ever subtracts: a layer the catalog
+// does not declare cannot be wanted into existence.
+//
+// The fallbacks matter more than the preference. A publisher on an older build
+// offers one video track and no low layer, and a publisher whose primary
+// encoder died may offer only the small one; in both cases taking what exists
+// beats taking nothing, because nothing is a permanently blank tile.
+func (r *remote) chooseVideoLayer(video, videoLow *bridge.TrackConfig) (string, *bridge.TrackConfig) {
+	if !r.room.wantsVideo(r.id) {
+		return VideoTrack, nil
+	}
+	if r.room.wantsLowLayer(r.id) && videoLow != nil {
+		return VideoLowTrack, videoLow
+	}
+	if video != nil {
+		return VideoTrack, video
+	}
+	if videoLow != nil {
+		return VideoLowTrack, videoLow
+	}
+	return VideoTrack, nil
 }
 
 // applyInterest re-runs reconcile against the catalog this remote last
 // published, after the frontend has changed what it can see.
 func (r *remote) applyInterest() {
 	r.mu.Lock()
-	video, audio, closed := r.wantVideo, r.wantAudio, r.closed
+	video, videoLow, audio, closed := r.wantVideo, r.wantVideoLow, r.wantAudio, r.closed
 	r.mu.Unlock()
 	if closed {
 		return
@@ -538,7 +565,7 @@ func (r *remote) applyInterest() {
 	// arriving catalog cannot both decide the same track's fate at once.
 	r.applying.Lock()
 	defer r.applying.Unlock()
-	r.reconcile(video, audio)
+	r.reconcile(video, videoLow, audio)
 }
 
 // syncTrack subscribes, unsubscribes, or resubscribes one track so its
@@ -557,15 +584,16 @@ func (r *remote) syncTrack(slot **remoteTrack, name string, kind uint8, want *br
 		r.dropTrack(slot)
 		return
 
-	case current != nil && current.config == *want:
-		// Already subscribed with this exact config: nothing to do.
+	case current != nil && current.name == name && current.config == *want:
+		// Already subscribed to this exact track with this config.
 		return
 
 	case current != nil:
 		// The publisher changed codec or resolution. The frontend keys
 		// its decoder off the handle, so tear the old one down and
 		// announce a fresh handle rather than reconfiguring in place.
-		r.log.Info("track config changed, resubscribing", "track", name)
+		r.log.Info("track changed, resubscribing",
+			"from", current.name, "to", name)
 		r.dropTrack(slot)
 	}
 
@@ -600,6 +628,7 @@ func (r *remote) subscribeTrack(slot **remoteTrack, name string, kind uint8, cfg
 	track := &remoteTrack{
 		handle: handle,
 		kind:   kind,
+		name:   name,
 		config: *cfg,
 		sub:    sub,
 		label:  label,

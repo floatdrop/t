@@ -849,12 +849,13 @@ class Store {
    * Re-sending it would make every remote reconsider its subscriptions for
    * nothing.
    */
-  setVideoInterest(ids: string[]): void {
+  setVideoInterest(ids: string[], low: string[] = []): void {
     const wanted = [...ids].sort();
-    const key = wanted.join(',');
+    const small = [...low].sort();
+    const key = `${wanted.join(',')}|${small.join(',')}`;
     if (key === this.#interestKey) return;
     this.#interestKey = key;
-    bridge.send({ type: 'interest', interest: { video: wanted } });
+    bridge.send({ type: 'interest', interest: { video: wanted, low: small } });
   }
 
   /** The last interest set sent, so an unchanged one is not sent twice. */

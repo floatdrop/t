@@ -77,7 +77,10 @@ type Room struct {
 	// declared track is subscribed — the behaviour before any of this — so a
 	// frontend that never reports what it can see is over-served rather than
 	// left with a room of blank tiles.
-	videoWant    map[string]bool
+	videoWant map[string]bool
+	// videoLowWant is the subset of those whose tile is small enough that the
+	// publisher's smaller encoding will do.
+	videoLowWant map[string]bool
 	videoWantAll bool
 }
 
@@ -312,14 +315,19 @@ func (r *Room) WriteFrame(f *bridge.MediaFrame) error {
 // the other three is a megabit each of pictures nobody can see. Discarding
 // them at the decoder would still have paid for them on the wire; not asking
 // is the only saving there is.
-func (r *Room) SetVideoInterest(ids []string) {
+func (r *Room) SetVideoInterest(ids, low []string) {
 	want := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		want[id] = true
 	}
+	lowWant := make(map[string]bool, len(low))
+	for _, id := range low {
+		lowWant[id] = true
+	}
 
 	r.mu.Lock()
 	r.videoWant = want
+	r.videoLowWant = lowWant
 	r.videoWantAll = false
 	remotes := make([]*remote, 0, len(r.remotes))
 	for _, rem := range r.remotes {
@@ -334,7 +342,8 @@ func (r *Room) SetVideoInterest(ids []string) {
 	for _, rem := range remotes {
 		rem.applyInterest()
 	}
-	r.log.Debug("video interest updated", "wanted", len(want), "participants", len(remotes))
+	r.log.Debug("video interest updated",
+		"wanted", len(want), "small", len(lowWant), "participants", len(remotes))
 }
 
 // wantsVideo reports whether a participant's video should be subscribed.
@@ -342,6 +351,15 @@ func (r *Room) wantsVideo(id string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.videoWantAll || r.videoWant[id]
+}
+
+// wantsLowLayer reports whether the smaller encoding is enough for the tile
+// this participant will be drawn in. False before the frontend has said
+// anything, so the default stays the full picture.
+func (r *Room) wantsLowLayer(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.videoLowWant[id]
 }
 
 // watchRoom opens the SUBSCRIBE_NAMESPACE that reports participants

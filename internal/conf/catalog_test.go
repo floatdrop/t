@@ -13,7 +13,7 @@ import (
 func TestCatalogCarriesTheVersion(t *testing.T) {
 	video := &bridge.TrackConfig{Kind: "video", Codec: "avc1.42E01F", Width: 1280, Height: 720}
 
-	cat, err := buildCatalog("alice", "0.3.0", video, nil)
+	cat, err := buildCatalog("alice", "0.3.0", video, nil, nil)
 	if err != nil {
 		t.Fatalf("buildCatalog: %v", err)
 	}
@@ -38,7 +38,7 @@ func TestCatalogCarriesTheVersion(t *testing.T) {
 func TestCatalogWithoutVersion(t *testing.T) {
 	audio := &bridge.TrackConfig{Kind: "audio", Codec: "opus", SampleRate: 48000, Channels: 1}
 
-	cat, err := buildCatalog("bob", "", nil, audio)
+	cat, err := buildCatalog("bob", "", nil, nil, audio)
 	if err != nil {
 		t.Fatalf("buildCatalog: %v", err)
 	}

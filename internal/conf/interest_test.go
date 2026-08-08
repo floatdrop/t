@@ -67,7 +67,7 @@ func TestVideoInterestDropsWhatIsNotOnScreen(t *testing.T) {
 	}
 
 	// Everyone scrolled off screen.
-	bob.SetVideoInterest(nil)
+	bob.SetVideoInterest(nil, nil)
 
 	waitFor(t, "the video subscription to be dropped", 10*time.Second, func() bool {
 		return bobRec.retired(video.Handle)
@@ -78,7 +78,7 @@ func TestVideoInterestDropsWhatIsNotOnScreen(t *testing.T) {
 	}
 
 	// Scrolled back.
-	bob.SetVideoInterest([]string{alice.State().ID})
+	bob.SetVideoInterest([]string{alice.State().ID}, nil)
 
 	waitFor(t, "the video subscription to come back", 10*time.Second, func() bool {
 		again, ok := bobRec.trackFor("video")
@@ -94,7 +94,7 @@ func TestDecliningVideoIsNotAFailedSubscription(t *testing.T) {
 	_, bob, bobRec := alicePublishing(t, "interest2")
 
 	video, _ := bobRec.trackFor("video")
-	bob.SetVideoInterest(nil)
+	bob.SetVideoInterest(nil, nil)
 	waitFor(t, "the video subscription to be dropped", 10*time.Second, func() bool {
 		return bobRec.retired(video.Handle)
 	})
@@ -150,7 +150,7 @@ func TestVisibilityGatingCutsInboundBitrate(t *testing.T) {
 	everyone := inboundKbps(sampler, window)
 
 	// One of the two tiles scrolled off screen.
-	bob.SetVideoInterest([]string{alice.State().ID})
+	bob.SetVideoInterest([]string{alice.State().ID}, nil)
 	time.Sleep(time.Second) // let the subscription actually go away
 
 	oneVisible := inboundKbps(sampler, window)
@@ -177,7 +177,7 @@ func TestRosterReportsWhatIsPublishedNotWhatIsSubscribed(t *testing.T) {
 	alice, bob, bobRec := alicePublishing(t, "interest3")
 
 	video, _ := bobRec.trackFor("video")
-	bob.SetVideoInterest(nil)
+	bob.SetVideoInterest(nil, nil)
 	waitFor(t, "the video subscription to be dropped", 10*time.Second, func() bool {
 		return bobRec.retired(video.Handle)
 	})
@@ -191,4 +191,87 @@ func TestRosterReportsWhatIsPublishedNotWhatIsSubscribed(t *testing.T) {
 		}
 		return false
 	})
+}
+
+// simulcastPublisher declares both video encodings at sizes a test can tell
+// apart, plus audio.
+func simulcastPublisher(t *testing.T, addr, room, nickname string) *Room {
+	t.Helper()
+	r, _ := joinRoom(t, addr, room, nickname)
+	for _, cfg := range []*bridge.TrackConfig{
+		{Kind: "video", Codec: "avc1.42e01f", Width: 1280, Height: 720},
+		{Kind: KindVideoLow, Codec: "avc1.42e01f", Width: 640, Height: 360},
+		{Kind: "audio", Codec: "opus", SampleRate: 48000, Channels: 1},
+	} {
+		if err := r.DeclareTrack(cfg); err != nil {
+			t.Fatalf("declare %s: %v", cfg.Kind, err)
+		}
+	}
+	return r
+}
+
+// A tile is only as big as the grid draws it, and the publisher cannot know
+// how big that is — it sizes its encoders from its own window, which is not
+// the one the picture lands in. So the subscriber chooses, and choosing is
+// only possible if both encodings are offered and told apart.
+func TestSubscriberTakesTheLayerItsTileCanUse(t *testing.T) {
+	relayServer := startRelay(t)
+	addr := relayServer.Addr()
+
+	alice := simulcastPublisher(t, addr, "layers", "alice")
+	bob, bobRec := joinRoom(t, addr, "layers", "bob")
+
+	waitFor(t, "bob to take the full picture by default", 10*time.Second, func() bool {
+		v, ok := bobRec.trackFor("video")
+		return ok && v.Config.Width == 1280
+	})
+	full, _ := bobRec.trackFor("video")
+
+	// The tile turns out to be a thumbnail.
+	bob.SetVideoInterest([]string{alice.State().ID}, []string{alice.State().ID})
+
+	waitFor(t, "bob to move to the smaller encoding", 10*time.Second, func() bool {
+		v, ok := bobRec.trackFor("video")
+		return ok && v.Config.Width == 640
+	})
+	small, _ := bobRec.trackFor("video")
+	if small.Handle == full.Handle {
+		t.Error("the layer changed without a fresh handle, so the frontend " +
+			"would keep decoding the old one into the same sink")
+	}
+
+	// Expanded back to full size.
+	bob.SetVideoInterest([]string{alice.State().ID}, nil)
+	waitFor(t, "bob to move back to the full picture", 10*time.Second, func() bool {
+		v, ok := bobRec.trackFor("video")
+		return ok && v.Config.Width == 1280
+	})
+}
+
+// A publisher on an older build offers one video track and no small layer.
+// Wanting the small one has to fall back to what exists, because the
+// alternative is a permanently blank tile for a peer who is publishing
+// perfectly well.
+func TestWantingASmallLayerNobodyOffersFallsBack(t *testing.T) {
+	relayServer := startRelay(t)
+	addr := relayServer.Addr()
+
+	alice := publisherWithBothTracks(t, addr, "fallback", "alice")
+	bob, bobRec := joinRoom(t, addr, "fallback", "bob")
+	waitFor(t, "bob to subscribe", 10*time.Second, func() bool {
+		_, tracks, _, _ := bobRec.snapshot()
+		return len(tracks) == 2
+	})
+
+	bob.SetVideoInterest([]string{alice.State().ID}, []string{alice.State().ID})
+	time.Sleep(time.Second)
+
+	if _, ok := bobRec.trackFor("video"); !ok {
+		t.Fatal("no video subscription at all")
+	}
+	_, _, _, errs := bobRec.snapshot()
+	if len(errs) > 0 {
+		t.Errorf("asking for a layer the publisher does not offer was reported "+
+			"as a failure: %v", errs)
+	}
 }

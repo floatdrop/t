@@ -9,7 +9,7 @@
   import { bridge } from '../lib/bridge';
   import { ICON_SIZE } from '../lib/icons';
   import { buildInviteLink, copyText } from '../lib/invite';
-  import { GRID_GAP, GRID_PADDING, tileColumns } from '../lib/layout';
+  import { GRID_GAP, GRID_PADDING, tileColumns, tileWidth } from '../lib/layout';
   import { store } from '../lib/session.svelte';
   import DeviceMenu from './DeviceMenu.svelte';
   import VideoTile from './VideoTile.svelte';
@@ -156,6 +156,14 @@
    */
   const INTEREST_SETTLE_MS = 250;
 
+  /**
+   * The device-pixel width at or below which a publisher's smaller encoding is
+   * enough. The bottom rung of the ladder is 640 wide, so a tile drawn no
+   * larger than that gains nothing from the full picture — it would be scaled
+   * back down to this before anyone saw it.
+   */
+  const SMALL_TILE_WIDTH = 640;
+
   let gridEl = $state<HTMLDivElement | undefined>();
 
   /**
@@ -190,7 +198,20 @@
           else visible.delete(id);
         }
         clearTimeout(settle);
-        settle = setTimeout(() => store.setVideoInterest([...visible]), INTEREST_SETTLE_MS);
+        settle = setTimeout(() => {
+          const wanted = [...visible];
+          // Which layer, measured rather than assumed: a tile is only as big
+          // as the grid draws it, and asking for the full picture to paint it
+          // into a thumbnail spends bitrate on pixels that are scaled away
+          // before anyone sees them. The publisher cannot make this call — it
+          // sizes its encoders from its own window, which is not the one the
+          // picture lands in.
+          const width = root.clientWidth
+            ? tileWidth(remotes.length + 1, root.clientWidth) * Math.min(devicePixelRatio, 2)
+            : 0;
+          const low = width > 0 && width <= SMALL_TILE_WIDTH ? wanted : [];
+          store.setVideoInterest(wanted, low);
+        }, INTEREST_SETTLE_MS);
       },
       { root, rootMargin: INTEREST_MARGIN, threshold: 0 },
     );

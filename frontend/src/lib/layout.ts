@@ -68,6 +68,32 @@ export interface AutoVideoInput {
  * The floor is the bottom rung whatever either says: 360p is where a face stops
  * being a face, and no arrangement of the grid is worth going below it.
  */
+/**
+ * What Auto will actually spend on the rung it picked.
+ *
+ * Choosing the size is only half of following the grid. A rung is chosen
+ * because it is as much picture as the tile can show — but the bitrate is the
+ * user's, chosen once for the call, and spending all of it on a tile that came
+ * down to 360p buys nothing: past a point more bits on a small picture are
+ * simply a cleaner small picture, and the budget would be better left unspent
+ * on a link that is now carrying several streams instead of one. This is the
+ * same waste the rung avoids, counted in bits rather than pixels.
+ *
+ * The ceiling is the next rung's minBitrate, which is already the number that
+ * says where this size stops being the right one to ask for: with more than
+ * that to spend, a bigger picture would be the better use of it — and Auto has
+ * already established there is no room for a bigger picture. So the budget is
+ * capped there rather than cut to this rung's own minimum, which is the point
+ * where the size stops being worth asking for at all, not what it deserves.
+ *
+ * The top rung has nothing above it and so no ceiling: 1080p is as far as this
+ * goes, and whatever was selected is spent on it.
+ */
+export function autoVideoBitrate(rung: VideoRung, selected: number): number {
+  const next = VIDEO_LADDER[VIDEO_LADDER.findIndex((r) => r.width === rung.width) + 1];
+  return next ? Math.min(selected, next.minBitrate) : selected;
+}
+
 export function autoVideoRung(input: AutoVideoInput): VideoRung {
   const wanted =
     tileWidth(input.tiles, input.viewportWidth) * Math.min(input.pixelRatio, MAX_PIXEL_RATIO);

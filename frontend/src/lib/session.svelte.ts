@@ -20,7 +20,7 @@ import {
   type VideoSettings,
   type VideoSource,
 } from './capture';
-import { autoVideoRung } from './layout';
+import { autoVideoBitrate, autoVideoRung } from './layout';
 import { playback, type PlaybackStats } from './playback';
 import type {
   InviteMessage,
@@ -512,8 +512,8 @@ class Store {
     // capture layer is given. Nothing below this point knows the difference,
     // so a size that changed because someone joined rebuilds the pipeline by
     // exactly the same path as one that was picked by hand.
-    const picked =
-      this.media.resolution === RESOLUTION_AUTO ? this.autoResolution : this.media.resolution;
+    const auto = this.media.resolution === RESOLUTION_AUTO;
+    const picked = auto ? this.autoResolution : this.media.resolution;
     const [width, height] = picked.split('x').map(Number);
     return {
       source: 'camera',
@@ -521,7 +521,11 @@ class Store {
       width,
       height,
       framerate: defaultVideoSettings.framerate,
-      bitrate: this.media.videoBitrate,
+      // Auto caps the budget to the size it settled on; a size chosen by hand
+      // is an instruction and spends what was selected.
+      bitrate: auto
+        ? autoVideoBitrate(this.#autoRung, this.media.videoBitrate)
+        : this.media.videoBitrate,
     };
   }
 

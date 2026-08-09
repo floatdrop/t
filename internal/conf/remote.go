@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/floatdrop/moq-go/pkg/moqt/loc"
@@ -267,6 +268,11 @@ type remoteTrack struct {
 	backfilled   chan struct{}
 	backfillOnce sync.Once
 	label        string
+	// delivered is the newest timestamp handed to the frontend on this handle,
+	// so the backfill can tell whether it still has anything to contribute.
+	// Atomic because the live path writes it from a stream goroutine while the
+	// FETCH reads it from its own.
+	delivered atomic.Uint64
 
 	// groupsMu guards groups, which holds one reassembler per group currently
 	// in flight — keyed by Group ID, entered by every subgroup stream of that
@@ -1135,7 +1141,9 @@ func (r *remote) readMediaFetch(
 			return cmp.Compare(a.Timestamp, b.Timestamp)
 		})
 		for i := range pending {
-			r.room.sink.SendMedia(&pending[i])
+			if !r.deliverBackfilled(track, &pending[i]) {
+				return
+			}
 		}
 	}()
 
@@ -1172,8 +1180,39 @@ func (r *remote) readMediaFetch(
 			pending = append(pending, frame)
 			continue
 		}
-		r.room.sink.SendMedia(&frame)
+		if !r.deliverBackfilled(track, &frame) {
+			return
+		}
 	}
+}
+
+// deliverBackfilled forwards one backfilled frame unless the live path has
+// already moved past it, and reports whether the backfill is still worth
+// draining.
+//
+// The backfill exists to fill the group in progress in *front* of the live
+// edge, and awaitBackfill holds the live path back so that it can. Under a
+// bottleneck it loses that race: a whole group cannot cross in the time the
+// gate allows, live frames go first, and what the FETCH eventually delivers is
+// a frame the decoder is already past. Measured against a real relay behind a
+// 32 kB/s link, every inversion over half a second was one of these, all of
+// them in a subscription's opening seconds and none after.
+//
+// Handing them over anyway is the worst of the options: a decoder fed a frame
+// older than one it has decoded either errors or emits a picture presentation
+// will discard as stale, and either way the tile is no better for it. So the
+// race is conceded rather than papered over — the frames are dropped, and the
+// rest of the fetch with them, since a FETCH answers in order and nothing after
+// this can be newer than the live edge either.
+func (r *remote) deliverBackfilled(track *remoteTrack, frame *bridge.MediaFrame) bool {
+	if live := track.delivered.Load(); live > 0 && frame.Timestamp <= live {
+		r.log.Debug("backfill lost the race with the live edge",
+			"handle", track.handle, "frame", frame.Timestamp, "live", live)
+		return false
+	}
+	track.advance(frame.Timestamp)
+	r.room.sink.SendMedia(frame)
+	return true
 }
 
 // dropTrack closes one media subscription and tells the frontend to
@@ -1283,8 +1322,22 @@ func (r *remote) readMedia(
 		// subgroup numbers its objects from its own base, so an ID orders a
 		// stream against itself and nothing else. See reorder.go.
 		reassembler.Push(subgroup, emissionIndex(obj.ObjectID, decoded.Properties), func() {
+			track.advance(frame.Timestamp)
 			r.room.sink.SendMedia(&frame)
 		})
+	}
+}
+
+// advance records a frame as delivered, keeping the newest timestamp this
+// handle has reached. Only ever forwards: the live path can deliver a group out
+// of order relative to another group, and the high-water mark is what the
+// backfill needs, not the last thing that happened to go out.
+func (t *remoteTrack) advance(timestamp uint64) {
+	for {
+		was := t.delivered.Load()
+		if timestamp <= was || t.delivered.CompareAndSwap(was, timestamp) {
+			return
+		}
 	}
 }
 

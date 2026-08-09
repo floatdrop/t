@@ -23,8 +23,24 @@ import {
 import { DENOISE_FRAME, Denoiser, type VoiceState } from './denoise';
 import { addTapModule, watchAudioContext, type TapBlock } from './worklets';
 
-/** Seconds between forced keyframes — also the video group length. */
-const KEYFRAME_INTERVAL_SEC = 2;
+/**
+ * Seconds between forced keyframes — also the video group length.
+ *
+ * It is what a subscriber waits before its first picture, because a decoder
+ * cannot start on a delta frame. That used to be covered by a FETCH replaying
+ * the group in progress; the FETCH is gone, so this is the wait, and one
+ * second is a tile that appears rather than one that is missing.
+ *
+ * It is also how much a lost group costs, which is the other half of the
+ * argument: a group is all-or-nothing to a decoder, so halving its length
+ * halves the damage of losing one.
+ *
+ * The price is keyframes being a larger share of the stream — at 30 fps and
+ * roughly four delta frames to a keyframe, about six per cent of the bitrate
+ * moves from deltas to keyframes. That is the cheaper side of this trade for
+ * a call, where a blank tile is noticed and a slightly softer picture is not.
+ */
+const KEYFRAME_INTERVAL_SEC = 1;
 
 /**
  * The SVC mode the primary video encoding is configured with.

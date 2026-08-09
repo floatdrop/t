@@ -1,15 +1,12 @@
 package conf
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"slices"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/floatdrop/moq-go/pkg/moqt/loc"
@@ -78,14 +75,6 @@ const maxLag = 1500 * time.Millisecond
 // backfilled group; doing it every second would spend more of the link on
 // recovering than on media.
 const resyncCooldown = 15 * time.Second
-
-// backfillBlind is how long the drift meter stops measuring after a backfill.
-//
-// A backfilled group is a couple of seconds of video arriving at once, which
-// delays the audio the meter is fed from — real contention, but caused by this
-// client and over in a moment, so it says nothing about what the path can
-// carry. Long enough to cover the burst and the queue it leaves behind.
-const backfillBlind = 4 * time.Second
 
 // audioRebuildCooldown is the shortest gap between rebuilding audio after the
 // relay has refused it. Audio is never demoted — there is nothing smaller and
@@ -241,16 +230,7 @@ type remoteTrack struct {
 	// config is what the publisher declared.
 	config bridge.TrackConfig
 	sub    *session.Subscription
-	// fetch is the joining FETCH that backfilled the group in progress when
-	// this track was subscribed. Nil on audio, and on video whose backfill was
-	// refused.
-	fetch *session.FetchRequest
-	label string
-	// delivered is the newest timestamp handed to the frontend on this handle,
-	// so the backfill can tell whether it still has anything to contribute.
-	// Atomic because the live path writes it from a stream goroutine while the
-	// FETCH reads it from its own.
-	delivered atomic.Uint64
+	label  string
 
 	// groupsMu guards groups, which holds one reassembler per group currently
 	// in flight — keyed by Group ID, entered by every subgroup stream of that
@@ -923,201 +903,16 @@ func (r *remote) subscribeTrack(
 		// was long enough to time tests out. A congested link is exactly where
 		// that trip is slowest and where audio can least afford to queue behind
 		// a picture.
-		go r.backfillGroup(subMsg.RequestID, track, counter)
 	}
 	return nil
-}
-
-// backfillGroup asks for the group already in progress, so a fresh video
-// subscription has a picture now rather than at the next keyframe.
-//
-// A SUBSCRIBE with the largest-object filter starts at the first object *after*
-// whatever exists, which for video is the middle of a GOP — undecodable, since
-// playback discards inbound frames until it sees a keyframe. So a new
-// subscription showed nothing at all until the publisher's next keyframe, up to
-// the whole keyframe interval away, and there is no way to ask a remote
-// publisher to produce one sooner. Every layer change, every demotion and every
-// tile scrolled back into view paid that.
-//
-// The Relative Joining FETCH (§10.12.2) with JoiningStart=0 resolves to
-// {largest.Group, 0} through {largest.Group, largest.Object + 1} — the current
-// group from its keyframe up to exactly where the subscription begins. The two
-// ranges are adjacent: no object arrives twice and none is skipped. It is the
-// same pairing the catalog subscription has always used.
-//
-// Video only. The same backfill on audio would deliver up to half a second of
-// sound that has already been and gone, straight into a player whose whole job
-// is staying near the live edge.
-func (r *remote) backfillGroup(
-	subscribeID uint64,
-	track *remoteTrack,
-	counter *telemetry.TrackCounter,
-) {
-	fetchMsg := &message.Fetch{
-		FetchType: message.FetchTypeRelativeJoining,
-		Joining: &message.JoiningFetch{
-			JoiningRequestID: subscribeID,
-			JoiningStart:     0,
-		},
-		// Not what makes the ordering correct, and a priority could not be: it
-		// is a scheduling hint, and two streams read by two goroutines can
-		// interleave at the receiver whatever order they were sent in. What
-		// settles the race is deliverBackfilled — whichever reaches the
-		// frontend first wins, and the loser is dropped.
-		//
-		// Level with live video is still where this belongs — it is the same
-		// pictures and they are needed first — but see the priority constants:
-		// nothing acts on any of them on either transport available here.
-		Parameters: message.Parameters{
-			message.SubscriberPriorityParam(videoPriority),
-		},
-	}
-	fetch, err := r.room.sess.Fetch(r.ctx, fetchMsg)
-	if err != nil {
-		// Degraded, not fatal: without it the tile stays blank until the next
-		// keyframe, which is exactly what it did before this existed.
-		r.log.Debug("video backfill FETCH refused", "handle", track.handle, "err", err)
-		return
-	}
-
-	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		fetch.Close()
-		return
-	}
-	track.fetch = fetch
-	r.mu.Unlock()
-
-	// The audio meter, not this track's: drift is measured on audio, and audio
-	// is what this burst is about to get in the way of.
-	r.room.counters.
-		Track(telemetry.InPrefix+r.id+"/"+AudioTrack).
-		SuspendSkew(time.Now(), backfillBlind)
-
-	r.room.router.HandleFetch(fetchMsg.RequestID, func(s *session.IncomingFetchStream) {
-		r.readMediaFetch(s, track, counter)
-	})
-}
-
-// readMediaFetch drains a backfilled group, forwarding it exactly as the live
-// path does.
-func (r *remote) readMediaFetch(
-	s *session.IncomingFetchStream,
-	track *remoteTrack,
-	counter *telemetry.TrackCounter,
-) {
-	// However this ends — delivered, refused, reset — the live stream stops
-	// waiting on it here.
-	// A FETCH answers in object-ID order, which is decode order only while a
-	// group is on one subgroup. Layered, each subgroup owns its own ID range
-	// (see layerObjectStride), so the answer arrives as the whole base layer
-	// followed by the whole enhancement layer — every enhancement frame after
-	// every frame it sits between. Ordering it means having all of it, which is
-	// affordable precisely here: a backfill is one group, and the live path is
-	// already waiting for the last of it before it delivers anything.
-	//
-	// Only when there is something to order. An unlayered track streams out as
-	// it arrives, exactly as it did before.
-	layered := track.config.TemporalLayers > 1
-	var pending []bridge.MediaFrame
-	defer func() {
-		slices.SortStableFunc(pending, func(a, b bridge.MediaFrame) int {
-			return cmp.Compare(a.Timestamp, b.Timestamp)
-		})
-		for i := range pending {
-			if !r.deliverBackfilled(track, &pending[i]) {
-				return
-			}
-		}
-	}()
-
-	counter.AddGroup()
-	for {
-		obj, err := s.ReadDecoded()
-		if err != nil {
-			if !errors.Is(err, io.EOF) && r.ctx.Err() == nil {
-				r.log.Debug("video backfill ended", "handle", track.handle, "err", err)
-			}
-			return
-		}
-		// §11.4.4.2 absence markers carry no payload.
-		if obj.EndOfNonExistentRange || obj.EndOfUnknownRange {
-			continue
-		}
-
-		decoded, err := loc.Decode(obj.Properties, obj.Payload)
-		if err != nil {
-			r.log.Warn("LOC decode failed in backfill", "handle", track.handle, "err", err)
-			continue
-		}
-
-		counter.AddObject(len(decoded.Payload))
-		frame := bridge.MediaFrame{
-			Kind:      track.kind,
-			Handle:    track.handle,
-			Timestamp: scaleTimestamp(decoded.Properties),
-			KeyFrame:  obj.ObjectID == 0,
-			Config:    decoded.Properties.VideoConfig,
-			Payload:   decoded.Payload,
-		}
-		if layered {
-			pending = append(pending, frame)
-			continue
-		}
-		if !r.deliverBackfilled(track, &frame) {
-			return
-		}
-	}
-}
-
-// deliverBackfilled forwards one backfilled frame unless the live path has
-// already moved past it, and reports whether the backfill is still worth
-// draining.
-//
-// The backfill fills the group in progress in *front* of the live edge, and a
-// gate used to hold the live path back so that it could. Under a bottleneck the
-// gate lost anyway — a whole group cannot cross in the three seconds it allowed
-// — and then it gave up and let live through, so all it bought was a delay
-// before the same race was decided the same way. Measured against a real relay
-// behind a 32 kB/s link, every inversion over half a second was a backfill
-// arriving after that, all in a subscription's opening seconds and none after.
-//
-// So there is no gate. Whichever path reaches the frontend first wins, which is
-// what the backfill always was: a race it may lose.
-//
-// Handing them over anyway is the worst of the options: a decoder fed a frame
-// older than one it has decoded either errors or emits a picture presentation
-// will discard as stale, and either way the tile is no better for it. So the
-// race is conceded rather than papered over — the frames are dropped, and the
-// rest of the fetch with them, since a FETCH answers in order and nothing after
-// this can be newer than the live edge either.
-func (r *remote) deliverBackfilled(track *remoteTrack, frame *bridge.MediaFrame) bool {
-	if live := track.delivered.Load(); live > 0 && frame.Timestamp <= live {
-		r.log.Debug("backfill lost the race with the live edge",
-			"handle", track.handle, "frame", frame.Timestamp, "live", live)
-		return false
-	}
-	track.advance(frame.Timestamp)
-	r.room.sink.SendMedia(frame)
-	return true
 }
 
 // dropTrack closes one media subscription and tells the frontend to
 // retire its decoder.
 func (r *remote) dropTrack(slot **remoteTrack) {
-	// The fetch is read under the same lock that backfillGroup writes it
-	// under: that now runs on its own goroutine, so a track dropped while its
-	// backfill is still being set up would otherwise race the assignment and
-	// leave the FETCH open — still delivering a whole group to a handle the
-	// frontend has been told to retire.
 	r.mu.Lock()
 	track := *slot
 	*slot = nil
-	var fetch *session.FetchRequest
-	if track != nil {
-		fetch = track.fetch
-	}
 	r.mu.Unlock()
 	if track == nil {
 		return
@@ -1128,9 +923,6 @@ func (r *remote) dropTrack(slot **remoteTrack) {
 	track.dropGroups()
 
 	track.sub.Close()
-	if fetch != nil {
-		fetch.Close()
-	}
 	r.room.counters.Forget(track.label)
 	r.room.sink.SendControl(&bridge.ServerMessage{
 		Type:      bridge.MsgTrackGone,
@@ -1207,22 +999,8 @@ func (r *remote) readMedia(
 		// subgroup numbers its objects from its own base, so an ID orders a
 		// stream against itself and nothing else. See reorder.go.
 		reassembler.Push(subgroup, emissionIndex(obj.ObjectID, decoded.Properties), func() {
-			track.advance(frame.Timestamp)
 			r.room.sink.SendMedia(&frame)
 		})
-	}
-}
-
-// advance records a frame as delivered, keeping the newest timestamp this
-// handle has reached. Only ever forwards: the live path can deliver a group out
-// of order relative to another group, and the high-water mark is what the
-// backfill needs, not the last thing that happened to go out.
-func (t *remoteTrack) advance(timestamp uint64) {
-	for {
-		was := t.delivered.Load()
-		if timestamp <= was || t.delivered.CompareAndSwap(was, timestamp) {
-			return
-		}
 	}
 }
 

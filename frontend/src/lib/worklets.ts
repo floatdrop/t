@@ -73,21 +73,17 @@ registerProcessor('pcm-tap', PCMTap);
 `;
 
 /**
- * pcm-player plays decoded audio from a ring buffer the main thread fills,
- * and reports what it is currently playing so video can be synchronised to
- * it.
+ * pcm-player plays decoded audio from a ring buffer the main thread fills.
  *
  * A ring buffer rather than scheduling AudioBufferSourceNodes because
  * decoded Opus arrives every 20 ms: hundreds of one-shot nodes per minute
  * per participant would both allocate heavily and click at every seam.
  * Underrun outputs silence and is counted, so the debug panel can show it.
  *
- * The playout clock needs only one scalar. Buffered audio is contiguous, so
- * the timestamp of the sample about to be *heard* is the timestamp of the
- * sample about to be *written* minus everything still queued. A gap — a lost
- * packet — breaks that assumption, so an incoming chunk that does not
- * continue the previous one resets the reference instead of mis-dating every
- * sample after it.
+ * It keeps a write timestamp only to notice a discontinuity: a chunk that does
+ * not continue the previous one resets the reference rather than being packed
+ * on as though it did. Nothing outside reads it — video used to be scheduled
+ * against a playout clock derived from it, and no longer is.
  */
 const PLAYER_SOURCE = `
 // Two seconds at 48 kHz. Large enough to absorb network jitter, small
@@ -138,10 +134,16 @@ const TRIM_TO = 5760;     // 120 ms, twice the preroll
 // treated as a new reference rather than a continuation.
 const RESYNC_US = 5000;
 
-// How often to report the playout clock, in render quanta. Eight quanta at
-// 48 kHz is about 21 ms — often enough for a 60 Hz render loop to interpolate
-// between reports without noticeable error.
-const REPORT_EVERY = 8;
+// How often to report buffer counters, in render quanta.
+//
+// It used to be eight — about 21 ms — because a render loop interpolated
+// between reports to schedule video against the playout clock. Nothing is
+// scheduled against it any more; the only reader left is a debug panel
+// sampling a few times a second, and forty-seven messages a second per remote
+// participant onto the main thread for that is a cost with nothing on the
+// other side of it. Sixty-four quanta is about 170 ms, which no panel can tell
+// from live.
+const REPORT_EVERY = 64;
 
 class PCMPlayer extends AudioWorkletProcessor {
   constructor() {
@@ -182,7 +184,6 @@ class PCMPlayer extends AudioWorkletProcessor {
       underruns: this.underruns,
       trimmed: this.trimmed,
       trimmedFrom: this.trimmedFrom,
-      playing: this.playing,
     });
   }
 
@@ -199,9 +200,7 @@ class PCMPlayer extends AudioWorkletProcessor {
   }
 
   // Drops the oldest audio when too much has queued, which is the only thing
-  // that actually shortens the queue. The playout clock needs no correction:
-  // it is derived from what is still buffered, so skipping ahead in the buffer
-  // is skipping ahead in time, and the video scheduled against it follows.
+  // that actually shortens the queue.
   trim() {
     if (this.available <= MAX_BUFFER) return;
     const drop = this.available - TRIM_TO;
@@ -282,8 +281,6 @@ export interface PlayerReport {
    * the only part worth logging.
    */
   trimmedFrom: number;
-  /** False while prerolling or after a starve, when the clock is not moving. */
-  playing: boolean;
 }
 
 /** What pcm-player expects on its port. */

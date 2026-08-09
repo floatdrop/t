@@ -298,7 +298,4 @@
 
   /* The one badge that is not neutral information: video this client had to
      give up on entirely, which otherwise reads as a camera that is off. */
-  .badge.warn {
-    color: var(--warn);
-  }
 </style>

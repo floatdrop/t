@@ -1095,8 +1095,23 @@ func (r *remote) demote(track *remoteTrack, code string) {
 
 		r.log.Warn("the relay stopped forwarding audio: we are not keeping up",
 			"handle", track.handle, "code", code, "action", "rebuilding it unchanged")
+
+		r.mu.Lock()
+		video, audio := r.wantVideo, r.wantAudio
+		r.mu.Unlock()
+
+		// Rebuilt here rather than handed to the retry loop. That loop is
+		// guarded by a flag it clears in a defer, after its last check for
+		// anything missing — so a verdict landing in that window found a loop
+		// that had already decided there was nothing to do, and was dropped.
+		// Nothing else would have re-run reconcile: checkLag only fires from
+		// audio streams, which by then do not exist, and a publisher who is
+		// merely talking never republishes their catalog. That participant went
+		// silent for the rest of the call.
 		r.dropTrack(&r.audio)
-		r.scheduleResubscribe()
+		r.applying.Lock()
+		r.reconcile(video, audio)
+		r.applying.Unlock()
 		return
 	}
 
@@ -1161,6 +1176,13 @@ func (r *remote) demote(track *remoteTrack, code string) {
 	r.applying.Unlock()
 
 	if givingUp {
+		// Said out loud. VideoLevel exists so a participant this client gave up
+		// on does not look like one who switched their camera off — and it only
+		// reaches the roster when the roster is republished, which nothing here
+		// used to do. The tile went blank while the roster still reported full
+		// video, which is the pair of disagreeing signals VideoLevel was added
+		// to prevent.
+		r.room.publishParticipants()
 		r.scheduleRecovery()
 	} else {
 		r.scheduleResubscribe()
@@ -1241,6 +1263,10 @@ func (r *remote) recover() {
 	r.applying.Lock()
 	r.reconcile(video, audio)
 	r.applying.Unlock()
+
+	// The roster still says this participant has no video until it is told
+	// otherwise; see the same call on the way down.
+	r.room.publishParticipants()
 }
 
 // checkLag rebuilds this participant's subscriptions when they have slipped too

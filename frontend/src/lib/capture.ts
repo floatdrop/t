@@ -15,7 +15,6 @@ import type { ClientMessage } from './protocol';
 import {
   HANDLE_LOCAL_AUDIO,
   HANDLE_LOCAL_VIDEO,
-  HANDLE_LOCAL_VIDEO_LOW,
   KIND_AUDIO,
   KIND_VIDEO,
   toBase64,
@@ -253,7 +252,6 @@ export interface CaptureStats {
   audioKbps: number;
   /** Packets waiting inside the audio encoder — see MAX_AUDIO_ENCODE_QUEUE. */
   audioEncodeQueue: number;
-  /** Frames the small video layer shed because its encoder was backed up. */
   keyFrames: number;
   dropped: number;
   /** What the browser actually applied to the microphone track. */
@@ -487,7 +485,6 @@ export class Capture {
 
   #video: HTMLVideoElement | null = null;
   #videoEncoder: VideoEncoder | null = null;
-  #lowCtx: OffscreenCanvasRenderingContext2D | null = null;
   #audioEncoder: AudioEncoder | null = null;
   #audioCtx: AudioContext | null = null;
   #tap: AudioWorkletNode | null = null;

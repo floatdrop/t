@@ -81,30 +81,10 @@ const RENDER_STALL_MS = 500;
  */
 const CANVAS_RESIZE_INTERVAL_MS = 500;
 
-/**
- * How long one bitmap conversion may be outstanding before another is allowed.
- *
- * A conversion takes about a millisecond, so this is not a deadline it should
- * ever reach — it is there because "one at a time" was a latch with nothing to
- * release it. A promise that never settles left the flag raised and every
- * frame after it was dropped: not a stutter, a tile frozen for the rest of the
- * call, with data still arriving and every other number healthy. The main
- * thread being blocked — dragging a window is the documented case, and it is
- * the same blockage the presentation loop already keeps a watchdog for — is
- * exactly when a promise is most likely not to come back.
- *
- * So the latch expires. A conversion outstanding longer than this is abandoned
- * rather than waited on, and a later result that arrives after being written
- * off is discarded instead of painting a stale picture over a fresh one.
- */
-const PAINT_STUCK_MS = 250;
 
-/** Picks the best available way to paint into a canvas. See [Painter]. */
+/** The 2D context a tile is drawn into. */
 function painterFor(canvas: HTMLCanvasElement): Painter | null {
-  const bitmap = canvas.getContext('bitmaprenderer');
-  if (bitmap) return { kind: 'bitmap', ctx: bitmap };
-  const two = canvas.getContext('2d');
-  return two ? { kind: '2d', ctx: two } : null;
+  return canvas.getContext('2d');
 }
 
 /** How often to check that the presentation loop is still being called. */
@@ -151,11 +131,6 @@ export interface PlaybackStats {
    * every time and is what a flickering or frozen tile looks like.
    */
   resizes?: number;
-  /**
-   * Video only: frames dropped because a bitmap conversion was still running.
-   * See VideoSink.paintSkipped — expected to be zero.
-   */
-  paintSkipped?: number;
   /** Codec string the decoder was configured with. */
   codec: string;
   /** Video only: frames decoded but not yet painted. */
@@ -173,21 +148,17 @@ export interface PlaybackStats {
 }
 
 /**
- * How a decoded frame reaches a canvas.
+ * How a tile is painted: a 2D context, drawn into synchronously.
  *
- * 'bitmap' is the preferred path: an ImageBitmapRenderingContext takes
- * ownership of an ImageBitmap outright, so the frame is handed over rather
- * than blitted, and the canvas takes its size from the bitmap — no separate
- * resize, and nothing to throttle. It is also the path that avoids drawing a
- * WebCodecs VideoFrame straight into a 2D context, which WebKit has a history
- * of not doing well.
- *
- * '2d' is the fallback for a browser that will not give us the other context,
- * because a slower picture is better than a black one.
+ * There used to be a choice here, preferring an ImageBitmapRenderingContext
+ * on the reasoning that transferring a bitmap beats blitting a frame and that
+ * WebKit has a history of not drawing a WebCodecs VideoFrame into a 2D context
+ * well. It was worth trying and it did not pay: tiles still froze, and the
+ * asynchronous conversion it required brought a latch, an expiry, a sequence
+ * number and a skip counter with it. Measured against the thing it was meant
+ * to fix, it fixed nothing.
  */
-type Painter =
-  | { kind: 'bitmap'; ctx: ImageBitmapRenderingContext }
-  | { kind: '2d'; ctx: CanvasRenderingContext2D };
+type Painter = CanvasRenderingContext2D;
 
 interface VideoSink {
   kind: 'video';
@@ -195,40 +166,6 @@ interface VideoSink {
   decoder: VideoDecoder;
   canvas: HTMLCanvasElement | null;
   painter: Painter | null;
-  /**
-   * Set while a frame is being turned into an ImageBitmap.
-   *
-   * That conversion is asynchronous, and the presentation loop offers a frame
-   * every display refresh whether or not the last one has landed. Without this
-   * two conversions race and the older one can win, putting an older picture
-   * on screen — so a frame offered while one is in flight is dropped instead.
-   * At most one display interval is lost, and the next frame chosen is the
-   * fresher one anyway.
-   */
-  painting: boolean;
-  /** When the outstanding conversion started — see PAINT_STUCK_MS. */
-  paintingSince: number;
-  /**
-   * Which conversion is the current one.
-   *
-   * Bumped for each attempt, so a conversion that was abandoned as stuck and
-   * then resolves late can tell that it has been superseded: it must neither
-   * paint its stale frame nor clear the flag belonging to the attempt that
-   * replaced it.
-   */
-  paintSeq: number;
-  /**
-   * Frames dropped because a bitmap conversion was still in flight.
-   *
-   * The conversion is asynchronous and the presentation loop offers a frame
-   * every display refresh, so one that arrives while the last is still being
-   * converted is discarded rather than queued behind it. Expected to be zero,
-   * or near it, because a conversion should finish inside a display interval —
-   * a number that climbs with the frame count means this path is the thing
-   * limiting the picture, which is otherwise invisible: the tile simply runs
-   * at half the rate it is being sent.
-   */
-  paintSkipped: number;
   /** Latest decoded frame, held until a canvas is attached to paint it. */
   pending: VideoFrame | null;
   /** H.264 cannot start on a delta frame; gate until the first keyframe. */
@@ -419,10 +356,6 @@ export class Playback {
       painter: null,
       pending: null,
       sawKeyFrame: false,
-      painting: false,
-      paintingSince: 0,
-      paintSeq: 0,
-      paintSkipped: 0,
       decoded: 0,
       dropped: 0,
       lastResizeMs: 0,
@@ -901,52 +834,28 @@ export class Playback {
       }
     }
 
-    if (painter.kind === 'bitmap') {
-      const now = performance.now();
-      // One conversion at a time, but not for ever — see PAINT_STUCK_MS.
-      if (sink.painting && now - sink.paintingSince < PAINT_STUCK_MS) {
-        sink.paintSkipped++;
-        frame.close();
-        return;
-      }
-      if (sink.painting) {
-        this.#paintStuck(sink, now - sink.paintingSince);
-      }
-
-      const seq = ++sink.paintSeq;
-      sink.painting = true;
-      sink.paintingSince = now;
-
-      createImageBitmap(frame)
-        .then((bitmap) => {
-          // Superseded while in flight, or the canvas has gone — a tile
-          // unmounted, a layer switched. Either way this bitmap must not be
-          // painted, and one that is not transferred has to be released by
-          // hand.
-          if (seq === sink.paintSeq && sink.painter?.kind === 'bitmap') {
-            // Takes ownership of the bitmap rather than copying out of it.
-            sink.painter.ctx.transferFromImageBitmap(bitmap);
-          } else {
-            bitmap.close();
-          }
-        })
-        .catch((err: unknown) => this.#paintFailed(sink, err))
-        .finally(() => {
-          // Only the current attempt owns the flag. An abandoned one that
-          // finally comes back must not release a conversion still running.
-          if (seq === sink.paintSeq) sink.painting = false;
-          frame.close();
-        });
-      return;
-    }
-
     try {
+      // Drawn straight from the decoder's frame, synchronously, in this tick.
+      //
+      // There used to be a bitmaprenderer path here: convert to an ImageBitmap
+      // and transfer that into the canvas, which is the faster of the two on
+      // paper. It was reached asynchronously, so it needed a one-at-a-time
+      // latch, an expiry for when the promise never came back, a sequence
+      // number so an abandoned conversion could not paint over a fresh one,
+      // and a counter for the frames it dropped meanwhile — four mechanisms
+      // whose shared failure was a frozen tile. It did not stop tiles
+      // freezing, so what it bought did not cover what it cost.
+      //
+      // Synchronous drawing has no such states: the frame is drawn and closed
+      // in the same tick, which is also what makes its lifetime obvious rather
+      // than a question about which conversion won a race.
+      //
       // Scaled to whatever the backing store currently is, rather than drawn
       // at the frame's own size. They are the same whenever the resize above
       // was taken, and while one is being held this is what keeps the picture
       // filling the tile instead of being cropped into a canvas that has not
       // caught up yet.
-      painter.ctx.drawImage(frame, 0, 0, sink.canvas.width, sink.canvas.height);
+      painter.drawImage(frame, 0, 0, sink.canvas.width, sink.canvas.height);
     } catch (err) {
       this.#paintFailed(sink, err);
     } finally {
@@ -954,24 +863,6 @@ export class Playback {
     }
   }
 
-  /**
-   * Reports a canvas that will not take a frame, once.
-   *
-   * Left in the devtools console this was invisible to the app, and what it
-   * produces — a tile frozen on its last picture — is indistinguishable from
-   * every other reason a tile stops moving. Latched, because a failure that
-   * repeats at the frame rate would bury the log.
-   */
-  /** Reports a conversion abandoned for taking too long, once. */
-  #paintStuck(sink: VideoSink, heldMs: number): void {
-    if (sink.paintFailed) return;
-    sink.paintFailed = true;
-    bridge.report('WARN', 'a frame conversion did not come back; going on without it', {
-      participant: sink.track.participant,
-      handle: String(sink.track.handle),
-      heldMs: String(Math.round(heldMs)),
-    });
-  }
 
   #paintFailed(sink: VideoSink, err: unknown): void {
     if (sink.paintFailed) return;
@@ -979,7 +870,6 @@ export class Playback {
     bridge.report('WARN', 'canvas would not accept a decoded frame', {
       participant: sink.track.participant,
       handle: String(sink.track.handle),
-      painter: sink.painter?.kind ?? 'none',
       err: String(err),
     });
   }
@@ -1027,7 +917,6 @@ export class Playback {
         row.width = sink.width;
         row.height = sink.height;
         row.resizes = sink.resizes;
-        row.paintSkipped = sink.paintSkipped;
         row.queued = sink.queue.length;
       }
       if (sink.kind === 'audio') {

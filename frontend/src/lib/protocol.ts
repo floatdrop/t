@@ -29,13 +29,6 @@ export const TEMPORAL_LAYER_MASK = 0x3 << TEMPORAL_LAYER_SHIFT;
 /** Handles for the two tracks this frontend publishes. */
 export const HANDLE_LOCAL_VIDEO = 0;
 export const HANDLE_LOCAL_AUDIO = 1;
-/**
- * The second, smaller encoding of the same camera. Its frames are KIND_VIDEO
- * like any other picture — only the handle says which encoding they belong to,
- * and only the publisher ever distinguishes them. A subscriber takes one layer
- * or the other and is told about it as plain video.
- */
-export const HANDLE_LOCAL_VIDEO_LOW = 2;
 
 export interface MediaFrame {
   kind: number;

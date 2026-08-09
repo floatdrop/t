@@ -260,7 +260,6 @@
                 <td>{s.queued ?? '—'}</td>
                 <td>{s.dropped}</td>
                 <td>{s.resizes ?? '—'}</td>
-                <td class={s.paintSkipped ? 'warn' : ''}>{s.paintSkipped ?? '—'}</td>
                 <td>
                   {#if s.buffered !== undefined}
                     {(s.buffered / 48).toFixed(0)} ms

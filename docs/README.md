@@ -189,18 +189,36 @@ capacity: two full seconds between someone speaking and anyone hearing it. So
 audible for the whole call.
 
 The floor was the 60 ms preroll depth until a nine-minute call over a VPN to a
-remote relay was measured: twenty-four trims across two participants, every one
-firing between 253 and 269 ms. The buffer was never running away — it was
-grazing the ceiling and being cut back to a preroll's worth, which is a 190 ms
-hole in the sound each time. Doubling the floor was expected to trade rare
-large gaps for frequent small ones and nothing else. It did not: the same nine
-minutes went from twenty-four trims to seven. The fill is episodic rather than
-a steady drift, so a deeper cushion absorbs bursts before they reach the
-ceiling instead of re-slicing the same total. Two runs on an uncontrolled path,
-so the size of that is not worth trusting — the direction held for both
-participants.
+remote relay was measured: doubling it took twenty-four trims across two
+participants down to seven.
 
-One source of that episodic fill was the bridge itself. Audio and video shared
+The explanation first given for that was wrong, and it is worth recording as
+wrong because it was arithmetic mistaken for evidence. It read the trims as
+"grazing the ceiling", from a depth of 253 to 269 ms at every one, and concluded
+that a deeper cushion was absorbing bursts before they reached the ceiling. But
+`trim` runs after every push and a push is one 20 ms Opus packet, so the depth
+at a trim is confined to (250, 270] ms *whatever* caused it — a 640 ms burst and
+a one-packet creep produce identical numbers. The reasoning is also backwards:
+raising the floor with the ceiling fixed reduces the headroom between them,
+which on its own predicts more trims rather than fewer.
+
+What the floor actually governs is the **underrun** below it. When the buffer
+runs dry the reader stops taking samples until the preroll has rebuilt, so
+nothing drains while the backlog lands — the stall converts into a burst, and
+the trim that follows is the second half of one event rather than a separate
+fault. The floor is therefore how long an upstream stall may last before that
+happens, and doubling it took a whole class of stalls out of the range that
+produces a trim at all. One uncontrolled path, so the size is not worth
+trusting; the direction held for both participants.
+
+A trim now reports the interval that led to it rather than the depth it reached
+— how much audio arrived against how much time passed, and how many underruns
+fell in between — because that is the pair that tells a burst from a stalled
+reader. Underruns are logged too, throttled: they were counted from the
+beginning and never once said out loud, which is why every trim in the logs
+looked unexplained.
+
+One suspected source of episodic fill was the bridge itself. Audio and video shared
 one 256-slot outbound queue to the WebView, so a video backlog both delayed
 sound behind it and evicted sound to make room for itself — and the WebView does
 stop reading, for as long as macOS is resizing its window. Whatever the frontend

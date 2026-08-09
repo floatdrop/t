@@ -112,25 +112,29 @@ const CAPACITY = 96000;
 // audible for the rest of the call. The high-water mark is four times the
 // preroll, so ordinary jitter never reaches it.
 //
-// The floor is not the preroll depth, though it started as it. Measured on a
-// nine-minute call over a VPN to a remote relay: twenty-four trims across two
-// participants, every one firing between 253 and 269 ms. So the buffer was
-// never running away — it was grazing the ceiling and being cut to 60 ms,
-// which is a 190 ms hole in the sound each time and leaves nothing in hand on
-// a path that had just demonstrated it delivers in bursts.
+// The floor is not the preroll depth, though it started as it. Doubling it was
+// measured on a nine-minute call over a VPN to a remote relay: twenty-four
+// trims across two participants became seven.
 //
-// Doubling the floor was expected to trade rare large gaps for frequent small
-// ones and nothing more, on the reasoning that the discard rate is set by how
-// fast the buffer fills. The measurement said otherwise: the same nine minutes
-// on the same path went from twenty-four trims to seven. So the fill is not a
-// steady drift being given back in instalments — it is episodic, and a deeper
-// cushion absorbs bursts that a preroll's worth of audio could not, before
-// they ever reach the ceiling. The cost is 60 ms of standing latency after
-// each trim, which is well inside what a conversation tolerates.
+// The explanation first written here was wrong, and worth recording as wrong.
+// It read the trims as "grazing the ceiling" from a depth of 253 to 269 ms at
+// every one, and concluded the fill was episodic and a deeper cushion absorbed
+// bursts before they reached the ceiling. That range was not a measurement: trim
+// runs after every push and a push is one 20 ms packet, so the depth at a trim
+// is confined to (250, 270] ms whatever caused it. And the reasoning is
+// backwards — raising the floor with MAX_BUFFER fixed *reduces* the headroom
+// between them, which on its own predicts more trims, not fewer.
 //
-// Two runs on a path whose conditions are not controlled, so the size of that
-// improvement is not to be trusted; the direction was consistent for both
-// participants.
+// What the floor actually governs is the underrun below it. On an underrun the
+// reader stops taking samples until the preroll has rebuilt, so nothing drains
+// while the backlog lands and the stall converts into a burst; a trim then
+// follows as the second half of one event. The floor is how long an upstream
+// stall may last before that happens, so doubling it took a whole class of
+// stalls out of the range that produces a trim at all. The cost is 120 ms of
+// standing latency after each trim, well inside what a conversation tolerates.
+//
+// One path, not controlled, so the size of the improvement is not to be
+// trusted; the direction held for both participants.
 const MAX_BUFFER = 12000; // 250 ms
 const TRIM_TO = 5760;     // 120 ms, twice the preroll
 
@@ -157,10 +161,28 @@ class PCMPlayer extends AudioWorkletProcessor {
     // is a real fault, and silence about it is what let two seconds of delay
     // go unnoticed in the first place.
     this.trimmed = 0;
-    // How deep the buffer had got when it was last trimmed. Reported because
-    // the depth after a trim is always TRIM_TO by construction and so says
-    // nothing: this is the number that measures how far behind the audio was.
-    this.trimmedFrom = 0;
+    // What a trim is measured by: the interval leading up to it, not the depth
+    // at the moment of it.
+    //
+    // The depth cannot say anything. trim() runs after every push and a push is
+    // one 20 ms Opus packet, so the depth is always within one packet of
+    // MAX_BUFFER when it fires — confined to (250, 270] ms by construction,
+    // whatever caused it. A measurement of "every trim fired between 253 and
+    // 269 ms" was once taken from that and read as a finding about the buffer;
+    // it was arithmetic. A 640 ms burst and a one-packet creep produce
+    // identical numbers.
+    //
+    // What discriminates is how much audio arrived against how much time
+    // passed. Equal means the reader stalled; more arrived than elapsed means a
+    // burst landed, and how much more is how big it was.
+    this.pushedSinceTrim = 0;
+    this.lastTrimFrame = 0;
+    this.underrunsAtTrim = 0;
+    // Reported at the last trim: ms of wall clock, ms of audio that arrived in
+    // it, and underruns within it.
+    this.sinceTrimMs = 0;
+    this.arrivedMs = 0;
+    this.underrunsSinceTrim = 0;
     // Hold output until this much audio has queued, so playback does not
     // start on the very first packet and then immediately starve.
     this.prerollFrames = 2880; // 60 ms
@@ -180,11 +202,14 @@ class PCMPlayer extends AudioWorkletProcessor {
       available: this.available,
       underruns: this.underruns,
       trimmed: this.trimmed,
-      trimmedFrom: this.trimmedFrom,
+      sinceTrimMs: this.sinceTrimMs,
+      arrivedMs: this.arrivedMs,
+      underrunsSinceTrim: this.underrunsSinceTrim,
     });
   }
 
   push(samples) {
+    this.pushedSinceTrim += samples.length;
     this.pushSamples(samples);
     this.trim();
   }
@@ -194,10 +219,22 @@ class PCMPlayer extends AudioWorkletProcessor {
   trim() {
     if (this.available <= MAX_BUFFER) return;
     const drop = this.available - TRIM_TO;
-    this.trimmedFrom = this.available;
     this.read = (this.read + drop) % CAPACITY;
     this.available -= drop;
     this.trimmed++;
+
+    // currentFrame is the audio hardware's own sample counter, so this is real
+    // elapsed time and not something the main thread can skew. Zero on the
+    // first trim, which has no interval behind it.
+    this.sinceTrimMs = this.lastTrimFrame > 0
+      ? ((currentFrame - this.lastTrimFrame) / sampleRate) * 1000
+      : 0;
+    this.arrivedMs = (this.pushedSinceTrim / sampleRate) * 1000;
+    this.underrunsSinceTrim = this.underruns - this.underrunsAtTrim;
+
+    this.lastTrimFrame = currentFrame;
+    this.pushedSinceTrim = 0;
+    this.underrunsAtTrim = this.underruns;
   }
 
   pushSamples(samples) {
@@ -264,13 +301,16 @@ export interface PlayerReport {
   /** How many times the queue has been trimmed back to bound its latency. */
   trimmed: number;
   /**
-   * How deep the queue was, in samples, at the last trim.
+   * The interval leading up to the last trim, which is what says why it fired.
    *
-   * The depth *after* a trim is TRIM_TO by construction and so measures
-   * nothing. This is how far behind the audio had actually fallen, which is
-   * the only part worth logging.
+   * `arrivedMs` against `sinceTrimMs` is the discriminating comparison: audio
+   * arriving faster than time passes is a burst, and the difference is its
+   * size, while the two being equal means the reader stalled instead. The depth
+   * at the moment of a trim measures nothing — see the worklet.
    */
-  trimmedFrom: number;
+  sinceTrimMs: number;
+  arrivedMs: number;
+  underrunsSinceTrim: number;
 }
 
 /** What pcm-player expects on its port. */

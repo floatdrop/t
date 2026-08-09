@@ -81,6 +81,15 @@ const RENDER_STALL_MS = 500;
  */
 const CANVAS_RESIZE_INTERVAL_MS = 500;
 
+/**
+ * Shortest gap between underrun warnings for one participant.
+ *
+ * An underrun arrives per render quantum's worth of starvation, so a bad
+ * stretch produces a run of them; what matters is that it happened and how
+ * often, not each instance. The count carried in the log is what to read.
+ */
+const UNDERRUN_LOG_INTERVAL_MS = 5000;
+
 
 /** The 2D context a tile is drawn into. */
 function painterFor(canvas: HTMLCanvasElement): Painter | null {
@@ -219,6 +228,8 @@ interface AudioSink {
   restarts: number;
   /** Trims seen so far, so only an increase is reported. */
   trimmed: number;
+  /** When an underrun was last logged, so a run of them is not a run of logs. */
+  lastUnderrunLogMs: number;
 }
 
 type Sink = VideoSink | AudioSink;
@@ -402,6 +413,7 @@ export class Playback {
       buffered: 0,
       underruns: 0,
       trimmed: 0,
+      lastUnderrunLogMs: 0,
       restarts: 0,
       config: null as unknown as AudioDecoderConfig,
       decoder: null as unknown as AudioDecoder,
@@ -422,23 +434,47 @@ export class Playback {
 
     node.port.onmessage = (ev: MessageEvent<PlayerReport>) => {
       sink.buffered = ev.data.available;
-      sink.underruns = ev.data.underruns;
       // Said out loud, and only on the edge: one trim is a transient the
       // listener hears as a skip, but a stream of them means this participant's
       // audio is arriving faster than it can be played and something upstream
       // is wrong. Silence about it is what hid two seconds of delay.
       if (ev.data.trimmed > sink.trimmed) {
         sink.trimmed = ev.data.trimmed;
+        const arrived = Math.round(ev.data.arrivedMs);
+        const elapsed = Math.round(ev.data.sinceTrimMs);
         bridge.report('WARN', 'trimmed the audio buffer to bound its latency', {
           participant: track.participant,
           trims: String(sink.trimmed),
-          // How deep it had got, not how deep it is now: a trim leaves the
-          // buffer at its floor by construction, so reporting what is left
-          // logged the same ~60 ms every time and threw away the one number
-          // that says how far behind the sound had fallen.
-          droppedFromMs: String(Math.round((ev.data.trimmedFrom / 48000) * 1000)),
-          nowMs: String(Math.round((ev.data.available / 48000) * 1000)),
+          // The interval that filled it, not the depth it reached. The depth is
+          // within one 20 ms packet of the ceiling every single time, so it
+          // said nothing; these two say whether a burst landed or the reader
+          // stalled, and how big the burst was.
+          arrivedMs: String(arrived),
+          overMs: String(elapsed > 0 ? arrived - elapsed : 0),
+          sinceLastTrimMs: String(elapsed),
+          underrunsSince: String(ev.data.underrunsSinceTrim),
         });
+      }
+      // Counted since the beginning and never once said out loud, which is why
+      // every trim in the logs looked unexplained. An underrun is what turns an
+      // upstream stall into a burst: the reader stops taking samples until the
+      // preroll has rebuilt, so nothing drains while the backlog lands, and the
+      // trim that follows is the second half of one event rather than a
+      // separate fault. Throttled, because a bad patch produces a run of them
+      // and the count is the interesting part.
+      if (ev.data.underruns > sink.underruns) {
+        const now = performance.now();
+        const missed = ev.data.underruns - sink.underruns;
+        sink.underruns = ev.data.underruns;
+        if (now - sink.lastUnderrunLogMs >= UNDERRUN_LOG_INTERVAL_MS) {
+          sink.lastUnderrunLogMs = now;
+          bridge.report('WARN', 'audio underran; the buffer is refilling', {
+            participant: track.participant,
+            underruns: String(sink.underruns),
+            since: String(missed),
+            bufferedMs: String(Math.round((ev.data.available / 48000) * 1000)),
+          });
+        }
       }
     };
     sink.node = node;

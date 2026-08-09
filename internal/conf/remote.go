@@ -911,8 +911,9 @@ func (r *remote) dropTrack(slot **remoteTrack) {
 		return
 	}
 
-	// Before the subscription closes, so anything a still-open stream was
-	// holding back is painted rather than discarded with the map.
+	// The groups in flight go with the track. What one still holds is
+	// enhancement objects waiting on a base frame that is no longer coming, and
+	// the decoder they would go to is being retired in the next breath.
 	track.dropGroups()
 
 	track.sub.Close()
@@ -1038,10 +1039,11 @@ func (r *remote) checkLagForStream(track *remoteTrack, counter *telemetry.TrackC
 // delivered again, and nothing else would ever rebuild it. That tile stayed
 // frozen for the rest of the call.
 //
-// Rebuilding it as it was would ask for exactly the traffic the relay just
-// refused, and would ask again every lag window. So the rebuild steps down
-// instead: the full picture becomes the publisher's smaller encoding, and the
-// smaller encoding becomes audio only.
+// Rebuilding it as it was asks for exactly the traffic the relay just refused,
+// so it is not repeated indefinitely: after enough rebuilds inside one window
+// this client gives up on the participant's video and comes back to it later.
+// There is no smaller encoding to step down onto — the publisher sends one, and
+// what degrades under pressure is the relay shedding its enhancement layer.
 func (r *remote) reportMediaEnd(track *remoteTrack, err error) {
 	if r.ctx.Err() != nil {
 		return // we tore this down ourselves

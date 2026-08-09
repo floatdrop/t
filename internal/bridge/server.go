@@ -390,9 +390,10 @@ func (s *Server) SendError(detail string) {
 // until the publisher's next scheduled keyframe, up to a keyframe interval
 // after the resize had finished.
 //
-// Keeping the newest instead means the queue always holds the live edge, and
-// at the video depth that edge spans more than one keyframe interval — so there
-// is always something decodable in it.
+// Keeping the newest instead means the queue always holds the live edge. What
+// guarantees something decodable in it is the age bound rather than the depth:
+// video is discarded past two keyframe intervals, so whatever survives contains
+// a keyframe however many participants are sharing the queue.
 //
 // Which queue is decided here, by kind, and it is the whole reason there are
 // two: a frame is only ever interchangeable with another of its own medium.

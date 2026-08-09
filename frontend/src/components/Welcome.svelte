@@ -399,10 +399,9 @@
         <div class="row">
           <div class="field">
             <label for="res">Resolution</label>
-            <!-- Auto is where every call starts, and is the only choice here
-                 that can still be right once the room fills up: it sizes the
-                 picture to the tile it will be shown in. A fixed size is an
-                 override, and leaving the call gives it back up. -->
+            <!-- One size, chosen once and kept. Auto used to sit above this
+                 list and follow the grid, and it cost every subscriber a
+                 decoder reconfigure each time it moved. -->
             <select
               id="res"
               bind:value={store.media.resolution}

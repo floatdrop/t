@@ -1286,11 +1286,6 @@ export class Capture {
     this.#videoRunning = false;
     bridge.report('ERROR', reason, attrs);
     this.#declare({ type: 'untrack', untrack: 'video' });
-    // The small layer cannot outlive the picture it is a copy of: it is fed
-    // from the same frames, so a dead primary means it will never be fed
-    // again. Leaving it declared would hand every subscriber a decoder that
-    // never receives another frame — the same freeze this withdrawal exists
-    // to prevent, one track along.
     // Withdrawing says what is true now, not what will be true for the rest of
     // the call. A camera taken by another application, suspended by the system
     // or unplugged and plugged back in should cost the seconds it was away.

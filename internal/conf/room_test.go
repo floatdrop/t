@@ -34,7 +34,12 @@ type recorder struct {
 	mu sync.Mutex
 
 	frames []bridge.MediaFrame
-	tracks []bridge.RemoteTrack
+	// arrived[i] is when frames[i] was delivered, for measuring how long a
+	// reordering buffer would have had to hold one frame to let another
+	// overtake it. Wall time rather than the media timestamp: what a buffer
+	// costs is the waiting, not the span it covers.
+	arrived []time.Time
+	tracks  []bridge.RemoteTrack
 	// gone are the tracks the backend has told the frontend to retire.
 	gone  []bridge.RemoteTrackID
 	peers []bridge.Participant
@@ -55,6 +60,7 @@ func (r *recorder) SendMedia(f *bridge.MediaFrame) {
 	copied := *f
 	copied.Payload = append([]byte(nil), f.Payload...)
 	r.frames = append(r.frames, copied)
+	r.arrived = append(r.arrived, time.Now())
 	r.objects[f.Handle]++
 	r.bytes[f.Handle] += len(f.Payload)
 }
@@ -75,6 +81,15 @@ func (r *recorder) SendControl(msg *bridge.ServerMessage) {
 	case bridge.MsgError:
 		r.errs = append(r.errs, msg.Error)
 	}
+}
+
+// timeline returns the delivered frames with their arrival times, in delivery
+// order.
+func (r *recorder) timeline() ([]bridge.MediaFrame, []time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]bridge.MediaFrame(nil), r.frames...),
+		append([]time.Time(nil), r.arrived...)
 }
 
 func (r *recorder) snapshot() ([]bridge.MediaFrame, []bridge.RemoteTrack, []bridge.Participant, []string) {

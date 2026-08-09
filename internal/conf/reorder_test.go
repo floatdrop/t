@@ -381,3 +381,59 @@ func TestReassemblerOrdersOnEmissionIndex(t *testing.T) {
 			"agree, or the layout has drifted from what reassembly keys on", got, want)
 	}
 }
+
+// A group that restarts must not be silenced by the reassembler that was
+// watching the attempt it replaced.
+//
+// When a base-layer write fails the publisher abandons the group and asks its
+// encoder for a keyframe. If the group it then opens reuses the ID, emission
+// indices restart at 0 while the subscriber's reassembler for that ID is still
+// at next=k — so every object of the restart, the keyframe first, is below the
+// mark and dropped as late. The tile holds its last frame until something
+// retires the group, and nothing does: retirement is driven by the publisher
+// reaching a later group, which it cannot do while it is stuck on this one.
+//
+// This is the receive side of the contract. It is pinned here because this is
+// where the mistake becomes a frozen tile, and because the reassembler is what
+// makes reusing a group ID unrecoverable rather than merely untidy.
+func TestGroupsAreNotReusedAfterARestart(t *testing.T) {
+	track := &remoteTrack{}
+
+	first := track.reassemblerFor(7)
+	var c collector
+	for _, index := range []uint64{0, 1, 2, 3} {
+		first.Push(index%2, index, c.emitter(index))
+	}
+	if got, want := c.order(), []uint64{0, 1, 2, 3}; !equal(got, want) {
+		t.Fatalf("first attempt: order = %v, want %v", got, want)
+	}
+
+	// The publisher restarts. A correct one opens the next group; this asserts
+	// what happens if it does not, so the requirement is stated where it bites.
+	restarted := track.reassemblerFor(8)
+	if restarted == first {
+		t.Fatal("a new group reused the reassembler of the one before it")
+	}
+	var c2 collector
+	for _, index := range []uint64{0, 1, 2} {
+		restarted.Push(index%2, index, c2.emitter(index))
+	}
+	if got, want := c2.order(), []uint64{0, 1, 2}; !equal(got, want) {
+		t.Fatalf("restarted group: order = %v, want %v — the keyframe that opens "+
+			"it must reach the decoder", got, want)
+	}
+
+	// And the poisoning itself: the same ID again is the same reassembler, which
+	// is exactly why the publisher must not reuse one.
+	same := track.reassemblerFor(7)
+	if same != first {
+		t.Fatal("the same group ID produced a second reassembler")
+	}
+	var c3 collector
+	same.Push(0, 0, c3.emitter(0))
+	if got := c3.order(); len(got) != 0 {
+		t.Fatalf("emitted %v: a reused group ID is indistinguishable from a "+
+			"replay, so this must stay dropped — the fix belongs in the "+
+			"publisher, which must advance the group", got)
+	}
+}

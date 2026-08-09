@@ -697,6 +697,29 @@ func (t *trackPublisher) writeObject(f *bridge.MediaFrame) error {
 		sg.Cancel(moqt.StreamResetInternalError)
 		t.subgroups[layer] = nil
 		if layer == 0 {
+			// The group is abandoned, and the one that replaces it has to be a
+			// *new* group rather than another attempt at this ID.
+			//
+			// rotateGroup only advances the ID when it is closing a group it
+			// started, so clearing started on its own would republish this ID
+			// with its emission indices counting from zero again. A subscriber
+			// cannot take that: it already has a reassembler for this group
+			// sitting at some later index, so every object of the restart —
+			// the keyframe first — arrives below the mark and is dropped as
+			// late, and nothing retires that reassembler while the publisher
+			// is stuck on the same ID. The tile freezes until the group
+			// finally moves. See TestGroupsAreNotReusedAfterARestart.
+			//
+			// It is also a wire violation on its own: two different payloads
+			// under one (Group ID, Object ID), which is exactly the key a relay
+			// caches on.
+			//
+			// The other layers go with it. They belong to the group being
+			// abandoned, and leaving one open would put the next group's first
+			// enhancement object on a stream whose object IDs have already gone
+			// past it.
+			t.closeSubgroups()
+			t.group++
 			t.started = false
 		}
 		return fmt.Errorf("conf: write object group=%d object=%d layer=%d: %w",

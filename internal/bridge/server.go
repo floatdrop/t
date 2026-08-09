@@ -22,34 +22,44 @@ import (
 // runaway frontend can make the backend buffer.
 const maxFrameBytes = 4 << 20
 
-// videoQueueDepth and audioQueueDepth bound the per-connection outbound media
-// queues. Media is live: when a queue is full the oldest frames are worthless,
-// so enqueuing discards them rather than blocking the MOQ read path (see
-// Server.SendMedia).
+// The outbound media queues, one per medium. Media is live: when a queue is
+// full the oldest frames are worthless, so enqueuing discards them rather than
+// blocking the MOQ read path (see Server.SendMedia).
 //
 // One queue per medium, because they were sharing 256 slots and a shared queue
 // is a coupling: video is 1.5 Mbps against audio's 32 kbps, so a video backlog
 // both delayed audio behind it and evicted audio to make room for itself. Every
 // time the WebView stopped reading — macOS resizing its window, a busy main
 // thread — the sound came back as a burst, which the player then trimmed to
-// bound its latency, and each trim is an audible chop. The player's own notes
-// record the symptom without naming the cause: the queue was filling
-// episodically rather than drifting.
+// bound its latency, and each trim is an audible chop.
 //
-// Video is deep enough to hold more than one keyframe interval at 30 fps, which
-// is what makes discarding the oldest safe: the frames kept always contain a
-// recent keyframe, so a frontend that fell behind resumes from the queue
-// instead of waiting for the publisher's next scheduled one.
+// What bounds each queue is the **age** of what is in it, not how many slots it
+// has. Slots were the first answer and they were the wrong unit, because a queue
+// is per connection and carries every remote participant at once: 64 video slots
+// is a couple of seconds of one stream but 0.7 s of three, so the depth that was
+// supposed to guarantee a keyframe stopped doing so in exactly the calls where
+// the WebView is most likely to stall. Sizing the slots for the worst case
+// instead would make a two-party call carry a latency reservoir it never needs.
 //
-// Audio is sized in time rather than in keyframes, every Opus packet standing
-// on its own: about two thirds of a second at the 20 ms cadence. It does not
-// need to be deeper, because the player's ring buffer is what bounds audio
-// latency downstream and trims anything past a quarter of a second — queueing
-// more here would only move the discard, and hand the player a burst it would
-// have to chop anyway.
+// Age says what was actually meant, and says it whatever the participant count:
+// a frame this old is not worth sending, because the frontend paints the newest
+// of what it is given and throws the rest away.
 const (
-	videoQueueDepth = 64
-	audioQueueDepth = 32
+	// Two keyframe intervals, so what survives always contains a keyframe and a
+	// frontend coming back from a stall resumes on one instead of decoding
+	// deltas against references it never received.
+	videoMaxAge = 2 * time.Second
+	// Under the player's own 250 ms ceiling, so the bridge gives up on stale
+	// sound before the ring buffer has to trim it. Both are audible; this one
+	// is shorter and it moves a counter.
+	audioMaxAge = 200 * time.Millisecond
+)
+
+// Slot counts are a memory backstop rather than the policy, deep enough that age
+// is normally what decides — several participants' worth at each cadence.
+const (
+	videoQueueDepth = 512
+	audioQueueDepth = 128
 )
 
 // controlQueueDepth bounds the outbound control queue, which is separate
@@ -120,6 +130,10 @@ type conn struct {
 type outbound struct {
 	typ  websocket.MessageType
 	data []byte
+	// queued is when this went into a media queue, so the write loop can tell
+	// a frame worth sending from one the frontend would only throw away. Zero
+	// for control messages, which are never discarded for age or anything else.
+	queued time.Time
 }
 
 // NewServer binds a loopback listener on an ephemeral port and returns a
@@ -270,7 +284,7 @@ func (c *conn) writeLoop(log *slog.Logger) {
 	}
 
 	for {
-		if msg, ok := c.nextReady(); ok {
+		if msg, ok := c.nextReady(time.Now()); ok {
 			if !write(msg) {
 				return
 			}
@@ -308,23 +322,43 @@ func (c *conn) writeLoop(log *slog.Logger) {
 // ahead of it in one write loop would still do. It cannot starve video however
 // busy the call gets: audio is 32 kbps against video's 1.5 Mbps, so there is
 // never more than a packet every 20 ms of it to prefer.
-func (c *conn) nextReady() (outbound, bool) {
+func (c *conn) nextReady(now time.Time) (outbound, bool) {
 	select {
 	case msg := <-c.control:
 		return msg, true
 	default:
 	}
-	select {
-	case msg := <-c.audio:
+	if msg, ok := takeFresh(c.audio, &c.droppedAudio, audioMaxAge, now); ok {
 		return msg, true
-	default:
 	}
-	select {
-	case msg := <-c.video:
+	if msg, ok := takeFresh(c.video, &c.droppedVideo, videoMaxAge, now); ok {
 		return msg, true
-	default:
 	}
 	return outbound{}, false
+}
+
+// takeFresh returns the oldest frame still worth sending, discarding and
+// counting whatever sat too long. Discarding here rather than at enqueue is
+// deliberate: how long a frame waited is only known once something is ready to
+// send it, and a queue that was filling while the frontend was not reading is
+// exactly the case this exists for.
+func takeFresh(
+	q chan outbound,
+	dropped *atomic.Uint64,
+	maxAge time.Duration,
+	now time.Time,
+) (outbound, bool) {
+	for {
+		select {
+		case msg := <-q:
+			if now.Sub(msg.queued) <= maxAge {
+				return msg, true
+			}
+			dropped.Add(1)
+		default:
+			return outbound{}, false
+		}
+	}
 }
 
 // SendControl queues a JSON control message. It never blocks.
@@ -334,7 +368,7 @@ func (s *Server) SendControl(msg *ServerMessage) {
 		s.log.Error("bridge: marshal control", "type", msg.Type, "err", err)
 		return
 	}
-	s.enqueueControl(outbound{websocket.MessageText, b})
+	s.enqueueControl(outbound{typ: websocket.MessageText, data: b})
 }
 
 // SendError is shorthand for a MsgError control message.
@@ -364,7 +398,11 @@ func (s *Server) SendError(detail string) {
 // two: a frame is only ever interchangeable with another of its own medium.
 func (s *Server) SendMedia(f *MediaFrame) {
 	buf := make([]byte, 0, FrameHeaderLen+len(f.Config)+len(f.Payload))
-	msg := outbound{websocket.MessageBinary, AppendFrame(buf, f)}
+	msg := outbound{
+		typ:    websocket.MessageBinary,
+		data:   AppendFrame(buf, f),
+		queued: time.Now(),
+	}
 
 	c := s.current()
 	if c == nil {

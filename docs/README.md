@@ -205,11 +205,21 @@ one 256-slot outbound queue to the WebView, so a video backlog both delayed
 sound behind it and evicted sound to make room for itself — and the WebView does
 stop reading, for as long as macOS is resizing its window. Whatever the frontend
 had missed then arrived in a burst the moment it caught up, which is exactly
-what the player trims. They have separate queues now, sized per medium, and
-audio is written ahead of video: 32 kbps against video's 1.5 Mbps cannot starve
-anything, and a conference survives a dropped frame far better than a gap in the
-sound. How much of the measured trimming this accounts for is not established —
-the runs above predate the split.
+what the player trims. They have separate queues now, and audio is written ahead
+of video: 32 kbps against video's 1.5 Mbps cannot starve anything, and a
+conference survives a dropped frame far better than a gap in the sound. How much
+of the measured trimming this accounts for is not established — the runs above
+predate the split.
+
+What bounds each queue is the **age** of what is in it, not a slot count. Slots
+were the first answer and they were the wrong unit: a queue is per connection
+and carries every remote participant at once, so 64 video slots is a couple of
+seconds of one stream but 0.7 s of three — the depth that was meant to guarantee
+a keyframe stopped doing so in exactly the calls where the WebView is likeliest
+to stall, and sizing for the worst case would make a two-party call hold a
+latency reservoir it never needs. So a video frame is dropped once it is two
+keyframe intervals old and an audio packet at 200 ms, under the player's own
+250 ms ceiling, both counted. Slot counts remain only as a memory backstop.
 
 That buffer filling is a symptom worth chasing rather than absorbing, so a trim
 is logged at WARN. The one that prompted the bound turned out to be two capture

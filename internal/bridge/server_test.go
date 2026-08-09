@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/coder/websocket"
 )
@@ -170,7 +171,7 @@ func TestAudioIsWrittenAheadOfVideo(t *testing.T) {
 	}
 	s.SendMedia(audioFrame(999))
 
-	msg, ok := c.nextReady()
+	msg, ok := c.nextReady(time.Now())
 	if !ok {
 		t.Fatal("nothing ready with both queues loaded")
 	}
@@ -185,7 +186,7 @@ func TestAudioIsWrittenAheadOfVideo(t *testing.T) {
 
 	// And control still outranks both.
 	s.SendControl(&ServerMessage{Type: MsgState, State: &SessionState{Phase: PhaseJoined}})
-	msg, ok = c.nextReady()
+	msg, ok = c.nextReady(time.Now())
 	if !ok {
 		t.Fatal("nothing ready with all three queues loaded")
 	}
@@ -267,4 +268,58 @@ func decodeType(t *testing.T, data []byte) string {
 		t.Fatalf("unmarshal control message: %v", err)
 	}
 	return msg.Type
+}
+
+// TestStaleMediaIsDiscardedRatherThanSent is the policy the queues are actually
+// bounded by. Slots are a memory backstop; age is what decides.
+//
+// A frontend that stopped reading comes back to a queue full of frames from
+// before the stall. Sending them costs the very latency the queue exists to
+// avoid — the frontend paints the newest of what it is given and throws the
+// rest away — so the write loop gives up on them instead, and counts it.
+func TestStaleMediaIsDiscardedRatherThanSent(t *testing.T) {
+	s, c := stalledConn(t)
+
+	// Enqueued now; read as though the stall had already outlasted both
+	// budgets, so nothing here is worth sending any more.
+	s.SendMedia(audioFrame(1))
+	s.SendMedia(videoFrame(2))
+
+	later := time.Now().Add(videoMaxAge + time.Second)
+	if _, ok := c.nextReady(later); ok {
+		t.Fatal("sent a frame older than the budget; the frontend would only " +
+			"have thrown it away, after paying to receive it")
+	}
+	video, audio := s.DroppedFrames()
+	if video != 1 || audio != 1 {
+		t.Errorf("dropped video=%d audio=%d, want 1 each — a discard that "+
+			"moves no counter is loss with nothing to say so", video, audio)
+	}
+}
+
+// And the other half: age must not throw away what is still current, or every
+// frame of a healthy call would go out of its way to be discarded.
+func TestFreshMediaSurvives(t *testing.T) {
+	s, c := stalledConn(t)
+
+	s.SendMedia(audioFrame(1))
+	s.SendMedia(videoFrame(2))
+
+	for _, want := range []uint8{KindAudio, KindVideo} {
+		msg, ok := c.nextReady(time.Now())
+		if !ok {
+			t.Fatalf("nothing ready; a frame just enqueued is not stale")
+		}
+		f, err := ParseFrame(msg.data)
+		if err != nil {
+			t.Fatalf("parse queued frame: %v", err)
+		}
+		if f.Kind != want {
+			t.Fatalf("frame kind = %d, want %d", f.Kind, want)
+		}
+	}
+	if video, audio := s.DroppedFrames(); video != 0 || audio != 0 {
+		t.Errorf("dropped video=%d audio=%d from a fresh queue, want none",
+			video, audio)
+	}
 }

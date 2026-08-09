@@ -67,26 +67,44 @@ the mandatory-track-property range so nothing can mistake its scope). Ascending
 index is decode order exactly. Reassembly is needed at all because the layers
 arrive on concurrent streams read on separate goroutines:
 `internal/conf/reorder.go` orders a group's streams before anything reaches a
-decoder, with no timers — a frame goes out the moment it is the index being
-waited for, and otherwise once no still-open stream can produce anything
-earlier, which the highest index each has delivered answers exactly. A publisher
-that stamps no index falls back to the object ID, which is right for the only
-kind that does not: one subgroup per group, counting from zero without gaps.
+decoder, with no timers. A publisher that stamps no index falls back to the
+object ID, which is right for the only kind that does not: one subgroup per
+group, counting from zero without gaps.
 
 The timestamp was tried as the key first and cost a frame of latency on every
 frame: it says which frame comes first but never whether anything earlier is
 still to come, so the oldest held frame always waited for the other layer to
 move past it.
 
-A group does *not* wait for a layer it has not seen. It was told what to expect
-once, from a count in the catalog, and that was worse than the problem it
-solved: a relay shedding the enhancement layer never opens that stream, so the
-group conceded nothing, and base-layer frames sat held until it was retired two
-groups later — four seconds of frozen tile, then four seconds of video at once,
-on any link that made the relay shed. What can still produce something earlier
-is what has been seen and has not ended. The backlog is bounded at eight
-objects, one deeper than L1T2's interleave, so the worst a missing layer can
-cost is a quarter of a second rather than a GOP.
+What the rule turns on is that **the two layers are not interchangeable**. A
+subgroup is one QUIC stream, so it is ordered and retransmitted — it delivers
+every object it carries, in order, or it is reset — and §11.4.3 forbids a hole
+in one, so a relay that skipped an object must open a new stream instead. The
+base layer therefore cannot arrive out of order or with gaps, only late. So it
+is emitted the moment it arrives, always, and the only thing that ever waits is
+an enhancement object that has overtaken the base frame it references, released
+when that frame turns up. In emission order — which is nearly every frame of
+every call — each object is the index due when it lands and nothing waits at
+all.
+
+Giving up is restricted to the same layer, because nothing references an
+enhancement frame: dropping one costs itself, where dropping a base frame costs
+every frame after it until the next keyframe. The backlog holds sixteen
+enhancement objects, a GOP's worth at 30 fps with a one-second keyframe
+interval, so a whole layer arriving ahead of the other — a backfilled group, or
+a publisher catching up after a stall — is still placed frame by frame.
+
+Both halves of that were learned the hard way. An earlier design ordered the two
+layers through one bounded backlog and conceded its head when the bound was
+reached; conceding advanced past a base object that was travelling intact on its
+own ordered stream, merely behind, so it arrived below the mark and was dropped
+as late while every frame referencing it went to the decoder anyway — a GOP of
+macroblock artifacts, caused by the app discarding a frame the network had
+delivered. Before that, a group waited for a layer a count in the catalog said
+to expect, and a relay shedding the enhancement layer never opens that stream:
+base-layer frames sat held until the group was retired, four seconds of frozen
+tile then four seconds of video at once. A bound on waiting was right; a group
+that waits for the base layer, or gives up on it, was not.
 
 The enhancement layer is also marked **disposable**, by a §8 object delivery
 timeout stamped on the first object of its subgroup: half a second, against the

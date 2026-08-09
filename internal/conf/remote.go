@@ -234,28 +234,20 @@ type remoteTrack struct {
 
 	// groupsMu guards groups, which holds one reassembler per group currently
 	// in flight — keyed by Group ID, entered by every subgroup stream of that
-	// group and removed when the last of them ends.
+	// group and retired once the publisher has moved two groups past it.
 	//
 	// More than one at a time only during the overlap where a group's tail is
-	// still arriving as the next one opens, so this holds one or two entries in
-	// practice. Video with temporal layers is what makes it necessary at all: a
-	// group then arrives on several concurrent streams and decode order has to
+	// still arriving as the next one opens, so this holds two or three entries
+	// in practice. Video with temporal layers is what makes it necessary at all:
+	// a group then arrives on several concurrent streams and decode order has to
 	// be put back together — see reorder.go.
 	groupsMu sync.Mutex
 	groups   map[uint64]*groupReassembler
 }
 
 // reassemblerFor returns the reassembler for one group, creating it on the
-// first stream to arrive for that group, and registers subgroup as a stream
-// that may still deliver objects.
-//
-// Every group is told how many subgroups to expect: what the publisher declared,
-// less anything this subscription declined, since the declaration is the only
-// thing that knows before the first frame does and the filter is the only thing
-// that knows what was asked for. A track carrying one subgroup expects one,
-// which is the behaviour it had before layers and the right one for a publisher
-// too old to say.
-func (t *remoteTrack) reassemblerFor(group, subgroup uint64) *groupReassembler {
+// first stream to arrive for that group.
+func (t *remoteTrack) reassemblerFor(group uint64) *groupReassembler {
 	t.groupsMu.Lock()
 	defer t.groupsMu.Unlock()
 	if t.groups == nil {
@@ -267,66 +259,45 @@ func (t *remoteTrack) reassemblerFor(group, subgroup uint64) *groupReassembler {
 		t.groups[group] = g
 		t.retireSupersededLocked(group)
 	}
-	g.OpenSubgroup(subgroup)
 	return g
 }
 
-// retireSupersededLocked flushes groups far enough behind newest that nothing
+// retireSupersededLocked forgets groups far enough behind newest that nothing
 // more can be coming for them. The caller holds groupsMu.
 //
-// This is the bound on waiting for an expected stream that never arrives —
-// which a group whose top layer the relay dropped without ever opening will do,
-// as will one whose encoder simply had no enhancement frame to send. Neither
-// produces any signal to wait for, so the only honest end to the wait is the
-// evidence that the publisher has moved on.
+// A group is retired by the publisher moving on rather than by its streams
+// ending, because the streams are the unreliable part: a relay resets one
+// without notice, and one it sheds never opens at all. A newer group could only
+// have been opened by the publisher, which closes every subgroup of a group
+// before opening the next.
 //
 // One whole group of slack, not none. A group's streams do not end together and
 // the relay drains them in whatever order it likes, so the next group opening is
-// no proof that this one is finished — flushing on it would discard exactly the
-// late layer this is here to protect. Two groups on is proof enough: the
-// publisher closes every subgroup of a group before opening the next, so a group
-// two behind the newest has been closed at the source for an entire GOP.
+// no proof that this one is finished. Two groups on is proof enough.
+//
+// What a retired group loses is whatever it was still holding, and a group only
+// holds an enhancement object that overtook the base frame it references. In
+// emission order nothing is held at all; the case that survives to retirement is
+// one that overtook at the very tail of a group, where no later base frame comes
+// to release it. A frame of the layer built to be disposable, against carrying a
+// reassembler per GOP for the length of the call.
 func (t *remoteTrack) retireSupersededLocked(newest uint64) {
-	for id, g := range t.groups {
+	for id := range t.groups {
 		if id+2 > newest {
 			continue
 		}
-		g.Flush()
 		delete(t.groups, id)
 	}
 }
 
-// finishSubgroup reports one subgroup stream as ended, releasing whatever that
-// unblocks. The group is forgotten once no stream of it is left, so a call that
-// runs for an hour does not accumulate a reassembler per GOP.
-func (t *remoteTrack) finishSubgroup(group, subgroup uint64) {
-	t.groupsMu.Lock()
-	g, ok := t.groups[group]
-	t.groupsMu.Unlock()
-	if !ok {
-		return
-	}
-	g.CloseSubgroup(subgroup)
-
-	t.groupsMu.Lock()
-	defer t.groupsMu.Unlock()
-	if g.idle() {
-		g.Flush()
-		delete(t.groups, group)
-	}
-}
-
-// dropGroups releases every group still in flight. Called when the track goes
-// away, so frames already received and decodable are painted rather than
-// discarded with the map.
+// dropGroups forgets every group still in flight, called when the track goes
+// away. Nothing is emitted on the way out: what a group still holds is
+// enhancement frames waiting on a base frame that is no longer coming, and the
+// decoder they would go to is about to be retired too.
 func (t *remoteTrack) dropGroups() {
 	t.groupsMu.Lock()
-	groups := t.groups
 	t.groups = nil
 	t.groupsMu.Unlock()
-	for _, g := range groups {
-		g.Flush()
-	}
 }
 
 // newRemote subscribes to a newly discovered participant's catalog. The
@@ -968,8 +939,7 @@ func (r *remote) readMedia(
 	// group's reassembler rather than straight to the frontend so the decoder
 	// sees them in decode order however the transport interleaved them.
 	group, subgroup := s.Header.GroupID, s.Header.SubgroupID
-	reassembler := track.reassemblerFor(group, subgroup)
-	defer track.finishSubgroup(group, subgroup)
+	reassembler := track.reassemblerFor(group)
 
 	// Counted once per group, by the stream that opens it. Every layer of a
 	// group is the same group, so counting per stream would report a group

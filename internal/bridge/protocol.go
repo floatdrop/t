@@ -135,9 +135,6 @@ type Interest struct {
 	// Video lists participant IDs whose video is wanted. An empty list means
 	// none, which is a real answer — everyone can be scrolled off screen.
 	Video []string `json:"video"`
-	// Low is the subset of Video whose tile is small enough that the
-	// publisher's smaller encoding will do. Anything here that is not also in
-	// Video is not subscribed at all: this says which encoding, never whether.
 }
 
 // Client message types.
@@ -201,18 +198,6 @@ type TrackConfig struct {
 
 	SampleRate uint32 `json:"sampleRate,omitempty"`
 	Channels   uint32 `json:"channels,omitempty"`
-
-	// TemporalLayers is how many temporal layers the encoder was configured
-	// to emit, and so how many subgroups a group of this track is published
-	// on. One or zero both mean a single subgroup, which is what every track
-	// was before layers and what an encoder that ignores scalabilityMode
-	// produces anyway.
-	//
-	// A subscriber needs this before the first frame, not after: a group's
-	// subgroup streams do not arrive together, and reassembly cannot tell a
-	// layer that is gone from one the relay has not drained yet unless it
-	// knows how many to look for. See internal/conf/reorder.go.
-	TemporalLayers uint8 `json:"temporalLayers,omitempty"`
 }
 
 // ClientStats are the frontend's own counters, forwarded so the debug

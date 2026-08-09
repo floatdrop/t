@@ -291,30 +291,27 @@ room. That control is not a convenience: joining by an invite link skips the
 welcome screen entirely, so it is the only place those choices can be made on
 that path.
 
-Resolution defaults to **Auto**, and every call is joined on it — a fixed size
-is an override that lasts until you leave. Auto sizes the picture to the tile it
-will be shown in, which is the only thing that decides how much of it anyone
-sees: the grid puts `ceil(sqrt(n))` tiles across, capped at three columns, so
-each additional participant makes every tile narrower, and a 1080p stream drawn
-into a 400 px tile spends its bitrate on pixels that are thrown away before they
-reach a screen. `autoVideoRung` in `frontend/src/lib/layout.ts` takes the tile
-width the grid arrives at, scales it by the display's pixel ratio (capped at 2x,
-beyond which the extra pixels cost real bitrate and buy nothing visible), and
-picks the smallest rung of `VIDEO_LADDER` wide enough to fill it — never below
-360p, which is where a face stops being a face.
+Resolution is one of the rungs of `VIDEO_LADDER`, chosen once and kept —
+1280×720 by default, matching `defaultVideoSettings`. What is published is
+exactly what was asked for.
 
-The selected bitrate caps that independently, because a size has to be carried
-as well as chosen: each rung carries the bitrate below which it stops being
-worth asking for, and 1080p at 1.5 Mbps is mush where the same budget carries
-720p cleanly. So the default 1.5 Mbps means a one-to-one call publishes 720p and
-a call of five comes down to 480p, while 3 Mbps reaches 1080p and 500 kbps stays
-at the 360p floor throughout. The size follows the room as people join and
-leave, and follows the window as it is resized — settling for 300 ms first,
-since a resize arrives per frame while a window is dragged and crossing a rung
-boundary rebuilds the whole video pipeline. The grid's own padding and gap come
-from the same constants in `layout.ts` that the measurement uses, so the two
-cannot drift apart; a wrong idea of the tile size would show up only as a stream
-that is quietly the wrong size.
+There used to be an **Auto** setting above the ladder, and the reasoning behind
+it was sound: the grid puts `ceil(sqrt(n))` tiles across, capped at three
+columns, so each additional participant makes every tile narrower, and a 1080p
+stream drawn into a 400 px tile spends its bitrate on pixels thrown away before
+they reach a screen. Auto took the tile width the grid arrived at, scaled it by
+the display's pixel ratio, and re-encoded to the smallest rung wide enough to
+fill it.
+
+What sank it is that changing resolution mid-call is not free. It rebuilds the
+local capture pipeline and costs every subscriber a decoder reconfigure and a
+wait for the next keyframe — and Auto spent that on events that are not about
+the picture at all: someone joining, someone leaving, a window being dragged
+wider. Dragging a window across a live call was measured driving a re-encode
+and a resubscribe, with an audio buffer trim behind it. A setting that degrades
+the call in the act of adapting to it is worse than one number chosen once, so
+it is gone, along with the viewport tracking, the pixel-ratio measurement, the
+resize settling timer and the per-rung minimum bitrates that only it read.
 
 Frame rate is capped at 30 wherever it comes from, and a screen share runs at
 15. `requestVideoFrameCallback` fires once per *presentation*, not once per
@@ -326,10 +323,9 @@ advertises all describe the stream actually being sent. A screen is read rather
 than watched — it holds still for seconds and then changes all at once — so it
 spends its 3 Mbps on staying at 1080p and legible instead of on smoothness.
 
-Auto resolution is a camera setting and stops at the camera. A share is 1080p
-whatever the grid is doing: sizing a picture to its tile is the right question
-for a face and the wrong one for a desktop, which is usually being read in the
-expanded tile where the grid's arithmetic does not apply at all.
+The resolution setting is a camera setting and stops at the camera. A share is
+1080p whatever it says: a size chosen to frame a face is the wrong size for a
+desktop, which is usually being read in the expanded tile.
 
 Turning a device off withdraws the track rather than just stopping the frames.
 A catalog that still declares video leaves every subscriber holding a decoder

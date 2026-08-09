@@ -13,7 +13,7 @@
   import Download from '@lucide/svelte/icons/download';
   import Settings2 from '@lucide/svelte/icons/settings-2';
   import { onMount } from 'svelte';
-  import { RESOLUTION_AUTO, VIDEO_LADDER } from '../lib/capture';
+  import { rungValue, VIDEO_LADDER } from '../lib/capture';
   import { ICON_SIZE } from '../lib/icons';
   import { parseInviteLink } from '../lib/invite';
   import { randomNickname, randomRoom } from '../lib/nickname';
@@ -409,9 +409,8 @@
               onchange={reopen}
               disabled={!store.media.useVideo}
             >
-              <option value={RESOLUTION_AUTO}>Auto</option>
               {#each VIDEO_LADDER as rung (rung.label)}
-                <option value={`${rung.width}x${rung.height}`}>{rung.label}</option>
+                <option value={rungValue(rung)}>{rung.label}</option>
               {/each}
             </select>
           </div>

@@ -67,10 +67,9 @@ them never fire on a healthy link.
 Point one instance at it and leave the rest on the relay directly; its doc
 comment explains why the rate matters more than it looks.
 
-The frontend's tests cover the plain-TypeScript policy modules — the arithmetic
-that decides what to send and what to ask for (`layout.ts`).
-Nothing renders a component: what touches a camera, a codec or a socket is
-exercised by running the app.
+The frontend's tests cover the plain-TypeScript policy modules — currently just
+the grid arithmetic in `layout.ts`. Nothing renders a component: what touches a
+camera, a codec or a socket is exercised by running the app.
 
 `internal/conf`'s tests run a real moq-go relay in-process over loopback QUIC
 and assert on the whole path — discovery, catalog exchange, subscription, exact
@@ -118,9 +117,10 @@ build version ride in the catalog as MSF §5.1 producer root fields.
 - `build/config.yml`'s `version` is the single source of truth; the binary reads
   it back via the embed in `main.go` and `internal/version`.
   `TestParseRealConfig` fails if the field moves.
-- Grid geometry constants in `frontend/src/lib/layout.ts` are used both to lay
-  the grid out and to pick the auto resolution; a drift shows up only as a
-  stream that is quietly the wrong size.
+- `internal/conf/reorder.go` assumes subgroup 0 is the temporal base layer, and
+  `internal/conf/publisher.go` is what makes that true by writing layer *L* to
+  subgroup *L*. The base layer is emitted on arrival and never held or dropped;
+  reversing that mapping would silently invert which layer is disposable.
 
 ## Gotchas
 

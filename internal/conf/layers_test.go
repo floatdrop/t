@@ -78,9 +78,14 @@ func videoFrames(rec *recorder) []bridge.MediaFrame {
 	return video
 }
 
-// layeredPublisher joins a room and declares audio plus a video track that says
-// it carries two temporal layers, which is what the frontend's L1T2 encoder
-// declares and what tells a subscriber how many subgroups to expect.
+// layeredPublisher joins a room and declares audio plus video.
+//
+// The declaration says nothing about layers, and does not need to: how many a
+// track carries is not something a subscriber has to be told any more. It used
+// to be, when reassembly waited for the layers it had been told to expect;
+// what waits now is one enhancement object for the base frame it references,
+// which the objects themselves answer. What makes this publisher layered is
+// what it writes — see publishLayeredGroup.
 func layeredPublisher(t *testing.T, addr, room, nickname string) *Room {
 	t.Helper()
 	r, _ := joinRoom(t, addr, room, nickname)
@@ -91,7 +96,6 @@ func layeredPublisher(t *testing.T, addr, room, nickname string) *Room {
 	}
 	if err := r.DeclareTrack(&bridge.TrackConfig{
 		Kind: "video", Codec: "avc1.42e01f", Width: 640, Height: 360,
-		TemporalLayers: 2,
 	}); err != nil {
 		t.Fatalf("declare video: %v", err)
 	}

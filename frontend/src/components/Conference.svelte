@@ -207,12 +207,6 @@
    * expanded are read: solo view renders exactly one tile, and everyone else
    * stops being visible in the most literal sense.
    */
-  // The store decides which layer to ask for, and that arithmetic needs to
-  // know when one tile has the window to itself.
-  $effect(() => {
-    store.expandedTile = expanded;
-  });
-
   $effect(() => {
     void tileKey;
     void expanded;

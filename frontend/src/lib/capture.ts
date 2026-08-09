@@ -61,22 +61,6 @@ const KEYFRAME_INTERVAL_SEC = 1;
 const VIDEO_SCALABILITY_MODE = 'L1T2';
 
 /**
- * How many temporal layers the mode above asks for, declared to subscribers.
- *
- * A subscriber has to know this before the first frame arrives. A group's
- * layers ride separate subgroups on separate streams, and reassembly cannot
- * tell a layer that will never come from one the relay has not got to yet
- * unless it knows how many to expect — see internal/conf/reorder.go. Nothing
- * observable answers in time: the first group of a track is the one a joining
- * subscriber is backfilled with, all at once, before any history exists.
- *
- * Declaring two when the encoder ignores scalabilityMode and produces one costs
- * nothing. Every frame then reads as the base layer, the group's object IDs run
- * contiguously, and each is in turn the object being waited for.
- */
-const VIDEO_TEMPORAL_LAYERS = 2;
-
-/**
  * Which temporal layer an encoded chunk belongs to.
  *
  * WebCodecs reports it as `svc.temporalLayerId` on the chunk's metadata. An
@@ -199,33 +183,41 @@ export interface VideoRung {
   height: number;
   /** How the size is written in the picker. */
   label: string;
-  /**
-   * The bitrate below which this size stops being worth asking for.
-   *
-   * What keeps "Auto" honest. A rung is only a candidate once the selected
-   * bitrate can actually feed it: 1080p carried at 1.5 Mbps is mush where the
-   * same budget carries 720p cleanly, so a big tile on a small budget should
-   * come down to a size the budget can hold rather than up to the one it looks
-   * like it wants.
-   */
-  minBitrate: number;
 }
 
-/** The sizes on offer, smallest first. Auto reads this in order. */
+/**
+ * The sizes on offer, smallest first.
+ *
+ * A list to pick from, and nothing more. There used to be an "Auto" setting
+ * above it that worked out how big our own tile was on everyone else's screen —
+ * from the grid's column count, the window width and the device pixel ratio —
+ * and re-encoded to the rung that fit, on the reasoning that sending 1080p into
+ * a 400 px tile spends bitrate nobody sees.
+ *
+ * The reasoning was sound and the behaviour was not. Changing resolution
+ * mid-call is not free: it rebuilds the local pipeline and costs every
+ * subscriber a decoder reconfigure and a wait for the next keyframe. Auto spent
+ * that on things that are not about the picture at all — someone joining,
+ * someone leaving, a window being dragged wider — and each one showed up on the
+ * far side as a stall. Dragging a window across a call was measured driving a
+ * re-encode and a resubscribe, and an audio trim behind it. A setting that
+ * degrades the call while adapting to it is worse than one number chosen once,
+ * so what is published is now exactly what was asked for.
+ */
 export const VIDEO_LADDER: readonly VideoRung[] = [
-  { width: 640, height: 360, label: '640 × 360', minBitrate: 400_000 },
-  { width: 854, height: 480, label: '854 × 480', minBitrate: 700_000 },
-  { width: 1280, height: 720, label: '1280 × 720', minBitrate: 1_200_000 },
-  { width: 1920, height: 1080, label: '1920 × 1080', minBitrate: 2_500_000 },
+  { width: 640, height: 360, label: '640 × 360' },
+  { width: 854, height: 480, label: '854 × 480' },
+  { width: 1280, height: 720, label: '1280 × 720' },
+  { width: 1920, height: 1080, label: '1920 × 1080' },
 ];
 
-/**
- * The resolution setting that names no size, and instead follows the grid.
- *
- * Not a rung: it resolves to one, and which one changes as people join and
- * leave. See autoVideoRung in layout.ts.
- */
-export const RESOLUTION_AUTO = 'auto';
+/** How a rung is written as a resolution setting. */
+export function rungValue(rung: VideoRung): string {
+  return `${rung.width}x${rung.height}`;
+}
+
+/** The size a call starts on, matching defaultVideoSettings. */
+export const DEFAULT_RESOLUTION = rungValue(VIDEO_LADDER[2]);
 
 /**
  * Whether a pipeline built for `have` already satisfies `want`.
@@ -909,7 +901,6 @@ export class Capture {
         height,
         framerate,
         bitrate: primaryBitrate,
-        temporalLayers: VIDEO_TEMPORAL_LAYERS,
       },
     });
 

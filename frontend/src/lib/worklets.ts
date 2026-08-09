@@ -80,10 +80,14 @@ registerProcessor('pcm-tap', PCMTap);
  * per participant would both allocate heavily and click at every seam.
  * Underrun outputs silence and is counted, so the debug panel can show it.
  *
- * It keeps a write timestamp only to notice a discontinuity: a chunk that does
- * not continue the previous one resets the reference rather than being packed
- * on as though it did. Nothing outside reads it — video used to be scheduled
- * against a playout clock derived from it, and no longer is.
+ * Samples carry no timestamp. There used to be one, and a write clock that
+ * resynchronised whenever a chunk did not continue the previous one — built
+ * when video was scheduled against a playout position derived from it. Video
+ * is no longer scheduled against anything, so the arithmetic ran on every
+ * chunk and nothing read the result. A gap in the sound is audible whether or
+ * not the buffer knows the timestamp either side of it: closing one needs a
+ * sparse buffer, which this is not, and the ring is contiguous by
+ * construction.
  */
 const PLAYER_SOURCE = `
 // Two seconds at 48 kHz. Large enough to absorb network jitter, small
@@ -130,10 +134,6 @@ const CAPACITY = 96000;
 const MAX_BUFFER = 12000; // 250 ms
 const TRIM_TO = 5760;     // 120 ms, twice the preroll
 
-// A chunk whose timestamp misses the expected one by more than this is
-// treated as a new reference rather than a continuation.
-const RESYNC_US = 5000;
-
 // How often to report buffer counters, in render quanta.
 //
 // It used to be eight — about 21 ms — because a render loop interpolated
@@ -165,16 +165,13 @@ class PCMPlayer extends AudioWorkletProcessor {
     // start on the very first packet and then immediately starve.
     this.prerollFrames = 2880; // 60 ms
     this.playing = false;
-    // Publisher-clock timestamp of the next sample to be written.
-    this.writeUs = 0;
-    this.haveClock = false;
     this.quanta = 0;
     this.port.onmessage = (ev) => {
       if (ev.data === 'stats') {
         this.report();
         return;
       }
-      this.push(ev.data.samples, ev.data.timestampUs);
+      this.push(ev.data.samples);
     };
   }
 
@@ -187,14 +184,7 @@ class PCMPlayer extends AudioWorkletProcessor {
     });
   }
 
-  push(samples, timestampUs) {
-    if (typeof timestampUs === 'number') {
-      if (!this.haveClock || Math.abs(timestampUs - this.writeUs) > RESYNC_US) {
-        this.writeUs = timestampUs;
-        this.haveClock = true;
-      }
-    }
-    this.writeUs += (samples.length / sampleRate) * 1e6;
+  push(samples) {
     this.pushSamples(samples);
     this.trim();
   }
@@ -286,8 +276,6 @@ export interface PlayerReport {
 /** What pcm-player expects on its port. */
 export interface PlayerChunk {
   samples: Float32Array;
-  /** Publisher-clock timestamp of the first sample, in microseconds. */
-  timestampUs: number;
 }
 
 const moduleURLs = new Map<string, string>();

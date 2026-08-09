@@ -6,21 +6,19 @@
  * panels need the same metrics and logs the conference view does.
  */
 
-import { untrack } from 'svelte';
 import { bridge } from './bridge';
 import {
   capture,
+  DEFAULT_RESOLUTION,
   defaultAudioSettings,
   defaultVideoSettings,
   listDevices,
-  RESOLUTION_AUTO,
   screenVideoSettings,
   type AudioSettings,
   type CaptureStats,
   type VideoSettings,
   type VideoSource,
 } from './capture';
-import { autoVideoBitrate, autoVideoRung } from './layout';
 import { playback, type PlaybackStats } from './playback';
 import type {
   InviteMessage,
@@ -49,17 +47,6 @@ const STATS_INTERVAL_MS = 250;
  */
 const SPEAKING_TIMEOUT_MS = 400;
 
-/**
- * How long the window has to hold still before Auto re-measures it.
- *
- * A resize arrives per frame while a window is being dragged, and a
- * re-measurement that crosses a rung boundary rebuilds the whole video
- * pipeline. Auto only acts on the rung, not the pixel, so this only has to
- * outlast the drag itself.
- */
-const RESIZE_SETTLE_MS = 300;
-
-
 /** How many times to try building a sink before giving up on a participant. */
 const PLAYBACK_ADD_ATTEMPTS = 3;
 
@@ -82,10 +69,7 @@ export interface MediaSettings {
    * it, because a participant has one video track in the catalog.
    */
   videoSource: VideoSource;
-  /**
-   * "WIDTHxHEIGHT", one of the rungs in VIDEO_LADDER, or RESOLUTION_AUTO to
-   * follow the grid — see the store's autoResolution.
-   */
+  /** "WIDTHxHEIGHT", one of the rungs in VIDEO_LADDER. */
   resolution: string;
   videoBitrate: number;
   audioBitrate: number;
@@ -164,52 +148,11 @@ class Store {
     useVideo: true,
     useAudio: true,
     videoSource: 'camera',
-    // Every call starts by following the grid. A fixed size is a deliberate
-    // override, and leave() puts this back so the next call starts from Auto
-    // again rather than from whatever one room happened to need.
-    resolution: RESOLUTION_AUTO,
+    resolution: DEFAULT_RESOLUTION,
     videoBitrate: defaultVideoSettings.bitrate,
     audioBitrate: defaultAudioSettings.bitrate,
     denoise: defaultAudioSettings.denoise,
   });
-
-  /**
-   * The window as Auto last measured it.
-   *
-   * Held as state rather than read from `window` where it is needed, because
-   * the size Auto picks has to be recomputed when the window changes and
-   * nothing observes a property read off the global. The pixel ratio travels
-   * with it: it changes when the window is dragged to a different display,
-   * which is also a resize.
-   */
-  viewportWidth = $state(window.innerWidth);
-  pixelRatio = $state(window.devicePixelRatio || 1);
-
-  #autoRung = $derived(
-    autoVideoRung({
-      // Our own tile is in the grid too, and on an empty call it is the only
-      // one — which is why this is not simply the participant count.
-      tiles: this.participants.length + 1,
-      viewportWidth: this.viewportWidth,
-      pixelRatio: this.pixelRatio,
-      bitrate: this.media.videoBitrate,
-    }),
-  );
-
-  /**
-   * What Auto is asking for, as "WIDTHxHEIGHT".
-   *
-   * A string rather than the rung itself so that watchers see a change only
-   * when the size really changed: a participant joining a call that is already
-   * three across moves nothing, and re-encoding for it would cost every
-   * subscriber a decoder reconfigure and a wait for the next keyframe.
-   */
-  autoResolution = $derived(`${this.#autoRung.width}x${this.#autoRung.height}`);
-
-  /** How that size is written, for the picker to show alongside "Auto". */
-  get autoLabel(): string {
-    return this.#autoRung.label;
-  }
 
   /** Cameras and microphones the browser is willing to name. */
   devices = $state<{ cameras: MediaDeviceInfo[]; microphones: MediaDeviceInfo[] }>({
@@ -419,55 +362,7 @@ class Store {
       this.playbackStats = playback.sampleStats();
     }, STATS_INTERVAL_MS);
 
-    window.addEventListener('resize', this.#onResize);
-
-    // Auto follows the call rather than being chosen once: people join, people
-    // leave, the window is resized, and what we publish keeps up without anyone
-    // opening a menu. An effect root because this store is not a component and
-    // has no lifecycle of its own — detach() disposes it.
-    this.#stopAuto = $effect.root(() => {
-      $effect(() => {
-        const wanted = this.autoResolution;
-        if (this.media.resolution !== RESOLUTION_AUTO) return;
-        // Only what Auto actually governs: a screen carries its own size, and a
-        // camera that is off has no picture to resize. Both are picked up when
-        // they come back, since the toggle applies the settings itself.
-        if (!this.media.useVideo || this.media.videoSource !== 'camera') return;
-        // Only on a live call. Off one there is nothing publishing to change,
-        // and openPreview reads the same value when it next opens the camera.
-        if (this.session.phase !== 'joined') return;
-        if (wanted === this.#autoApplied) return;
-        this.#autoApplied = wanted;
-
-        // Untracked, because applyMedia reads nearly every media setting on its
-        // way through and an effect that depended on all of them would rebuild
-        // the video pipeline for a microphone change too.
-        untrack(() => {
-          void this.applyMedia().catch((err) => {
-            bridge.report('WARN', 'could not apply the automatic resolution', {
-              wanted,
-              err: String(err),
-            });
-          });
-        });
-      });
-    });
   }
-
-  /** The last size Auto acted on, so a re-run that changes nothing does nothing. */
-  #autoApplied = '';
-  #stopAuto: (() => void) | null = null;
-  #resizeTimer: ReturnType<typeof setTimeout> | null = null;
-
-  /** Re-measures the window once it has stopped moving. */
-  #onResize = (): void => {
-    if (this.#resizeTimer) clearTimeout(this.#resizeTimer);
-    this.#resizeTimer = setTimeout(() => {
-      this.#resizeTimer = null;
-      this.viewportWidth = window.innerWidth;
-      this.pixelRatio = window.devicePixelRatio || 1;
-    }, RESIZE_SETTLE_MS);
-  };
 
   /** Forgets every remote track and participant, retiring their decoders. */
   #dropRemoteState(): void {
@@ -491,11 +386,6 @@ class Store {
   detach(): void {
     if (this.#statsTimer) clearInterval(this.#statsTimer);
     this.#statsTimer = null;
-    if (this.#resizeTimer) clearTimeout(this.#resizeTimer);
-    this.#resizeTimer = null;
-    window.removeEventListener('resize', this.#onResize);
-    this.#stopAuto?.();
-    this.#stopAuto = null;
     this.#speakingTimers.forEach(clearTimeout);
     this.#speakingTimers.clear();
   }
@@ -555,24 +445,14 @@ class Store {
       };
     }
 
-    // Auto names no size of its own; it resolves to a rung, which is what the
-    // capture layer is given. Nothing below this point knows the difference,
-    // so a size that changed because someone joined rebuilds the pipeline by
-    // exactly the same path as one that was picked by hand.
-    const auto = this.media.resolution === RESOLUTION_AUTO;
-    const picked = auto ? this.autoResolution : this.media.resolution;
-    const [width, height] = picked.split('x').map(Number);
+    const [width, height] = this.media.resolution.split('x').map(Number);
     return {
       source: 'camera',
       deviceId: this.media.cameraId || undefined,
       width,
       height,
       framerate: defaultVideoSettings.framerate,
-      // Auto caps the budget to the size it settled on; a size chosen by hand
-      // is an instruction and spends what was selected.
-      bitrate: auto
-        ? autoVideoBitrate(this.#autoRung, this.media.videoBitrate)
-        : this.media.videoBitrate,
+      bitrate: this.media.videoBitrate,
     };
   }
 
@@ -819,11 +699,11 @@ class Store {
       this.media.useVideo = this.#videoBeforeShare;
     }
 
-    // A fixed resolution is an override for the room it was chosen in — a call
-    // that needed 360p because it had nine people in it should not hold the
-    // next one to that. Every call is joined on Auto.
-    this.media.resolution = RESOLUTION_AUTO;
-    this.#autoApplied = '';
+    // The resolution is deliberately not reset. It used to be, because Auto
+    // could put it somewhere nobody chose — nine people in a room took it to
+    // 360p — and holding the next call to that would have been the grid's
+    // decision outliving the grid. Now it only ever holds what someone picked,
+    // which is the same kind of setting as the bitrate and keeps like one.
 
     capture.stop();
     playback.clear();
@@ -866,30 +746,6 @@ class Store {
     this.#visibleTiles = ids;
     this.#sendInterest();
   }
-
-  /**
-   * Whether the tiles are being drawn small enough that the publishers'
-   * smaller encoding would do.
-   *
-   * Derived from the same numbers Auto resolution uses, rather than measured
-   * in the grid and reported: a window resize changes every tile's size
-   * without changing which tiles are on screen, so an observer watching
-   * visibility never fires and the answer would go stale exactly when someone
-   * made the window smaller.
-   */
-  /**
-   * Which tile has the window to itself, mirrored from the conference view.
-   *
-   * The grid renders exactly one tile when something is expanded, and the
-   * arithmetic below has to be told: left to the participant count it kept
-   * computing a multi-column tile width while a single full-width tile was on
-   * screen, so double-clicking a face to look at it asked for the 640-wide
-   * layer and made it softer.
-   */
-  expandedTile = $state<string | null>(null);
-
-
-
 
   /** Re-sends interest after something other than the visible set changed. */
   refreshInterest(): void {

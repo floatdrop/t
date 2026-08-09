@@ -884,9 +884,7 @@ export class Playback {
     try {
       const samples = new Float32Array(data.numberOfFrames);
       data.copyTo(samples, { planeIndex: 0, format: 'f32-planar' });
-      // The timestamp travels with the samples: it is what lets the worklet
-      // report a playout position, and so what video is synchronised to.
-      const chunk: PlayerChunk = { samples, timestampUs: data.timestamp };
+      const chunk: PlayerChunk = { samples };
       // Transfer rather than copy: the worklet consumes the buffer.
       sink.node.port.postMessage(chunk, [samples.buffer]);
     } catch (err) {

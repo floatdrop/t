@@ -125,13 +125,6 @@ export interface TrackConfig {
   bitrate?: number;
   sampleRate?: number;
   channels?: number;
-  /**
-   * How many temporal layers the encoder was configured to emit, and so how
-   * many subgroups a group of this track is published on. One or absent both
-   * mean a single subgroup. A subscriber needs it before the first frame —
-   * see internal/conf/reorder.go.
-   */
-  temporalLayers?: number;
 }
 
 export interface ClientStats {

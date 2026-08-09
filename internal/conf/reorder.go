@@ -228,6 +228,25 @@ func (g *groupReassembler) releasableLocked(index uint64) bool {
 	if len(g.held) >= maxHeldObjects {
 		return true
 	}
+	// Nothing can precede a group's first object, so nothing may go out before
+	// it has arrived — and it is the keyframe, on the base layer, because that
+	// is what opens a group.
+	//
+	// Without this the rule below could concede index 0 itself. The streams of a
+	// group are read on independent goroutines with no ordering between them, so
+	// the enhancement layer's reader can reach its first Push before the base
+	// layer's reader has registered its subgroup at all. The group then holds one
+	// open stream, that stream is past index 1, and index 1 goes out with next
+	// still at 0 — after which the keyframe arrives, is below next, and is
+	// dropped as late. A group of deltas with no keyframe is not a degraded
+	// picture, it is an undecodable one.
+	//
+	// A subscriber that joined mid-group never receives index 0, and holds until
+	// the backlog valve above lets go. That costs a quarter of a second of frames
+	// the decoder was going to refuse anyway, having no keyframe to start on.
+	if g.next == 0 {
+		return false
+	}
 	for subgroup, highest := range g.open {
 		if !g.started[subgroup] || highest < index {
 			return false

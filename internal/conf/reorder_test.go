@@ -332,3 +332,61 @@ func TestReassemblerOrdersOnEmissionIndex(t *testing.T) {
 			"agree, or the layout has drifted from what reassembly keys on", got, want)
 	}
 }
+
+// The keyframe must not be conceded, and the streams of a group race to say so.
+//
+// Each subgroup is read on its own goroutine with no ordering between them, so
+// the enhancement layer's reader can reach its first Push before the base
+// layer's reader has registered its subgroup at all. The group then knows about
+// one stream, that stream is past index 1, and the rule that concedes a gap
+// once every open stream has moved past it would let index 1 out with nothing
+// emitted yet — after which the keyframe arrives below next and is dropped as
+// late.
+//
+// What comes of that is not a degraded picture but an undecodable one: a group
+// of deltas with no keyframe to start on. Nothing precedes a group's first
+// object, so nothing may go out before it has arrived.
+func TestReassemblerNeverConcedesTheKeyFrame(t *testing.T) {
+	g := newGroupReassembler()
+	var c collector
+
+	// The enhancement layer's reader wins the race: its subgroup is the only
+	// one this group has heard of when its first object lands.
+	g.OpenSubgroup(1)
+	g.Push(1, 1, c.emitter(1))
+	if got := c.order(); len(got) != 0 {
+		t.Fatalf("emitted %v before the group's first object arrived; the "+
+			"keyframe is index 0 and a decoder cannot start without it", got)
+	}
+
+	// The base layer's reader catches up.
+	g.OpenSubgroup(0)
+	g.Push(0, 0, c.emitter(0))
+	if got, want := c.order(), []uint64{0, 1}; !equal(got, want) {
+		t.Fatalf("order = %v, want %v", got, want)
+	}
+}
+
+// A subscriber that joins mid-group never receives index 0, and must not wait
+// for it for ever. The backlog valve is what lets go — the frames it releases
+// are ones the decoder will refuse anyway, having no keyframe, so the cost is
+// a quarter of a second of nothing.
+func TestReassemblerGivesUpOnAFirstObjectThatIsNotComing(t *testing.T) {
+	g := newGroupReassembler()
+	var c collector
+	g.OpenSubgroup(0)
+
+	for i := range uint64(maxHeldObjects + 2) {
+		g.Push(0, i+4, c.emitter(i+4)) // joined at index 4; 0..3 never arrive
+	}
+	got := c.order()
+	if len(got) == 0 {
+		t.Fatal("nothing was emitted: a group joined part-way through waited " +
+			"for a first object that was never going to arrive")
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i] <= got[i-1] {
+			t.Fatalf("emitted out of order at %d: %v", i, got[:i+1])
+		}
+	}
+}

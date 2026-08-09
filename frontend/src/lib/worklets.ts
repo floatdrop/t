@@ -1,5 +1,4 @@
 import { bridge } from './bridge';
-import { placementFor } from './placement';
 
 /**
  * AudioWorklet processors, as source strings loaded through blob URLs.
@@ -91,10 +90,6 @@ registerProcessor('pcm-tap', PCMTap);
  * sample after it.
  */
 const PLAYER_SOURCE = `
-// Injected from placement.ts so the rule has one implementation rather than
-// two — see that file for why it cannot simply be imported here.
-const placementFor = ${placementFor.toString()};
-
 // Two seconds at 48 kHz. Large enough to absorb network jitter, small
 // enough that the buffer can never hide a real stall.
 const CAPACITY = 96000;
@@ -160,9 +155,6 @@ class PCMPlayer extends AudioWorkletProcessor {
     // is a real fault, and silence about it is what let two seconds of delay
     // go unnoticed in the first place.
     this.trimmed = 0;
-    // Chunks that arrived out of order and were placed where their timestamp
-    // said rather than appended.
-    this.reordered = 0;
     // How deep the buffer had got when it was last trimmed. Reported because
     // the depth after a trim is always TRIM_TO by construction and so says
     // nothing: this is the number that measures how far behind the audio was.
@@ -189,7 +181,6 @@ class PCMPlayer extends AudioWorkletProcessor {
     this.port.postMessage({
       available: this.available,
       underruns: this.underruns,
-      reordered: this.reordered,
       trimmed: this.trimmed,
       trimmedFrom: this.trimmedFrom,
       playing: this.playing,
@@ -199,18 +190,6 @@ class PCMPlayer extends AudioWorkletProcessor {
   }
 
   push(samples, timestampUs) {
-    // A chunk that arrived out of order goes where its timestamp says rather
-    // than on the end. See placement.ts for the rule and why it is free.
-    const where = placementFor(
-      this.haveClock, this.writeUs, timestampUs,
-      this.available, samples.length, sampleRate,
-    );
-    if (where.action === 'place') {
-      this.placeSamples(samples, where.behind);
-      this.reordered++;
-      return;
-    }
-
     if (typeof timestampUs === 'number') {
       if (!this.haveClock || Math.abs(timestampUs - this.writeUs) > RESYNC_US) {
         this.writeUs = timestampUs;
@@ -220,19 +199,6 @@ class PCMPlayer extends AudioWorkletProcessor {
     this.writeUs += (samples.length / sampleRate) * 1e6;
     this.pushSamples(samples);
     this.trim();
-  }
-
-  // Writes a chunk that belongs the given number of samples before the write
-  // cursor,
-  // over whatever is queued there. Neither the depth nor the clock moves: the
-  // audio being replaced is silence or a repeat that was already accounted
-  // for, and the chunk occupies time that was already reserved for it.
-  placeSamples(samples, behind) {
-    let at = (this.write - behind + CAPACITY) % CAPACITY;
-    for (let i = 0; i < samples.length; i++) {
-      this.buffer[at] = samples[i];
-      at = (at + 1) % CAPACITY;
-    }
   }
 
   // Drops the oldest audio when too much has queued, which is the only thing
@@ -309,8 +275,6 @@ export interface PlayerReport {
   /** Samples still queued in the ring buffer. */
   available: number;
   underruns: number;
-  /** Chunks that arrived out of order and were placed by their timestamp. */
-  reordered: number;
   /** How many times the queue has been trimmed back to bound its latency. */
   trimmed: number;
   /**

@@ -43,7 +43,7 @@ func equal(a, b []uint64) bool {
 // the right one. Subgroup 0 carries the even timestamps and subgroup 1 the odd
 // ones — the L1T2 layout — and here subgroup 1 runs ahead.
 func TestReassemblerOrdersAcrossSubgroups(t *testing.T) {
-	g := newGroupReassembler(2)
+	g := newGroupReassembler()
 	var c collector
 	g.OpenSubgroup(0)
 	g.OpenSubgroup(1)
@@ -89,7 +89,7 @@ func TestReassemblerOrdersAcrossSubgroups(t *testing.T) {
 // back, because holding here would add latency to every frame of every call —
 // audio included.
 func TestReassemblerEmitsImmediatelyWithOneSubgroup(t *testing.T) {
-	g := newGroupReassembler(1)
+	g := newGroupReassembler()
 	var c collector
 	g.OpenSubgroup(0)
 
@@ -102,37 +102,25 @@ func TestReassemblerEmitsImmediatelyWithOneSubgroup(t *testing.T) {
 	}
 }
 
-// A group must wait for a layer the publisher declared and the transport has
-// not delivered yet, even when every stream it has actually seen has gone
-// quiet. This is the burst: the relay drains one subgroup well ahead of the
-// other, and a group that judged safety by what it had seen would release the
-// base layer entire and then have nowhere to put the enhancement layer.
-func TestReassemblerWaitsForADeclaredLayerItHasNotSeen(t *testing.T) {
-	g := newGroupReassembler(2)
+// A layer the relay sheds simply never opens its stream, and the group must not
+// wait for it. This is the shape that froze the picture: with the enhancement
+// layer gone the base arrives 0, 2, 4, only the first of which is the index
+// being waited for, so a group that held the rest until something else retired
+// it showed four seconds of nothing and then four seconds at once.
+//
+// The cost of not waiting is one group's enhancement layer when a burst
+// delivers the base first — a GOP at half the frame rate, against a frozen tile.
+func TestReassemblerDoesNotHoldForALayerThatNeverArrives(t *testing.T) {
+	g := newGroupReassembler()
 	var c collector
 	g.OpenSubgroup(0)
 
-	// The whole base layer arrives before the enhancement layer's stream shows
-	// up at all.
-	for _, ts := range []uint64{0, 2, 4, 6} {
-		g.Push(0, ts, c.emitter(ts))
+	for _, index := range []uint64{0, 2, 4, 6} {
+		g.Push(0, index, c.emitter(index))
 	}
-	// Only the first goes out — it is the index the group opens on, so nothing
-	// can precede it. Everything after has a gap in front of it that the
-	// unheard-from layer is entitled to fill.
-	if got, want := c.order(), []uint64{0}; !equal(got, want) {
-		t.Fatalf("order = %v, want %v — a gap must not be conceded while a "+
-			"declared layer has not been heard from", got, want)
-	}
-
-	g.OpenSubgroup(1)
-	for _, ts := range []uint64{1, 3, 5} {
-		g.Push(1, ts, c.emitter(ts))
-	}
-	// The run completes the moment the missing indices arrive: 6 goes out too,
-	// because 5 filled the last gap in front of it.
-	if got, want := c.order(), []uint64{0, 1, 2, 3, 4, 5, 6}; !equal(got, want) {
-		t.Fatalf("order = %v, want %v", got, want)
+	if got, want := c.order(), []uint64{0, 2, 4, 6}; !equal(got, want) {
+		t.Fatalf("order = %v, want %v — the base layer must go out on arrival "+
+			"when the layer above it is not being delivered", got, want)
 	}
 }
 
@@ -142,7 +130,7 @@ func TestReassemblerWaitsForADeclaredLayerItHasNotSeen(t *testing.T) {
 // A design that waited for the missing odd frames would pay that wait once per
 // frame, turning a shed layer into a stall on a link already struggling.
 func TestReassemblerDoesNotWaitOnAShedLayer(t *testing.T) {
-	g := newGroupReassembler(2)
+	g := newGroupReassembler()
 	var c collector
 	g.OpenSubgroup(0)
 	g.OpenSubgroup(1)
@@ -166,7 +154,7 @@ func TestReassemblerDoesNotWaitOnAShedLayer(t *testing.T) {
 // proves nothing earlier is coming, so the run continues without it and without
 // a timer.
 func TestReassemblerReleasesOverAGap(t *testing.T) {
-	g := newGroupReassembler(2)
+	g := newGroupReassembler()
 	var c collector
 	g.OpenSubgroup(0)
 	g.OpenSubgroup(1)
@@ -187,7 +175,7 @@ func TestReassemblerReleasesOverAGap(t *testing.T) {
 // earliest frame of all, so anything after it must wait — a subgroup is not
 // "finished" merely because a sibling has run ahead of it.
 func TestReassemblerHoldsForAnOpenButSilentSubgroup(t *testing.T) {
-	g := newGroupReassembler(2)
+	g := newGroupReassembler()
 	var c collector
 	g.OpenSubgroup(0)
 	g.OpenSubgroup(1)
@@ -208,7 +196,7 @@ func TestReassemblerHoldsForAnOpenButSilentSubgroup(t *testing.T) {
 // frame it owes piles up. Past maxHeldObjects the group gives up waiting rather
 // than growing without limit.
 func TestReassemblerBoundsTheBacklog(t *testing.T) {
-	g := newGroupReassembler(2)
+	g := newGroupReassembler()
 	var c collector
 	g.OpenSubgroup(0)
 	g.OpenSubgroup(1)
@@ -236,7 +224,7 @@ func TestReassemblerBoundsTheBacklog(t *testing.T) {
 // frame that arrives after the group has already moved past it. Emitting either
 // would hand a decoder something it is already beyond.
 func TestReassemblerDropsLateAndDuplicateFrames(t *testing.T) {
-	g := newGroupReassembler(1)
+	g := newGroupReassembler()
 	var c collector
 	g.OpenSubgroup(0)
 
@@ -254,7 +242,7 @@ func TestReassemblerDropsLateAndDuplicateFrames(t *testing.T) {
 // silently discard what is still held: frames already received and decodable
 // should be painted, not dropped because a sibling stream never closed.
 func TestReassemblerFlushEmitsTheBacklog(t *testing.T) {
-	g := newGroupReassembler(2)
+	g := newGroupReassembler()
 	var c collector
 	g.OpenSubgroup(0)
 	g.OpenSubgroup(1)
@@ -281,7 +269,7 @@ func TestReassemblerFlushEmitsTheBacklog(t *testing.T) {
 // would only be asserting that the scheduler stayed fair.
 func TestReassemblerConcurrentPushesStayOrdered(t *testing.T) {
 	const perLayer = maxHeldObjects / 2
-	g := newGroupReassembler(2)
+	g := newGroupReassembler()
 	var c collector
 	g.OpenSubgroup(0)
 	g.OpenSubgroup(1)
@@ -318,7 +306,7 @@ func TestReassemblerConcurrentPushesStayOrdered(t *testing.T) {
 // test so a change to the layout trips something rather than silently
 // reordering video.
 func TestReassemblerOrdersOnEmissionIndex(t *testing.T) {
-	g := newGroupReassembler(2)
+	g := newGroupReassembler()
 	var c collector
 	g.OpenSubgroup(0)
 	g.OpenSubgroup(1)

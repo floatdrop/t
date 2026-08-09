@@ -305,7 +305,7 @@ func (t *remoteTrack) reassemblerFor(group, subgroup uint64) *groupReassembler {
 	}
 	g, ok := t.groups[group]
 	if !ok {
-		g = newGroupReassembler(int(t.layers))
+		g = newGroupReassembler()
 		t.groups[group] = g
 		t.retireSupersededLocked(group)
 	}

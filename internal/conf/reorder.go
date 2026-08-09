@@ -43,21 +43,19 @@ import "sync"
 // already too late to be placed. Measured against a real relay that lost half
 // the frames of a group written back to back.
 //
-// So a group is told which subgroups to expect, and an expected one not seen yet
-// holds the group back exactly as an open one does. The count comes from the
-// publisher's catalog, because it has to be known before the first frame and
-// nothing observable says it in time: the track's own history cannot describe
-// its first group, which is precisely the backfilled one a joining subscriber
-// receives all at once.
+// A group waited for a layer it had been told to expect, once, and that was
+// worse than the problem it solved. A relay shedding the enhancement layer —
+// which is the whole point of publishing it separately — simply never opens
+// that stream, so the group conceded nothing: base-layer indices arrive 0, 2,
+// 4, only the first satisfying "the one being waited for", and the rest sat
+// held until the group was retired two groups later. Four seconds of frozen
+// tile followed by four seconds of video at once, over and over, on any link
+// that made the relay shed. The burst it was protecting against costs one
+// group's enhancement layer; this cost the picture.
 //
-// Over-declaring costs nothing while the indices stay contiguous: each object
-// is in turn the one being waited for. A track that declares two layers and
-// emits one keeps a group open expecting a stream that never comes, which the
-// track retires once a later group has superseded it.
-//
-// A subscriber that declined the top layer sees only every other index, so its
-// gaps are conceded by the open-stream rule rather than matched — which is why
-// what a group expects is what was subscribed, not what was declared.
+// So an unseen subgroup is not waited for. What can still produce something
+// earlier is what has actually been seen and not yet ended, which is the
+// question the open streams answer.
 
 // maxHeldObjects bounds one group's reassembly buffer.
 //
@@ -94,35 +92,22 @@ type groupReassembler struct {
 	// where a linear insert beats a heap's constant factor and its allocation.
 	held []heldObject
 	// open maps a subgroup ID to the highest index it has delivered, for
-	// every stream still running. A subgroup absent from both this and expected
-	// cannot produce anything — it ended, or was never subscribed — so it does
-	// not hold the group back.
+	// every stream still running. A subgroup absent from it cannot produce
+	// anything — it ended, was shed, or was never subscribed — so it does not
+	// hold the group back.
 	open map[uint64]uint64
 	// started marks a subgroup as having delivered at least one object. A
 	// stream that has opened but produced nothing yet must block release —
 	// its first object could be the one being waited for — which a zero
 	// highest-delivered cannot express on its own, since 0 is a real index.
 	started map[uint64]bool
-	// expected holds subgroups the publisher declared and this group has not
-	// seen a stream for. They block release without blocking it forever: the
-	// backlog valve still applies, and a group whose expected stream never
-	// arrives is retired by the track once a later group has superseded it.
-	expected map[uint64]bool
 }
 
-// newGroupReassembler starts a group expecting expect subgroups, numbered from
-// zero. Zero expects nothing, which is right for a group with no history behind
-// it and exactly the behaviour a single-subgroup track had before layers.
-func newGroupReassembler(expect int) *groupReassembler {
-	g := &groupReassembler{
-		open:     make(map[uint64]uint64),
-		started:  make(map[uint64]bool),
-		expected: make(map[uint64]bool),
+func newGroupReassembler() *groupReassembler {
+	return &groupReassembler{
+		open:    make(map[uint64]uint64),
+		started: make(map[uint64]bool),
 	}
-	for subgroup := range expect {
-		g.expected[uint64(subgroup)] = true
-	}
-	return g
 }
 
 // OpenSubgroup registers a stream that may still deliver objects. Called before
@@ -131,7 +116,6 @@ func newGroupReassembler(expect int) *groupReassembler {
 func (g *groupReassembler) OpenSubgroup(subgroup uint64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	delete(g.expected, subgroup)
 	if _, ok := g.open[subgroup]; !ok {
 		g.open[subgroup] = 0
 		g.started[subgroup] = false
@@ -223,20 +207,15 @@ func (g *groupReassembler) drainLocked() {
 // still expected. Each stream is ordered on its own, so a stream past this index
 // can never come back below it, and a stream with nothing left open cannot
 // produce anything at all — between them, nothing earlier exists to wait for.
-// This is what covers both a gap the relay punched and a layer this subscriber
-// declined: the frames around the hole arrive, every stream moves past it, and
-// the run continues without the missing index ever showing up. The expected
-// check is what keeps that reasoning honest, since a subgroup whose stream has
-// not arrived yet can still produce something earlier however quiet it looks.
+// This is what covers a gap the relay punched, a layer it shed, and a layer this
+// subscriber declined alike: the frames around the hole arrive, every stream
+// moves past it, and the run continues without the missing index showing up.
 func (g *groupReassembler) releasableLocked(index uint64) bool {
 	if index == g.next {
 		return true
 	}
 	if len(g.held) >= maxHeldObjects {
 		return true
-	}
-	if len(g.expected) > 0 {
-		return false
 	}
 	for subgroup, highest := range g.open {
 		if !g.started[subgroup] || highest < index {
@@ -246,17 +225,12 @@ func (g *groupReassembler) releasableLocked(index uint64) bool {
 	return true
 }
 
-// idle reports whether every subgroup stream of this group has ended and none
-// is still expected, which is when the group can be retired.
-//
-// A group still expecting a stream is not idle however quiet it has gone. In a
-// burst the base layer's stream can end while the enhancement layer has not been
-// opened yet, and retiring on that would flush the group and then discard the
-// layer when it arrived — the very thing expected exists to prevent.
+// idle reports whether every subgroup stream of this group has ended, which is
+// when the group can be retired.
 func (g *groupReassembler) idle() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return len(g.open) == 0 && len(g.expected) == 0
+	return len(g.open) == 0
 }
 
 // Flush emits everything still held, in order, and forgets the group. Called
@@ -272,5 +246,4 @@ func (g *groupReassembler) Flush() {
 	g.held = nil
 	clear(g.open)
 	clear(g.started)
-	clear(g.expected)
 }

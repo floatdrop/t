@@ -295,8 +295,6 @@ interface AudioSink {
   restarts: number;
   /** Trims seen so far, so only an increase is reported. */
   trimmed: number;
-  /** Chunks written to the slot their timestamp named rather than appended. */
-  reorderedAudio: number;
   /**
    * Latest playout position reported by the worklet — the master clock for
    * this participant's video. Null until audio actually starts playing.
@@ -490,7 +488,6 @@ export class Playback {
       buffered: 0,
       underruns: 0,
       trimmed: 0,
-      reorderedAudio: 0,
       restarts: 0,
       config: null as unknown as AudioDecoderConfig,
       clock: null,
@@ -513,17 +510,6 @@ export class Playback {
     node.port.onmessage = (ev: MessageEvent<PlayerReport>) => {
       sink.buffered = ev.data.available;
       sink.underruns = ev.data.underruns;
-      // Reported on the edge, like a trim: a reordered packet is the path
-      // delivering out of order, which is worth knowing about even though the
-      // buffer absorbed it.
-      if (ev.data.reordered > sink.reorderedAudio) {
-        sink.reorderedAudio = ev.data.reordered;
-        bridge.report('DEBUG', 'placed audio that arrived out of order', {
-          participant: track.participant,
-          reordered: String(sink.reorderedAudio),
-          bufferedMs: String(Math.round((ev.data.available / 48000) * 1000)),
-        });
-      }
       // Said out loud, and only on the edge: one trim is a transient the
       // listener hears as a skip, but a stream of them means this participant's
       // audio is arriving faster than it can be played and something upstream

@@ -144,11 +144,6 @@
     <span class="badges">
       {#if speaking}<span class="badge speaking-badge" title="speaking">●</span>{/if}
       {#if hasAudio}<span class="badge" title="publishing audio">🔊</span>{/if}
-      {#if !isLocal && videoLevel === 'small'}
-        <span class="badge" title="reduced to fit the connection">◱</span>
-      {:else if !isLocal && videoLevel === 'none'}
-        <span class="badge warn" title="video dropped to fit the connection">⚠</span>
-      {/if}
       {#if label}<span class="badge mono">{label}</span>{/if}
     </span>
   </div>

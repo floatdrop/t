@@ -78,11 +78,6 @@
       default:
         return { level: 'down', label: 'Not connected' };
     }
-    // Said out loud, because the picture visibly changes and the alternative
-    // is a call that quietly got worse for no reason anyone can see.
-    if (store.linkCongested) {
-      return { level: 'degraded', label: 'Connected · reduced video to fit the connection' };
-    }
     const loss = store.metrics?.lossPercent ?? 0;
     if (loss >= LOSS_DEGRADED_PERCENT) {
       return { level: 'degraded', label: `Connected · ${loss.toFixed(1)}% packet loss` };
@@ -216,14 +211,6 @@
   // know when one tile has the window to itself.
   $effect(() => {
     store.expandedTile = expanded;
-  });
-
-  // The tiles can stop being worth the full picture without any of them
-  // moving: making the window smaller changes every tile's size and none of
-  // their visibility, so the observer below never fires for it.
-  $effect(() => {
-    void store.geometryKey;
-    store.refreshInterest();
   });
 
   $effect(() => {

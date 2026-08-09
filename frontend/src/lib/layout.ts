@@ -94,54 +94,8 @@ export function autoVideoBitrate(rung: VideoRung, selected: number): number {
   return next ? Math.min(selected, next.minBitrate) : selected;
 }
 
-/**
- * The device-pixel width at or below which a publisher's smaller encoding is
- * enough.
- *
- * The bottom rung of the ladder, because that is what the small layer is
- * encoded at: a tile drawn no wider than this gains nothing from the full
- * picture, since it would be scaled back down to about this before anyone saw
- * it.
- */
-export const SMALL_TILE_WIDTH = VIDEO_LADDER[0].width;
 
-/**
- * The width at which a tile stops making do with the smaller encoding.
- *
- * Deliberately not the same number as SMALL_TILE_WIDTH. One threshold means a
- * tile sitting near it flips layer on every nudge, and a layer change is not
- * free: a fresh SUBSCRIBE, a new handle, a new decoder and a backfilled group
- * its live stream waits behind. A third again is enough of a gap that
- * settling on the boundary picks one and stays there.
- */
-export const FULL_TILE_WIDTH = Math.round(SMALL_TILE_WIDTH * 1.35);
 
-/**
- * Whether the tiles this grid will draw are small enough that the smaller
- * encoding will do.
- *
- * Here rather than in the component for the same reason the rung arithmetic
- * is: it is the tile width that decides it, and a second copy of that
- * calculation would drift from the one the grid lays out with — a drift that
- * shows up only as a stream that is quietly the wrong size.
- */
-export function tilesTakeSmallVideo(
-  input: {
-    tiles: number;
-    viewportWidth: number;
-    pixelRatio: number;
-  },
-  // What was decided last time. The answer depends on it, because the two
-  // thresholds are different in each direction — see FULL_TILE_WIDTH.
-  currentlySmall: boolean,
-): boolean {
-  const width =
-    tileWidth(input.tiles, input.viewportWidth) * Math.min(input.pixelRatio, MAX_PIXEL_RATIO);
-  // Nothing measurable yet: keep what was decided rather than guessing, since
-  // guessing here costs a layer change.
-  if (width <= 0) return currentlySmall;
-  return currentlySmall ? width <= FULL_TILE_WIDTH : width <= SMALL_TILE_WIDTH;
-}
 
 export function autoVideoRung(input: AutoVideoInput): VideoRung {
   const wanted =

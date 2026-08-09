@@ -1346,13 +1346,11 @@ func (r *remote) demote(track *remoteTrack, code string) {
 	if givingUp {
 		r.videoOff = true
 		r.rebuilds = 0
-		// Given up on again soon after coming back: the link has not recovered,
-		// so wait longer before believing it has.
-		if r.recoveryWait <= 0 {
-			r.recoveryWait = videoRecovery
-		} else if !r.recoveredAt.IsZero() && time.Since(r.recoveredAt) < r.recoveryWait {
-			r.recoveryWait = min(r.recoveryWait*2, videoRecoveryMax)
+		heldFor := time.Duration(0)
+		if !r.recoveredAt.IsZero() {
+			heldFor = time.Since(r.recoveredAt)
 		}
+		r.recoveryWait = nextRecoveryWait(r.recoveryWait, heldFor, !r.recoveredAt.IsZero())
 		backoff = r.recoveryWait.String()
 	}
 	video, audio := r.wantVideo, r.wantAudio
@@ -1408,6 +1406,31 @@ func (r *remote) scheduleRecovery() {
 	}
 	r.recovery = time.AfterFunc(r.recoveryWait, r.recover)
 	r.mu.Unlock()
+}
+
+// nextRecoveryWait is how long to leave video off, given how long the last
+// attempt at it lasted.
+//
+// It grows when video comes back and is given up on again sooner than the wait
+// that preceded it: the link has not recovered, and the reduced state needs
+// somewhere to settle rather than something to bounce off. Doubling to a
+// ceiling is what gives it that.
+//
+// And it shrinks again, which it did not for a while. Nothing lowered it, so
+// two bad minutes early in a call raised the wait to a couple of minutes and
+// left it there — an hour of a perfect link later, one burst still cost a
+// blank tile for two minutes. videoRecoveryMax's own reasoning is that a link
+// which genuinely recovered must not be written off for the evening, and a
+// wait that only ever grows writes it off. Video that held for longer than the
+// wait it was given is the evidence that the link recovered, so that resets it.
+func nextRecoveryWait(current, heldFor time.Duration, hasRecovered bool) time.Duration {
+	if current <= 0 {
+		return videoRecovery
+	}
+	if hasRecovered && heldFor < current {
+		return min(current*2, videoRecoveryMax)
+	}
+	return videoRecovery
 }
 
 // recover turns video back on once the link has been quiet, after it was given

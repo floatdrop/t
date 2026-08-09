@@ -265,11 +265,17 @@ func TestReassemblerFlushEmitsTheBacklog(t *testing.T) {
 
 // TestReassemblerConcurrentPushesStayOrdered runs the real shape: one goroutine
 // per subgroup stream, pushing at once, as the router does. Whatever the
-// interleaving, the emitted sequence must be ascending — the emits happen under
-// the lock precisely so two readers cannot interleave their output and undo the
-// ordering. Run this one with -race.
+// interleaving, the emitted sequence must be ascending and complete — the emits
+// happen under the lock precisely so two readers cannot interleave their output
+// and undo the ordering. Run this one with -race.
+//
+// Deliberately below maxHeldObjects, so that one goroutine winning the race
+// outright still leaves the backlog inside its bound. Above it the valve fires
+// and frames are dropped by design — which is worth testing, and is what
+// TestReassemblerBoundsTheBacklog does; asserting completeness there as well
+// would only be asserting that the scheduler stayed fair.
 func TestReassemblerConcurrentPushesStayOrdered(t *testing.T) {
-	const perLayer = 200
+	const perLayer = maxHeldObjects / 2
 	g := newGroupReassembler(2)
 	var c collector
 	g.OpenSubgroup(0)

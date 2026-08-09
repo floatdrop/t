@@ -58,23 +58,38 @@ lost about half the frames of a group that arrived as a burst. Per-layer ranges
 bring it back to one stream per subgroup.
 
 That leaves the object ID saying nothing about where a frame belongs relative to
-another subgroup's, so reassembly keys on the **LOC timestamp** instead. It has
-to reassemble at all because the layers arrive on concurrent streams read on
-separate goroutines: `internal/conf/reorder.go` orders a group's streams before
-anything reaches a decoder, with no timers — a frame is released once no
-still-open stream can produce anything earlier, which the latest timestamp each
-has delivered answers exactly. Decode order is presentation order here, since
-WebCodecs emits no B-frames.
+another subgroup's, so every object carries its position in the group's
+**emission order** as a producer-defined Object Property (type `0x8002`, above
+the mandatory-track-property range so nothing can mistake its scope). Ascending
+index is decode order exactly. Reassembly is needed at all because the layers
+arrive on concurrent streams read on separate goroutines:
+`internal/conf/reorder.go` orders a group's streams before anything reaches a
+decoder, with no timers — a frame goes out the moment it is the index being
+waited for, and otherwise once no still-open stream can produce anything
+earlier, which the highest index each has delivered answers exactly. A publisher
+that stamps no index falls back to the object ID, which is right for the only
+kind that does not: one subgroup per group, counting from zero without gaps.
 
-Two things follow. A group is told how many subgroups to expect, from a
-`temporalLayers` count the publisher declares in its catalog, because a stream
-that has not arrived yet is indistinguishable from one that never will — and the
-first group of a track, which is the backfilled one a joining subscriber
-receives all at once, is exactly where no history exists to infer it from. And
-while a layer is genuinely being carried, one frame sits in hand: the oldest held
-frame goes out when the other layer delivers something at or after it, which in
-a steady stream is the very next arrival. A group on a single subgroup — audio,
-and any unlayered video — waits for nothing and pays nothing for the machinery.
+The timestamp was tried as the key first and cost a frame of latency on every
+frame: it says which frame comes first but never whether anything earlier is
+still to come, so the oldest held frame always waited for the other layer to
+move past it.
+
+A group is also told how many subgroups to expect — the `temporalLayers` count
+the publisher declares in its catalog, less any layer this subscriber declined —
+because a stream that has not arrived yet is indistinguishable from one that
+never will, and the first group of a track, the backfilled one a joining
+subscriber receives all at once, is exactly where no history exists to infer it
+from. A group on a single subgroup — audio, and any unlayered video — waits for
+nothing and pays nothing for the machinery.
+
+The enhancement layer is also marked **disposable**, by a §8 object delivery
+timeout stamped on the first object of its subgroup: half a second, against the
+two seconds the base layer's subgroup gets. A relay honouring it resets that one
+stream with `DELIVERY_TIMEOUT` rather than terminating the subscription, so a
+link that cannot carry everything loses half its frame rate rather than its
+picture. Measured behind a 32 kB/s bottleneck, the enhancement layer fell from
+47% of the video bytes to 19% while the base layer kept arriving.
 
 The small encoding stays flat, on subgroup 0 alone. It already runs at a divided
 framerate, and a subscriber taking it has made the resolution step down that
@@ -624,8 +639,9 @@ path from a `MediaStreamTrack` to WebCodecs, so video frames are pulled off a
   (audio groups are 500 ms apart and video groups a keyframe interval apart, so
   they are never simultaneously in flight), but a burst of publishes does.
   Ordering across groups as well would remove the assumption, and the key it
-  would use is the same LOC timestamp — what it would need is somewhere to hold
-  a group's worth of frames, which is a jitter buffer rather than a reassembler.
+  would use is the LOC timestamp, since the emission index reassembly keys on is
+  numbered per group — what it would need is somewhere to hold a group's worth
+  of frames, which is a jitter buffer rather than a reassembler.
 - **The audio device's startup stall is corrected, not prevented.** Capture
   rendering pauses for around half a second while the page finishes starting up,
   and the clock tracker absorbs it within a second rather than the pause not

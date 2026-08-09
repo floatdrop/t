@@ -91,31 +91,8 @@ function temporalLayerOf(meta?: EncodedVideoChunkMetadata): number {
  */
 const MAX_FRAMERATE = 30;
 
-/**
- * How much slower the small layer runs than the primary.
- *
- * Halving it halves both of that layer's costs — the scale down and the encode
- * — and a thumbnail is not where anyone reads motion. It stays a factor rather
- * than a fixed rate so it follows the primary down when the primary is already
- * slow, as a screen share is.
- */
-const LOW_LAYER_FRAME_DIVISOR = 2;
 
-/**
- * What the small layer is worth, as a share of the bottom rung's asking price.
- *
- * VIDEO_LADDER's minBitrate is what a rung needs at MAX_FRAMERATE, and this
- * layer runs at half that — but halving the frame rate does not halve what it
- * costs, because a frame whose predecessor is further away has more to encode.
- * Around two thirds is the usual shape, and it is the ladder's number scaled
- * rather than a second number to keep in step with it.
- */
-const LOW_LAYER_BITRATE_FACTOR = 0.65;
 
-/** What the small layer asks for, given the above. */
-export function lowLayerBitrate(): number {
-  return Math.round(VIDEO_LADDER[0].minBitrate * LOW_LAYER_BITRATE_FACTOR);
-}
 
 /**
  * How close to a full frame interval two presentations may be and still count
@@ -277,7 +254,6 @@ export interface CaptureStats {
   /** Packets waiting inside the audio encoder — see MAX_AUDIO_ENCODE_QUEUE. */
   audioEncodeQueue: number;
   /** Frames the small video layer shed because its encoder was backed up. */
-  lowDropped: number;
   keyFrames: number;
   dropped: number;
   /** What the browser actually applied to the microphone track. */
@@ -392,7 +368,7 @@ type Declaration = Extract<ClientMessage, { type: 'track' } | { type: 'untrack' 
  * the small one must not supersede the primary's, or bringing up the layer
  * would withdraw the picture it is meant to accompany.
  */
-type DeclarationKind = 'video' | 'videoLow' | 'audio';
+type DeclarationKind = 'video' | 'audio';
 
 function declarationKind(msg: Declaration): DeclarationKind {
   return msg.type === 'track' ? msg.track.kind : msg.untrack;
@@ -511,26 +487,6 @@ export class Capture {
 
   #video: HTMLVideoElement | null = null;
   #videoEncoder: VideoEncoder | null = null;
-  /**
-   * The second, smaller encoding of the same camera — see startLowLayer.
-   * Null whenever the primary is already small enough that a second copy
-   * would buy nothing.
-   */
-  #lowEncoder: VideoEncoder | null = null;
-  /** Where a frame is scaled down before the low encoder sees it. */
-  #lowCanvas: OffscreenCanvas | null = null;
-  /** Alternates, so the small layer takes every second frame. */
-  #lowSkip = false;
-  /**
-   * Small-layer frames shed because its encoder was backed up.
-   *
-   * Counted separately from the primary's `dropped`: this layer's output is
-   * deliberately left out of the capture stats, so without its own counter a
-   * small layer shedding most of its frames is invisible — the only trace
-   * would be out/video-low carrying less than it advertises, which nothing
-   * compares.
-   */
-  #lowDropped = 0;
   #lowCtx: OffscreenCanvasRenderingContext2D | null = null;
   #audioEncoder: AudioEncoder | null = null;
   #audioCtx: AudioContext | null = null;
@@ -616,7 +572,7 @@ export class Capture {
   #lastSample = 0;
   #stats: CaptureStats = {
     videoFps: 0, videoKbps: 0, encodeQueue: 0,
-    audioFps: 0, audioKbps: 0, audioEncodeQueue: 0, lowDropped: 0, keyFrames: 0, dropped: 0,
+    audioFps: 0, audioKbps: 0, audioEncodeQueue: 0, keyFrames: 0, dropped: 0,
     echoCancellation: false, noiseSuppression: false, autoGainControl: false,
     denoiseActive: false,
   };
@@ -866,20 +822,11 @@ export class Capture {
     await withTimeout(el.play(), PLAY_TIMEOUT_MS, 'video element play()');
     this.#video = el;
 
-    // What the small layer will take, and what that leaves the primary.
-    //
-    // It used to be spent on top of the selection: a user who chose 1.5 Mbps
-    // sent 1.9, which on an asymmetric uplink is a real overrun of a number
-    // the interface presents as the budget. It comes out of the selection now,
-    // and is skipped when there is not room for both — below that point a
-    // second encoding is not a saving to offer anyone, it is just less of the
-    // picture everybody actually watches.
-    const floor = VIDEO_LADDER[0];
-    const lowBitrate =
-      width > floor.width && settings.bitrate - lowLayerBitrate() >= floor.minBitrate
-        ? lowLayerBitrate()
-        : 0;
-    const primaryBitrate = settings.bitrate - lowBitrate;
+    // The whole selection goes to the one encoding. There used to be a second,
+    // smaller one taking a share of it; a subscriber that cannot carry the
+    // picture is sent it with the enhancement layer shed instead, which costs
+    // the publisher nothing and needs no second encoder.
+    const primaryBitrate = settings.bitrate;
 
     const encoder = new VideoEncoder({
       output: (chunk, meta) => this.#onVideoChunk(chunk, meta),
@@ -953,7 +900,6 @@ export class Capture {
       },
     });
 
-    this.#startLowLayer(width, height, framerate, codec, lowBitrate);
 
     const keyEvery = Math.max(1, Math.round(framerate * KEYFRAME_INTERVAL_SEC));
 
@@ -1017,7 +963,6 @@ export class Capture {
           // one it moves to, and there is no way to ask for one — so the only
           // guarantee available is that both layers always have one at the
           // same moment.
-          this.#encodeLowLayer(frame, key);
           this.#frameIndex++;
         } catch (err) {
           bridge.report('WARN', 'video frame capture failed', { err: String(err) });
@@ -1323,7 +1268,6 @@ export class Capture {
     // again. Leaving it declared would hand every subscriber a decoder that
     // never receives another frame — the same freeze this withdrawal exists
     // to prevent, one track along.
-    this.#withdrawLowLayer();
     // Withdrawing says what is true now, not what will be true for the rest of
     // the call. A camera taken by another application, suspended by the system
     // or unplugged and plugged back in should cost the seconds it was away.
@@ -1394,208 +1338,11 @@ export class Capture {
     this.#undelivered = held;
   }
 
-  /**
-   * Brings up the second, smaller encoding of the same camera.
-   *
-   * Without it a subscriber has one choice per publisher: the full picture or
-   * nothing. That is the right answer for a tile drawn large and a poor one for
-   * a thumbnail, and it is nobody's correct answer in a call where two people
-   * have different window sizes — the resolution is picked from the
-   * publisher's own grid, so everyone gets a stream sized for a screen they
-   * cannot see.
-   *
-   * Both layers are published whenever video runs, rather than on request:
-   * nothing in MOQT tells a publisher that somebody subscribed, so there is no
-   * demand signal to light one up from. The cost is a second encoder and its
-   * bitrate, which is why the layer is skipped entirely when the primary is
-   * already at or below the small rung and a copy would buy nothing.
-   */
-  #startLowLayer(
-    width: number,
-    height: number,
-    framerate: number,
-    codec: string,
-    bitrate: number,
-  ): void {
-    this.#stopLowLayer();
 
-    const rung = VIDEO_LADDER[0];
-    if (bitrate <= 0 || width <= rung.width) {
-      // The primary is already this small or smaller, so a second copy of it
-      // would be the same picture twice. If a larger primary had one, that
-      // declaration has to go with it rather than being left behind pointing
-      // at an encoder that has just been closed.
-      this.#withdrawLowLayer();
-      return;
-    }
 
-    let canvas: OffscreenCanvas;
-    let ctx: OffscreenCanvasRenderingContext2D | null;
-    try {
-      // Scaled through a canvas rather than by handing an oversized frame to a
-      // smaller encoder: encoders differ on whether they will scale one, and
-      // this is the WebView where that kind of optimism has cost the most.
-      // Even dimensions: some H.264 encoders refuse an odd one, and an
-      // arbitrary screen-share geometry will produce one about half the time.
-      const scaled = Math.round((rung.width * height) / width);
-      canvas = new OffscreenCanvas(rung.width, scaled + (scaled % 2));
-      ctx = canvas.getContext('2d');
-      if (ctx) {
-        // The default is 'low' — bilinear with no mip chain, which aliases
-        // badly downscaling 1920 to 640. A screen share is the case that
-        // suffers most, and the subscriber whose tile is small enough to be
-        // given this layer is the one most likely to be reading text off it.
-        ctx.imageSmoothingQuality = 'high';
-      }
-    } catch (err) {
-      bridge.report('WARN', 'no small video layer: canvas unavailable', { err: String(err) });
-      return;
-    }
-    if (!ctx) {
-      bridge.report('WARN', 'no small video layer: no 2d context');
-      return;
-    }
 
-    const encoder = new VideoEncoder({
-      output: (chunk) => this.#onLowChunk(chunk),
-      // Only the small layer is withdrawn. The primary is a separate encoder
-      // and a separate track, and a call that has lost its thumbnail is still
-      // a call.
-      error: (err) => this.#failLowLayer(encoder, 'small video layer failed', { err: String(err) }),
-    });
-    try {
-      encoder.configure({
-        codec,
-        width: canvas.width,
-        height: canvas.height,
-        bitrate,
-        framerate: framerate / LOW_LAYER_FRAME_DIVISOR,
-        latencyMode: 'realtime',
-        avc: { format: 'annexb' },
-      });
-    } catch (err) {
-      bridge.report('WARN', 'no small video layer: configure failed', { err: String(err) });
-      return;
-    }
 
-    this.#lowEncoder = encoder;
-    this.#lowCanvas = canvas;
-    this.#lowCtx = ctx;
 
-    this.#declare({
-      type: 'track',
-      track: {
-        kind: 'videoLow',
-        codec,
-        width: canvas.width,
-        height: canvas.height,
-        framerate: framerate / LOW_LAYER_FRAME_DIVISOR,
-        bitrate,
-      },
-    });
-    bridge.report('INFO', 'small video layer configured', {
-      size: `${canvas.width}x${canvas.height}`,
-      bitrate: String(bitrate),
-      framerate: String(Math.round(framerate / LOW_LAYER_FRAME_DIVISOR)),
-    });
-  }
-
-  /** Scales one frame down and encodes it into the small layer. */
-  #encodeLowLayer(frame: VideoFrame, keyFrame: boolean): void {
-    const encoder = this.#lowEncoder;
-    const canvas = this.#lowCanvas;
-    const ctx = this.#lowCtx;
-    if (!encoder || !canvas || !ctx) return;
-    if (encoder.state !== 'configured') return;
-
-    // Both ways of sending less are for delta frames only. A keyframe is the
-    // only frame a subscriber can start from, and there is no way to ask this
-    // publisher for another — drop one and the group silently runs to double
-    // length, which strands anyone switching to this layer and doubles the
-    // backfill they pay for when they arrive. The keyframe alignment between
-    // the two layers is the guarantee being protected here.
-    if (!keyFrame) {
-      // Shed when the encoder is backed up, which is exactly when the machine
-      // is busy running two of them.
-      if (encoder.encodeQueueSize > 2) {
-        this.#lowDropped++;
-        return;
-      }
-      // Half the primary's rate. A tile small enough to want this layer is not
-      // one anyone reads motion off, and both costs — the scale down and the
-      // encode — are paid per frame.
-      this.#lowSkip = !this.#lowSkip;
-      if (this.#lowSkip) return;
-    } else {
-      this.#lowSkip = false;
-    }
-
-    let scaled: VideoFrame | null = null;
-    try {
-      ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
-      scaled = new VideoFrame(canvas, { timestamp: frame.timestamp });
-      encoder.encode(scaled, { keyFrame });
-    } catch (err) {
-      this.#failLowLayer(encoder, 'small video layer encode failed', { err: String(err) });
-    } finally {
-      scaled?.close();
-    }
-  }
-
-  #onLowChunk(chunk: EncodedVideoChunk): void {
-    const payload = new Uint8Array(chunk.byteLength);
-    chunk.copyTo(payload);
-    // Not counted in the capture stats: those describe the picture being sent,
-    // and counting the same frames twice would read as double the framerate.
-    bridge.sendFrame({
-      kind: KIND_VIDEO,
-      handle: HANDLE_LOCAL_VIDEO_LOW,
-      timestamp: chunk.timestamp,
-      keyFrame: chunk.type === 'key',
-      payload,
-    });
-  }
-
-  /**
-   * Gives up on the small layer, leaving the primary running.
-   *
-   * Guarded on the encoder still being the current one, for the reason
-   * #failVideo is: a failure reported by an encoder that has since been
-   * replaced belongs to a layer that is already gone, and withdrawing on its
-   * behalf would take down the live one — after which a subscriber demoted to
-   * the small layer would get nothing at all.
-   */
-  #failLowLayer(encoder: VideoEncoder, reason: string, attrs: Record<string, string>): void {
-    if (this.#lowEncoder !== encoder) return;
-    bridge.report('WARN', reason, attrs);
-    this.#withdrawLowLayer();
-  }
-
-  /**
-   * Stops the small layer and takes it out of the catalog.
-   *
-   * Withdrawing a kind that was never declared is a no-op on the backend, so
-   * this needs no memory of whether there was one.
-   */
-  #withdrawLowLayer(): void {
-    this.#stopLowLayer();
-    this.#declare({ type: 'untrack', untrack: 'videoLow' });
-  }
-
-  #stopLowLayer(): void {
-    const encoder = this.#lowEncoder;
-    this.#lowEncoder = null;
-    this.#lowCanvas = null;
-    this.#lowCtx = null;
-    this.#lowDropped = 0;
-    if (encoder && encoder.state !== 'closed') {
-      try {
-        encoder.close();
-      } catch {
-        // Already gone; nothing to release.
-      }
-    }
-  }
 
   #onVideoChunk(chunk: EncodedVideoChunk, meta?: EncodedVideoChunkMetadata): void {
     const payload = new Uint8Array(chunk.byteLength);
@@ -1961,7 +1708,6 @@ export class Capture {
         audioFps: this.#audioFrames / elapsed,
         audioKbps: (this.#audioBytes * 8) / 1000 / elapsed,
         audioEncodeQueue: this.#audioEncoder?.encodeQueueSize ?? 0,
-        lowDropped: this.#lowDropped,
         keyFrames: this.#stats.keyFrames + this.#keyFrames,
         dropped: this.#stats.dropped + this.#dropped,
         echoCancellation: this.#stats.echoCancellation,
@@ -2031,7 +1777,6 @@ export class Capture {
       // a no-op on the backend, so this needs no memory of what came before.
       if (!this.#videoRunning) {
         this.#declare({ type: 'untrack', untrack: 'video' });
-        this.#withdrawLowLayer();
       }
       if (!this.#audioRunning) this.#declare({ type: 'untrack', untrack: 'audio' });
     }
@@ -2066,7 +1811,6 @@ export class Capture {
     this.#detachTrackWatch?.();
     this.#stopCaptureWatchdogIfIdle();
 
-    this.#stopLowLayer();
     if (this.#videoEncoder && this.#videoEncoder.state !== 'closed') this.#videoEncoder.close();
     this.#videoEncoder = null;
     if (this.#video) {

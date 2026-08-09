@@ -52,16 +52,7 @@ const NamespaceRoot = "tlmst"
 const (
 	VideoTrack = "video"
 	AudioTrack = "audio"
-	// VideoLowTrack is a second, smaller encoding of the same camera. Both
-	// carry MSF's video role; the name is what tells them apart, and a
-	// subscriber takes exactly one of the two.
-	VideoLowTrack = "video-low"
 )
-
-// KindVideoLow is the track kind the frontend declares the small encoding
-// under. Its media frames are ordinary video — only the declaration and the
-// handle distinguish the layer.
-const KindVideoLow = "videoLow"
 
 // How long to wait before rebuilding a room watch that ended, the ceiling on
 // that wait, and how many attempts before the session is declared lost instead.

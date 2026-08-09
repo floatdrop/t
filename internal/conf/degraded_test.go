@@ -355,49 +355,52 @@ func TestSkewStaysFlatOnAHealthyPath(t *testing.T) {
 const congestedDriftFloor float64 = 5
 
 // The relay does not merely reset a stream when it gives up on a subscriber:
-// it terminates the subscription. Nothing else rebuilds one, so before this
-// the tile that happened to went blank for the rest of the call — the exact
-// failure the reset was warning about, made permanent by not being answered.
+// it terminates the subscription. Nothing else rebuilds one, so the tile it
+// happened to would go blank for the rest of the call — the exact failure the
+// reset was warning about, made permanent by not being answered.
 //
-// The answer is not to re-subscribe as we were, which would offer back the
-// load that was just refused and be cut off again a lag window later. It is to
-// come back smaller.
-func TestOverloadDemotesRatherThanFreezing(t *testing.T) {
+// The answer used to be to come back smaller, down a ladder of encodings. There
+// is one encoding now, and what a link that cannot carry it gets instead is the
+// same track with its enhancement layer shed by the relay, which needs no
+// negotiating. So the answer is to ask again — and to stop asking for a while
+// once the link has answered the question enough times.
+func TestOverloadRebuildsRatherThanFreezing(t *testing.T) {
 	relayServer := startRelay(t)
 	addr := relayServer.Addr()
-	alice := simulcastPublisher(t, addr, "demote", "alice")
+	alice := publisherWithBothTracks(t, addr, "demote", "alice")
 
 	link := startShaper(t, addr, 32_000, 64)
 	spy := newLogSpy(t)
-	bobRoom, bobRec := joinRoomWithCounters(
+	_, bobRec := joinRoomWithCounters(
 		t, link.Addr(), "demote", "bob", telemetry.NewRegistry(), slog.New(spy))
-	_ = bobRoom
 
-	waitFor(t, "bob to take the full picture", 15*time.Second, func() bool {
-		v, ok := bobRec.trackFor("video")
-		return ok && v.Config.Width == 1280
+	waitFor(t, "bob to take the video", 15*time.Second, func() bool {
+		_, ok := bobRec.trackFor("video")
+		return ok
 	})
+	first, _ := bobRec.trackFor("video")
 
 	stop := make(chan struct{})
 	publishPaced(t, alice, stop)
 	defer close(stop)
 
-	waitFor(t, "the relay to give up on the full picture", 25*time.Second, func() bool {
+	waitFor(t, "the relay to give up on the subscription", 25*time.Second, func() bool {
 		return spy.sawAttr("msg",
 			"the relay stopped forwarding a track: we are not keeping up")
 	})
 
-	// The subscription the relay killed is rebuilt, and rebuilt smaller.
-	waitFor(t, "video to come back at the smaller encoding", 20*time.Second, func() bool {
+	// A new handle for the same track: rebuilt, not abandoned and not swapped
+	// for something else.
+	waitFor(t, "video to come back on a fresh subscription", 25*time.Second, func() bool {
 		v, ok := bobRec.trackFor("video")
-		return ok && v.Config.Width == 640
+		return ok && v.Handle != first.Handle
 	})
-
-	if !spy.sawAttr("to", "small") {
-		t.Error("the demotion was not reported as a step down the ladder")
+	if !spy.sawAttr("action", "rebuilding it unchanged") {
+		t.Error("the rebuild was not reported")
 	}
+
 	_, _, _, errs := bobRec.snapshot()
 	if len(errs) > 0 {
-		t.Errorf("being demoted was reported to the user as a failure: %v", errs)
+		t.Errorf("being cut off was reported to the user as a failure: %v", errs)
 	}
 }

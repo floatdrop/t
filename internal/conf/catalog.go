@@ -48,7 +48,7 @@ const audioInitRef = "audio-config"
 // audio may each be nil, which is how a participant that publishes only
 // one of the two (or neither, before its encoders have started) is
 // described.
-func buildCatalog(nickname, version string, video, videoLow, audio *bridge.TrackConfig) (msf.Catalog, error) {
+func buildCatalog(nickname, version string, video, audio *bridge.TrackConfig) (msf.Catalog, error) {
 	live := true
 	// Both media tracks belong to one render group so a player knows
 	// they are meant to be presented together (§5.2.10).
@@ -57,18 +57,10 @@ func buildCatalog(nickname, version string, video, videoLow, audio *bridge.Track
 	var tracks []msf.Track
 	var initData []msf.InitData
 
-	// Both video encodings are declared the same way and differ only in name
-	// and size: a subscriber picks whichever fits the tile it will draw.
-	for _, layer := range []struct {
-		name string
-		cfg  *bridge.TrackConfig
-	}{{VideoTrack, video}, {VideoLowTrack, videoLow}} {
-		if layer.cfg == nil {
-			continue
-		}
-		v := layer.cfg
+	if video != nil {
+		v := video
 		track := msf.Track{
-			Name:        layer.name,
+			Name:        VideoTrack,
 			Packaging:   msf.PackagingLOC,
 			IsLive:      &live,
 			Role:        msf.RoleVideo,
@@ -149,10 +141,7 @@ type parsedCatalog struct {
 	// old enough not to say.
 	Version string
 	Video   *bridge.TrackConfig
-	// VideoLow is the smaller encoding, when the publisher offers one. Both
-	// carry MSF's video role, so they are told apart by track name.
-	VideoLow *bridge.TrackConfig
-	Audio    *bridge.TrackConfig
+	Audio   *bridge.TrackConfig
 	// Complete reports the §11.3 terminator catalog — the publisher has
 	// ended the broadcast and every track is done.
 	Complete bool
@@ -208,14 +197,10 @@ func parseCatalog(payload []byte) (parsedCatalog, error) {
 				n > 1 && n <= float64(bridge.MaxTemporalLayer+1) {
 				cfg.TemporalLayers = uint8(n)
 			}
-			// A publisher too old to simulcast names its only video track
-			// "video"; anything else with the video role that is not the low
-			// layer is ignored rather than guessed at.
-			switch tr.Name {
-			case VideoTrack:
+			// Only the track named "video"; anything else with the video role is
+			// ignored rather than guessed at.
+			if tr.Name == VideoTrack {
 				out.Video = cfg
-			case VideoLowTrack:
-				out.VideoLow = cfg
 			}
 		case msf.RoleAudio:
 			channels, err := strconv.ParseUint(tr.ChannelConfig, 10, 32)

@@ -618,7 +618,7 @@ func (a *App) setInterest(in *bridge.Interest) {
 	room := a.room
 	a.mu.Unlock()
 	if room != nil {
-		room.SetVideoInterest(in.Video, in.Low)
+		room.SetVideoInterest(in.Video)
 	}
 }
 
@@ -628,7 +628,7 @@ func (a *App) restoreInterest(room *conf.Room) {
 	in := a.interest
 	a.mu.Unlock()
 	if in != nil {
-		room.SetVideoInterest(in.Video, in.Low)
+		room.SetVideoInterest(in.Video)
 	}
 }
 

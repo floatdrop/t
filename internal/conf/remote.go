@@ -56,31 +56,6 @@ const (
 	videoPriority   = 60
 )
 
-// videoLevel is how much of a participant's video this client is still asking
-// for. The relay demotes us down this ladder by giving up on a subscription;
-// time promotes us back up.
-type videoLevel int
-
-const (
-	videoFull     videoLevel = iota // the primary encoding, every layer of it
-	videoBaseOnly                   // the primary encoding without its top temporal layer
-	videoSmall                      // the publisher's smaller encoding
-	videoNone                       // audio only
-)
-
-func (l videoLevel) String() string {
-	switch l {
-	case videoBaseOnly:
-		return "base-only"
-	case videoSmall:
-		return "small"
-	case videoNone:
-		return "none"
-	default:
-		return "full"
-	}
-}
-
 // maxLag is how far behind the live edge a subscription may slip before it is
 // rebuilt to escape it.
 //
@@ -118,8 +93,21 @@ const backfillBlind = 4 * time.Second
 // the only protection against asking forever is to ask less often.
 const audioRebuildCooldown = 5 * time.Second
 
-// videoRecovery is how long a demotion holds before this client tries one step
-// back up.
+// videoGiveUpAfter is how many times the relay may give up on a participant's
+// video inside videoGiveUpWindow before this client stops asking for it.
+//
+// More than one is deliberate. A single verdict is often a burst rather than a
+// verdict about the link, and the honest first answer is to ask again — a fresh
+// SUBSCRIBE starts at the live edge, and the §8 timeout on the enhancement
+// layer means what comes back is lighter than what was refused without anyone
+// negotiating it. Three inside a minute is a link that has answered the
+// question.
+const (
+	videoGiveUpAfter  = 3
+	videoGiveUpWindow = time.Minute
+)
+
+// videoRecovery is how long video stays off before this client asks again.
 //
 // Long enough that a congested minute is not spent flapping: a step up costs a
 // fresh SUBSCRIBE, a new handle, a new decoder and a wait for the next keyframe
@@ -186,9 +174,8 @@ type remote struct {
 	// wantVideo/wantAudio are the configs the last applied catalog asked for,
 	// kept so a subscribe that failed can be tried again against what the
 	// publisher actually wants rather than waiting for them to republish.
-	wantVideo    *bridge.TrackConfig
-	wantVideoLow *bridge.TrackConfig
-	wantAudio    *bridge.TrackConfig
+	wantVideo *bridge.TrackConfig
+	wantAudio *bridge.TrackConfig
 	// retrying marks a resubscribe loop already in flight for this remote.
 	retrying   bool
 	hasCatalog bool
@@ -206,7 +193,6 @@ type remote struct {
 	// level is how much of this participant's video is still being asked for,
 	// after any demotion the relay has forced on us. It only ever lowers what
 	// the frontend asked for, never raises it.
-	level videoLevel
 	// demotedFor is the handle the current demotion was decided on. A
 	// subscription's groups arrive on separate streams and the relay resets
 	// each of them, so the same verdict lands more than once; without this
@@ -221,11 +207,20 @@ type remote struct {
 	// escape a slip, so a link that cannot hold the live edge does not rebuild
 	// them continuously.
 	resyncedAt time.Time
-	// recoveryWait is how long the next attempt to climb back waits. It grows
-	// each time a step up fails to survive, and resets once one does.
+	// rebuilds counts how often the relay has given up on this participant's
+	// video lately, and rebuiltSince is when that count started. Enough of them
+	// in one window means the link is not going to carry it, and video is set
+	// aside until the recovery timer tries again.
+	rebuilds     int
+	rebuiltSince time.Time
+	// videoOff is set while video has been given up on, so reconcile stops
+	// asking for it.
+	videoOff bool
+	// recoveryWait is how long the next attempt waits. It grows on a rebuild
+	// that did not survive — see videoRecoveryMax.
 	recoveryWait time.Duration
-	// recoveredAt is when the last step up happened, so demote can tell one
-	// that survived from one that was cut off almost immediately.
+	// recoveredAt is when video was last turned back on, so a rebuild can tell
+	// one that survived from one that did not.
 	recoveredAt time.Time
 	// recovery lifts the demotion once the link has been quiet. Replaced on
 	// each demotion, so the wait always runs from the most recent one.
@@ -243,13 +238,8 @@ type remoteTrack struct {
 	// is. Two layers can carry identical configs — same codec, same
 	// framerate — so the config alone cannot tell them apart.
 	name string
-	// config is what the publisher declared. layers is how many subgroups of it
-	// this subscription actually asked for, which is the smaller number
-	// whenever a §5.1.3 filter declined the top of the stack — and the one
-	// reassembly must expect, since a subgroup this client declined is one no
-	// group of it should ever wait for.
+	// config is what the publisher declared.
 	config bridge.TrackConfig
-	layers uint8
 	sub    *session.Subscription
 	// fetch is the joining FETCH that backfilled the group in progress when
 	// this track was subscribed. Nil on audio, and on video whose backfill was
@@ -630,7 +620,7 @@ func (r *remote) onCatalog(group uint64, payload []byte) {
 	}
 	// §11.3 Complete means they have ended the broadcast, so it declares
 	// nothing whatever the track fields say.
-	r.catalogVideo = !cat.Complete && (cat.Video != nil || cat.VideoLow != nil)
+	r.catalogVideo = !cat.Complete && cat.Video != nil
 	r.catalogAudio = !cat.Complete && cat.Audio != nil
 	r.mu.Unlock()
 
@@ -644,20 +634,20 @@ func (r *remote) onCatalog(group uint64, payload []byte) {
 		// §11.3: the publisher ended its broadcast. Drop the media
 		// subscriptions but keep watching the catalog — the namespace is
 		// still announced, and they may start publishing again.
-		r.reconcile(nil, nil, nil)
+		r.reconcile(nil, nil)
 		r.room.publishParticipants()
 		return
 	}
 
-	r.reconcile(cat.Video, cat.VideoLow, cat.Audio)
+	r.reconcile(cat.Video, cat.Audio)
 	r.room.publishParticipants()
 }
 
 // remember records what the current catalog asks for, so a failed subscribe
 // has something to be retried against.
-func (r *remote) remember(video, videoLow, audio *bridge.TrackConfig) {
+func (r *remote) remember(video, audio *bridge.TrackConfig) {
 	r.mu.Lock()
-	r.wantVideo, r.wantVideoLow, r.wantAudio = video, videoLow, audio
+	r.wantVideo, r.wantAudio = video, audio
 	r.mu.Unlock()
 }
 
@@ -673,19 +663,17 @@ func (r *remote) remember(video, videoLow, audio *bridge.TrackConfig) {
 // the room while holding its own would close the cycle.
 func (r *remote) missing() bool {
 	r.mu.Lock()
-	video, videoLow, audio := r.wantVideo, r.wantVideoLow, r.wantAudio
+	video, audio := r.wantVideo, r.wantAudio
 	haveVideo, haveAudio := r.video != nil, r.audio != nil
 	r.mu.Unlock()
 
-	// Asked of the chooser rather than inferred from the ladder, because there
-	// is more than one way to decline a track deliberately: demoted to none,
-	// not visible to the frontend, or demoted one step against a publisher who
-	// offers nothing smaller — which resolves to no video at all. Reading only
-	// the first of those left the third looking like a subscription that
-	// failed, so the retry loop spent all five attempts chasing a track this
-	// client had decided not to take, and then told the user the participant
-	// could not be reached while their audio was working.
-	_, wantedVideo, _ := r.chooseVideoLayer(video, videoLow)
+	// Asked of the chooser rather than assumed, because declining video is a
+	// decision this client makes in two ways — the tile is not on screen, or
+	// video has been given up on — and neither is a subscription that failed.
+	// Reading it wrongly sent the retry loop chasing a track nobody asked for
+	// and then told the user the participant could not be reached while their
+	// audio was working.
+	wantedVideo := r.chooseVideo(video)
 	return (wantedVideo != nil && !haveVideo) || (audio != nil && !haveAudio)
 }
 
@@ -727,7 +715,6 @@ func (r *remote) resubscribe() {
 
 		r.mu.Lock()
 		closed, video, audio := r.closed, r.wantVideo, r.wantAudio
-		videoLow := r.wantVideoLow
 		r.mu.Unlock()
 		if closed || !r.missing() {
 			return
@@ -736,7 +723,7 @@ func (r *remote) resubscribe() {
 		// Through reconcile under the same lock a catalog would take, so a
 		// retry and an arriving catalog cannot both subscribe the same track.
 		r.applying.Lock()
-		r.reconcile(video, videoLow, audio)
+		r.reconcile(video, audio)
 		r.applying.Unlock()
 
 		if !r.missing() {
@@ -765,91 +752,50 @@ func (r *remote) displayName() string {
 
 // reconcile brings the media subscriptions in line with the wanted
 // configs. A nil config means the track should not be subscribed.
-func (r *remote) reconcile(video, videoLow, audio *bridge.TrackConfig) {
-	r.remember(video, videoLow, audio)
-	name, wanted, layers := r.chooseVideoLayer(video, videoLow)
-	r.syncTrack(&r.video, name, bridge.KindVideo, wanted, layers)
-	r.syncTrack(&r.audio, AudioTrack, bridge.KindAudio, audio, 0)
+func (r *remote) reconcile(video, audio *bridge.TrackConfig) {
+	r.remember(video, audio)
+	r.syncTrack(&r.video, VideoTrack, bridge.KindVideo, r.chooseVideo(video))
+	r.syncTrack(&r.audio, AudioTrack, bridge.KindAudio, audio)
 }
 
-// chooseVideoLayer picks which of a publisher's video encodings to take.
+// videoStateOf names what this client is taking, for the roster.
+func videoStateOf(off bool) string {
+	if off {
+		return "none"
+	}
+	return "full"
+}
+
+// chooseVideo decides whether to subscribe this participant's video.
 //
-// What they publish and what we can use are different questions. The answer to
-// the second is the frontend's — it knows how big each tile will be drawn, and
-// which are on screen at all — and it only ever subtracts: a layer the catalog
-// does not declare cannot be wanted into existence.
+// There used to be a choice of encodings and a ladder that walked down them.
+// Both are gone. A publisher offers one video track, and what a link that
+// cannot carry it gets instead is the same track with its enhancement layer
+// shed — by the relay, under the §8 timeout the publisher marks it with, with
+// nobody asking. Degrading is something the transport does now, not something
+// this client negotiates.
 //
-// The fallbacks matter more than the preference. A publisher on an older build
-// offers one video track and no low layer, and a publisher whose primary
-// encoder died may offer only the small one; in both cases taking what exists
-// beats taking nothing, because nothing is a permanently blank tile.
-// The third return is how many temporal layers to ask for, zero meaning all of
-// them. It is what makes the base-only rung a filter on the subscription this
-// client already holds rather than a different track: same encoding, same
-// decoder, same handle, no keyframe to wait for — the whole reason a temporal
-// layer is a cheaper step than a smaller picture.
-func (r *remote) chooseVideoLayer(
-	video, videoLow *bridge.TrackConfig,
-) (string, *bridge.TrackConfig, uint8) {
-	// Both room lookups first, and neither under this remote's lock:
-	// publishParticipants holds the room's and calls inward, so reaching back
-	// the other way would close the cycle.
+// So the only questions left are whether the frontend can see the tile and
+// whether video has been given up on for this participant.
+func (r *remote) chooseVideo(video *bridge.TrackConfig) *bridge.TrackConfig {
+	// Before the lock: publishParticipants holds the room's and calls inward, so
+	// reaching back the other way would close the cycle.
 	if !r.room.wantsVideo(r.id) {
-		return VideoTrack, nil, 0
+		return nil
 	}
-	wantsSmall := r.room.wantsLowLayer(r.id)
-
 	r.mu.Lock()
-	level := r.level
-	r.mu.Unlock()
-
-	// The demotion only ever lowers what the frontend asked for. It cannot
-	// raise it: a tile the size of a thumbnail does not want the full picture
-	// because the link happens to be quiet.
-	switch {
-	case level == videoNone:
-		return VideoTrack, nil, 0
-
-	case level == videoBaseOnly &&
-		shedsALayer(video, wantsSmall, subgroupFiltersPermitted(r.room.sess)):
-		// The cheap step: the same subscription with its top layer declined.
-		//
-		// Only against a publisher that has one to decline. A rung that resolves
-		// to exactly what the rung above it resolves to is not a step down, and
-		// taking it as one is how this was got wrong before — the ladder spent a
-		// rung, shed nothing, and arrived at the next verdict no lighter than it
-		// started. Where there is no layer to drop, this falls through and
-		// behaves as the smaller encoding, which is what the ladder did before
-		// the rung existed.
-		return VideoTrack, video, 1
-
-	case level >= videoSmall || level == videoBaseOnly:
-		// Demoted by the relay. If this publisher offers nothing smaller then
-		// there is no smaller thing to ask for, and re-asking for the full
-		// picture would be offering back the load that was just refused — so
-		// the only step down left is off.
-		if videoLow != nil {
-			return VideoLowTrack, videoLow, 0
-		}
-		return VideoTrack, nil, 0
-
-	case wantsSmall && videoLow != nil:
-		return VideoLowTrack, videoLow, 0
-
-	case video != nil:
-		return VideoTrack, video, 0
-
-	case videoLow != nil:
-		return VideoLowTrack, videoLow, 0
+	defer r.mu.Unlock()
+	if r.videoOff {
+		return nil
 	}
-	return VideoTrack, nil, 0
+	return video
 }
 
 // applyInterest re-runs reconcile against the catalog this remote last
 // published, after the frontend has changed what it can see.
 func (r *remote) applyInterest() {
 	r.mu.Lock()
-	video, videoLow, audio, closed := r.wantVideo, r.wantVideoLow, r.wantAudio, r.closed
+	video, audio, closed := r.wantVideo, r.wantAudio, r.closed
 	r.mu.Unlock()
 	if closed {
 		return
@@ -858,13 +804,13 @@ func (r *remote) applyInterest() {
 	// arriving catalog cannot both decide the same track's fate at once.
 	r.applying.Lock()
 	defer r.applying.Unlock()
-	r.reconcile(video, videoLow, audio)
+	r.reconcile(video, audio)
 }
 
 // syncTrack subscribes, unsubscribes, or resubscribes one track so its
 // live state matches want. slot points at r.video or r.audio.
 func (r *remote) syncTrack(
-	slot **remoteTrack, name string, kind uint8, want *bridge.TrackConfig, layers uint8,
+	slot **remoteTrack, name string, kind uint8, want *bridge.TrackConfig,
 ) {
 	r.mu.Lock()
 	current := *slot
@@ -879,13 +825,8 @@ func (r *remote) syncTrack(
 		r.dropTrack(slot)
 		return
 
-	case current != nil && current.name == name && current.config == *want &&
-		current.layers == effectiveLayers(want, layers):
-		// Already subscribed to this exact track with this config, and asking
-		// for the same layers of it. The layer count belongs in that comparison
-		// because the base-only rung changes neither the name nor the config —
-		// without it, stepping onto or off that rung would decide nothing had
-		// changed and leave the subscription exactly as it was.
+	case current != nil && current.name == name && current.config == *want:
+		// Already subscribed to this exact track with this config.
 		return
 
 	case current != nil:
@@ -896,10 +837,6 @@ func (r *remote) syncTrack(
 			r.log.Info("track re-encoded, resubscribing", "track", name,
 				"from", fmt.Sprintf("%dx%d", current.config.Width, current.config.Height),
 				"to", fmt.Sprintf("%dx%d", want.Width, want.Height))
-		} else if current.name == name {
-			r.log.Info("temporal layers changed, resubscribing",
-				"track", name, "from", current.layers,
-				"to", effectiveLayers(want, layers))
 		} else {
 			r.log.Info("layer changed, resubscribing",
 				"from", current.name, "to", name)
@@ -910,26 +847,14 @@ func (r *remote) syncTrack(
 	if closed {
 		return
 	}
-	if err := r.subscribeTrack(slot, name, kind, want, layers); err != nil {
+	if err := r.subscribeTrack(slot, name, kind, want); err != nil {
 		r.log.Warn("track subscribe failed", "track", name, "err", err)
 		r.scheduleResubscribe()
 	}
 }
 
-// effectiveLayers resolves how many subgroups a subscription will actually
-// carry: what was asked for, bounded by what the publisher says it has. Zero
-// asked for means all of them, and a publisher that declares nothing gets the
-// single subgroup every track had before layers existed.
-func effectiveLayers(cfg *bridge.TrackConfig, want uint8) uint8 {
-	declared := max(cfg.TemporalLayers, 1)
-	if want == 0 || want > declared {
-		return declared
-	}
-	return want
-}
-
 func (r *remote) subscribeTrack(
-	slot **remoteTrack, name string, kind uint8, cfg *bridge.TrackConfig, layers uint8,
+	slot **remoteTrack, name string, kind uint8, cfg *bridge.TrackConfig,
 ) error {
 	priority := uint8(videoPriority)
 	if kind == bridge.KindAudio {
@@ -943,18 +868,6 @@ func (r *remote) subscribeTrack(
 			message.SubscriberPriorityParam(priority),
 		},
 	}
-	// Declining the layers above this one, by the §5.1.3 Range Filter that
-	// names the subgroups worth sending. Asked of the relay rather than dropped
-	// on arrival, because a frame discarded here has already been paid for on
-	// the wire, and the wire is what ran out.
-	subscribed := effectiveLayers(cfg, layers)
-	if declared := max(cfg.TemporalLayers, 1); subscribed < declared {
-		subMsg.Parameters = append(subMsg.Parameters,
-			message.RangeFilterParam(&message.RangeFilter{
-				Type:   message.ParamSubgroupFilter,
-				Ranges: []message.Range{{Start: 0, End: uint64(subscribed - 1)}},
-			}))
-	}
 	sub, err := r.room.sess.Subscribe(r.ctx, subMsg)
 	if err != nil {
 		return fmt.Errorf("conf: SUBSCRIBE %s %s: %w", r.id, name, err)
@@ -967,7 +880,6 @@ func (r *remote) subscribeTrack(
 		kind:   kind,
 		name:   name,
 		config: *cfg,
-		layers: subscribed,
 		sub:    sub,
 		label:  label,
 	}
@@ -1107,7 +1019,7 @@ func (r *remote) readMediaFetch(
 	//
 	// Only when there is something to order. An unlayered track streams out as
 	// it arrives, exactly as it did before.
-	layered := track.layers > 1
+	layered := track.config.TemporalLayers > 1
 	var pending []bridge.MediaFrame
 	defer func() {
 		slices.SortStableFunc(pending, func(a, b bridge.MediaFrame) int {
@@ -1410,12 +1322,6 @@ func (r *remote) demote(track *remoteTrack, code string) {
 		return
 	}
 
-	// Read before the lock: publishParticipants holds the room's and calls
-	// inward, so reaching back the other way under this one would close the
-	// cycle — the same ordering chooseVideoLayer keeps.
-	wantsSmall := r.room.wantsLowLayer(r.id)
-	canFilter := subgroupFiltersPermitted(r.room.sess)
-
 	r.mu.Lock()
 	// Only the subscription that is still current, and only once for it. Every
 	// open group of a dead subscription is reset separately, so this arrives
@@ -1426,97 +1332,63 @@ func (r *remote) demote(track *remoteTrack, code string) {
 		return
 	}
 	r.demotedFor = track.handle
-	from := r.level
-	r.level = stepDown(r.level, r.wantVideo, wantsSmall, canFilter)
-	to := r.level
-	// Cut off again soon after climbing back: the link has not recovered, so
-	// wait longer before believing it has. Doubling rather than resetting is
-	// what gives the reduced state somewhere to settle.
+
+	// A run of these means the link is not going to carry this participant's
+	// video, and asking again immediately would offer back what was just
+	// refused. Counted over a window rather than forever, so an hour-long call
+	// is not judged on one bad minute.
+	if r.rebuiltSince.IsZero() || time.Since(r.rebuiltSince) > videoGiveUpWindow {
+		r.rebuiltSince, r.rebuilds = time.Now(), 0
+	}
+	r.rebuilds++
+	givingUp := r.rebuilds >= videoGiveUpAfter
 	backoff := ""
-	if !r.recoveredAt.IsZero() && time.Since(r.recoveredAt) < r.recoveryWait {
-		r.recoveryWait = min(r.recoveryWait*2, videoRecoveryMax)
+	if givingUp {
+		r.videoOff = true
+		r.rebuilds = 0
+		// Given up on again soon after coming back: the link has not recovered,
+		// so wait longer before believing it has.
+		if r.recoveryWait <= 0 {
+			r.recoveryWait = videoRecovery
+		} else if !r.recoveredAt.IsZero() && time.Since(r.recoveredAt) < r.recoveryWait {
+			r.recoveryWait = min(r.recoveryWait*2, videoRecoveryMax)
+		}
 		backoff = r.recoveryWait.String()
 	}
-	video, videoLow, audio := r.wantVideo, r.wantVideoLow, r.wantAudio
+	video, audio := r.wantVideo, r.wantAudio
 	r.mu.Unlock()
 
-	fields := []any{
-		"handle", track.handle, "code", code,
-		"from", from.String(), "to", to.String(),
-	}
-	if backoff != "" {
-		fields = append(fields, "next_attempt_in", backoff)
+	fields := []any{"handle", track.handle, "code", code}
+	if givingUp {
+		fields = append(fields, "action", "audio only", "next_attempt_in", backoff)
+	} else {
+		fields = append(fields, "action", "rebuilding it unchanged")
 	}
 	r.log.Warn("the relay stopped forwarding a track: we are not keeping up", fields...)
 
+	// Dropped before reconciling, and that is not a detail: the track name and
+	// config are the same ones, so reconcile on its own would compare them
+	// against the subscription the relay has just killed, conclude nothing had
+	// changed, and leave the dead one in place. Nothing else would notice
+	// either — missing() sees a track object and reports it present — so the
+	// tile stayed blank for the rest of the call.
+	//
+	// Rebuilt as it was, not smaller. There is nothing smaller to ask for, and
+	// there does not need to be: a fresh SUBSCRIBE starts at the live edge, and
+	// on a link this tight the relay shortly sheds the enhancement layer, so
+	// what comes back is half the frame rate of the same picture.
+	if !givingUp {
+		r.dropTrack(&r.video)
+	}
 	r.applying.Lock()
-	r.reconcile(video, videoLow, audio)
+	r.reconcile(video, audio)
 	r.applying.Unlock()
 
-	r.scheduleRecovery()
-}
-
-// subgroupFiltersPermitted reports whether the peer will accept the §5.1.3
-// Range Filter the base-only rung is expressed as.
-//
-// §10.3.1.6: MAX_FILTER_RANGES is what a peer will accept across all Range
-// Filter parameters of one request, and omitting it means zero — filters
-// prohibited. Sending one anyway is not ignored, it is rejected: the relay
-// answers INVALID_FILTER and the SUBSCRIBE fails outright. Against a relay that
-// does not advertise the option, the first congestion event therefore took the
-// rung, lost the subscription, exhausted the retry loop and gave up on the
-// participant's video for the rest of the call — worse than the demotion it was
-// meant to be an improvement on. Measured against a deployed relay; every
-// in-process test passed, because the test relay permits them.
-func subgroupFiltersPermitted(sess *session.Session) bool {
-	for _, kv := range sess.PeerOptions() {
-		if kv.Type == uint64(message.SetupOptionMaxFilterRanges) {
-			return kv.IntVal >= 1
-		}
+	if givingUp {
+		r.scheduleRecovery()
+	} else {
+		r.scheduleResubscribe()
 	}
-	return false
-}
-
-// shedsALayer reports whether the base-only rung would actually take anything
-// off the wire for this publisher.
-//
-// It only does against one that publishes a layer to decline, only while the
-// frontend is asking for the primary encoding — a tile already on the small one
-// has taken a bigger step than this rung offers — and only where the peer
-// accepts the filter that expresses it. Everywhere else it resolves to exactly
-// what the rung below it resolves to.
-//
-// The ladder skips it there rather than resolving it away, which is a real
-// distinction: a rung that changes nothing still costs a step, so the next
-// verdict arrives with the link no lighter and one fewer step left to take. That
-// is how this was got wrong on the first attempt.
-func shedsALayer(video *bridge.TrackConfig, wantsSmall, canFilter bool) bool {
-	return canFilter && !wantsSmall && video != nil && video.TemporalLayers > 1
-}
-
-// stepDown is the next rung below cur, skipping base-only where it is not one.
-func stepDown(cur videoLevel, video *bridge.TrackConfig, wantsSmall, canFilter bool) videoLevel {
-	if cur >= videoNone {
-		return videoNone
-	}
-	next := cur + 1
-	if next == videoBaseOnly && !shedsALayer(video, wantsSmall, canFilter) {
-		next = videoSmall
-	}
-	return next
-}
-
-// stepUp is the next rung above cur, skipping base-only on the way back for the
-// same reason stepDown skips it on the way down.
-func stepUp(cur videoLevel, video *bridge.TrackConfig, wantsSmall, canFilter bool) videoLevel {
-	if cur <= videoFull {
-		return videoFull
-	}
-	next := cur - 1
-	if next == videoBaseOnly && !shedsALayer(video, wantsSmall, canFilter) {
-		next = videoFull
-	}
-	return next
 }
 
 // scheduleRecovery tries one step back up once the link has been quiet for
@@ -1538,49 +1410,36 @@ func (r *remote) scheduleRecovery() {
 	r.mu.Unlock()
 }
 
-// recover restores one step of what was demoted, and schedules the next step
-// if there is still ground to make up.
+// recover turns video back on once the link has been quiet, after it was given
+// up on.
 //
-// One step at a time on purpose. Going straight back to the full picture after
-// a demotion to none would re-offer the whole load that the relay refused, and
-// find out whether it fits by being cut off again.
+// Nothing steps back up any more, because nothing stepped down: the answer to
+// a relay giving up is the same subscription again, and the answer to that
+// failing repeatedly is to stop asking for a while. This is the end of the
+// while.
 func (r *remote) recover() {
 	if r.ctx.Err() != nil {
 		return
 	}
 
-	wantsSmall := r.room.wantsLowLayer(r.id)
-	canFilter := subgroupFiltersPermitted(r.room.sess)
-
 	r.mu.Lock()
-	if r.closed || r.level == videoFull {
+	if r.closed || !r.videoOff {
 		r.mu.Unlock()
 		return
 	}
-	from := r.level
-	r.level = stepUp(r.level, r.wantVideo, wantsSmall, canFilter)
-	to := r.level
+	r.videoOff = false
 	r.recoveredAt = time.Now()
 	// Cleared so the next verdict on the rebuilt subscription is acted on.
 	r.demotedFor = 0
-	// All the way back means the link held: start again from the short wait.
-	if r.level == videoFull {
-		r.recoveryWait = videoRecovery
-	}
-	video, videoLow, audio := r.wantVideo, r.wantVideoLow, r.wantAudio
-	more := r.level != videoFull
+	r.rebuilds, r.rebuiltSince = 0, time.Time{}
+	video, audio := r.wantVideo, r.wantAudio
 	r.mu.Unlock()
 
-	r.log.Info("the link has been quiet; asking for more video again",
-		"from", from.String(), "to", to.String())
+	r.log.Info("the link has been quiet; asking for video again")
 
 	r.applying.Lock()
-	r.reconcile(video, videoLow, audio)
+	r.reconcile(video, audio)
 	r.applying.Unlock()
-
-	if more {
-		r.scheduleRecovery()
-	}
 }
 
 // checkLag rebuilds this participant's subscriptions when they have slipped too
@@ -1602,7 +1461,7 @@ func (r *remote) checkLag(counter *telemetry.TrackCounter) {
 		return
 	}
 	r.resyncedAt = time.Now()
-	video, videoLow, audio := r.wantVideo, r.wantVideoLow, r.wantAudio
+	video, audio := r.wantVideo, r.wantAudio
 	r.mu.Unlock()
 
 	r.log.Warn("this participant has slipped behind the live edge; resubscribing",
@@ -1615,7 +1474,7 @@ func (r *remote) checkLag(counter *telemetry.TrackCounter) {
 	r.dropTrack(&r.audio)
 
 	r.applying.Lock()
-	r.reconcile(video, videoLow, audio)
+	r.reconcile(video, audio)
 	r.applying.Unlock()
 }
 
@@ -1675,6 +1534,6 @@ func (r *remote) participant() bridge.Participant {
 		// this client gave up on looked exactly like one who switched their
 		// camera off, while HasVideo insisted the camera was on: a blank tile
 		// and two signals disagreeing about why.
-		VideoLevel: r.level.String(),
+		VideoLevel: videoStateOf(r.videoOff),
 	}
 }

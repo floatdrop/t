@@ -145,7 +145,7 @@ class Store {
 
   captureStats = $state<CaptureStats>({
     videoFps: 0, videoKbps: 0, encodeQueue: 0,
-    audioFps: 0, audioKbps: 0, audioEncodeQueue: 0, lowDropped: 0, keyFrames: 0, dropped: 0,
+    audioFps: 0, audioKbps: 0, audioEncodeQueue: 0, keyFrames: 0, dropped: 0,
     echoCancellation: false, noiseSuppression: false, autoGainControl: false,
     denoiseActive: false,
   });
@@ -993,11 +993,10 @@ class Store {
   #sendInterest(): void {
     this.#settleLayer();
     const wanted = [...this.#visibleTiles].sort();
-    const small = this.tilesAreSmall || this.linkCongested ? wanted : [];
-    const key = `${wanted.join(',')}|${small.join(',')}`;
+    const key = wanted.join(',');
     if (key === this.#interestKey) return;
     this.#interestKey = key;
-    bridge.send({ type: 'interest', interest: { video: wanted, low: small } });
+    bridge.send({ type: 'interest', interest: { video: wanted } });
   }
 
   /** The last interest set sent, so an unchanged one is not sent twice. */

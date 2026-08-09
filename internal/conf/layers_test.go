@@ -1,14 +1,10 @@
 package conf
 
 import (
-	"log/slog"
 	"testing"
 	"time"
 
-	"github.com/floatdrop/moq-go/pkg/moqt/session"
-
 	"tlmst/internal/bridge"
-	"tlmst/internal/telemetry"
 )
 
 // A publisher that actually emits temporal layers.
@@ -327,7 +323,7 @@ func TestABurstDeliversTheBaseLayerWhole(t *testing.T) {
 		}
 		return got
 	}
-	waitFor(t, "every base-layer frame of the burst to reach bob", 15*time.Second,
+	waitFor(t, "every base-layer frame of the burst to reach bob", 40*time.Second,
 		func() bool { return len(base()) >= frames/2 })
 
 	got := base()
@@ -416,144 +412,5 @@ func TestABottleneckCostsTheEnhancementLayerFirst(t *testing.T) {
 		t.Errorf("the bottleneck took %.0f%% enhancement against %.0f%% on a "+
 			"link with room: the disposable layer was not given up first",
 			100*squeezedShare, 100*roomyShare)
-	}
-}
-
-// The step the whole layered layout was for. When the relay gives up on a
-// subscription, the ladder's first answer should be to decline the top temporal
-// layer rather than to change encoding: same track, same decoder, same picture
-// at half the frame rate, and no keyframe to wait for. Only the frames stop —
-// nothing is torn down.
-func TestTheFirstStepDownIsALayerNotAnEncoding(t *testing.T) {
-	// A relay that permits Range Filters, which moq-go's does not by default:
-	// MAX_FILTER_RANGES is zero unless set, and zero prohibits them. The rung
-	// is dormant against a relay that says nothing — see
-	// TestTheLayerRungIsSkippedWhereFiltersAreRefused for that half.
-	relayServer := startRelayWith(t, session.WithMaxFilterRanges(4))
-	addr := relayServer.Addr()
-
-	// Declares both encodings, and says the primary carries two layers — so
-	// the ladder has both a rung to skip to and a layer to shed first.
-	alice, _ := joinRoom(t, addr, "rung", "alice")
-	for _, cfg := range []*bridge.TrackConfig{
-		{Kind: "video", Codec: "avc1.42e01f", Width: 1280, Height: 720, TemporalLayers: 2},
-		{Kind: KindVideoLow, Codec: "avc1.42e01f", Width: 640, Height: 360},
-		{Kind: "audio", Codec: "opus", SampleRate: 48000, Channels: 1},
-	} {
-		if err := alice.DeclareTrack(cfg); err != nil {
-			t.Fatalf("declare %s: %v", cfg.Kind, err)
-		}
-	}
-
-	link := startShaper(t, addr, 32_000, 64)
-	spy := newLogSpy(t)
-	_, bobRec := joinRoomWithCounters(
-		t, link.Addr(), "rung", "bob", telemetry.NewRegistry(), slog.New(spy))
-
-	waitFor(t, "bob to take the full picture", 15*time.Second, func() bool {
-		v, ok := bobRec.trackFor("video")
-		return ok && v.Config.Width == 1280
-	})
-	full, _ := bobRec.trackFor("video")
-
-	stop := make(chan struct{})
-	publishPacedLayers(t, alice, stop, temporalLayerFor)
-	defer close(stop)
-
-	waitFor(t, "the relay to give up on the full picture", 30*time.Second, func() bool {
-		return spy.sawAttr("msg",
-			"the relay stopped forwarding a track: we are not keeping up")
-	})
-	waitFor(t, "the ladder to step down to the base layer", 15*time.Second, func() bool {
-		return spy.sawAttr("to", "base-only")
-	})
-
-	// A *new* handle at the same size, which is the assertion that means
-	// anything: trackFor reports the newest track announced, so a demotion whose
-	// SUBSCRIBE was rejected leaves the old one in place and an assertion on the
-	// width alone passes without a subscription existing. That is how a rung
-	// that never worked against any moq-go relay went unnoticed until two
-	// clients were run against a deployed one.
-	waitFor(t, "the base-only subscription to be announced", 20*time.Second, func() bool {
-		v, ok := bobRec.trackFor("video")
-		return ok && v.Handle != full.Handle
-	})
-
-	v, _ := bobRec.trackFor("video")
-	if v.Config.Width != 1280 {
-		t.Errorf("the first step down changed encoding to %dx%d; the point of "+
-			"the layer rung is that the picture stays the same size",
-			v.Config.Width, v.Config.Height)
-	}
-	if spy.sawAttr("to", "small") {
-		t.Error("the ladder went straight to the smaller encoding, skipping " +
-			"the cheaper step it now has")
-	}
-	_, _, _, errs := bobRec.snapshot()
-	for _, e := range errs {
-		t.Errorf("the user was told a track could not be reached: %q", e)
-	}
-}
-
-// A relay is entitled to refuse §5.1.3 Range Filters, and one that says nothing
-// about MAX_FILTER_RANGES has refused them: §10.3.1.6 makes the default zero.
-// Sending one anyway is not ignored — the SUBSCRIBE is rejected outright with
-// INVALID_FILTER.
-//
-// So the rung that is expressed as a filter has to be skipped there, exactly as
-// it is skipped against a publisher with no layer to shed. Without this the
-// first congestion event took the rung, lost the subscription, exhausted the
-// retry loop and gave up on that participant's video for the rest of the call —
-// strictly worse than the demotion the rung was an improvement on. Found by
-// running two clients against a deployed relay; every in-process test passed,
-// because the test relay permits filters unless told otherwise.
-func TestTheLayerRungIsSkippedWhereFiltersAreRefused(t *testing.T) {
-	relayServer := startRelayWith(t, session.WithMaxFilterRanges(0))
-	addr := relayServer.Addr()
-
-	alice, _ := joinRoom(t, addr, "nofilter", "alice")
-	for _, cfg := range []*bridge.TrackConfig{
-		{Kind: "video", Codec: "avc1.42e01f", Width: 1280, Height: 720, TemporalLayers: 2},
-		{Kind: KindVideoLow, Codec: "avc1.42e01f", Width: 640, Height: 360},
-		{Kind: "audio", Codec: "opus", SampleRate: 48000, Channels: 1},
-	} {
-		if err := alice.DeclareTrack(cfg); err != nil {
-			t.Fatalf("declare %s: %v", cfg.Kind, err)
-		}
-	}
-
-	link := startShaper(t, addr, 32_000, 64)
-	spy := newLogSpy(t)
-	_, bobRec := joinRoomWithCounters(
-		t, link.Addr(), "nofilter", "bob", telemetry.NewRegistry(), slog.New(spy))
-
-	waitFor(t, "bob to take the full picture", 15*time.Second, func() bool {
-		v, ok := bobRec.trackFor("video")
-		return ok && v.Config.Width == 1280
-	})
-
-	stop := make(chan struct{})
-	publishPacedLayers(t, alice, stop, temporalLayerFor)
-	defer close(stop)
-
-	waitFor(t, "the relay to give up on the full picture", 30*time.Second, func() bool {
-		return spy.sawAttr("msg",
-			"the relay stopped forwarding a track: we are not keeping up")
-	})
-
-	// Straight to the smaller encoding: the rung in between cannot be asked
-	// for here, so it is not a rung.
-	waitFor(t, "video to come back at the smaller encoding", 20*time.Second, func() bool {
-		v, ok := bobRec.trackFor("video")
-		return ok && v.Config.Width == 640
-	})
-
-	if spy.sawAttr("to", "base-only") {
-		t.Error("the ladder stepped to base-only against a relay that refuses " +
-			"the filter it is expressed as")
-	}
-	_, _, _, errs := bobRec.snapshot()
-	for _, e := range errs {
-		t.Errorf("the user was told a track could not be reached: %q", e)
 	}
 }

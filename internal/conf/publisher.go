@@ -72,6 +72,26 @@ const videoSubgroupTimeout = 2 * time.Second
 // slow does not lose its top layer for coping.
 const enhancementObjectTimeout = 500 * time.Millisecond
 
+// propEmissionIndex is a producer-defined Object Property carrying an object's
+// position in its group's emission order, counted across every subgroup of the
+// group.
+//
+// Reassembly needs one number that means "what comes next", and neither of the
+// obvious candidates is. Object IDs cannot be: each layer numbers from its own
+// base, because IDs must be unique within a group and consecutive within a
+// subgroup at once (see layerObjectStride). Timestamps can order objects but
+// cannot say whether anything earlier is still to come, so every frame waits for
+// the other layer to move past it — a frame of latency on every frame of every
+// layered call. A counter the publisher already has costs a few bytes and says
+// exactly the thing.
+//
+// Even, so it carries a varint (§1.4.3), and above the [0x4000, 0x7FFF]
+// Mandatory Track Property range (§2.5.1) so it cannot be read as one of those —
+// an endpoint that met an unknown mandatory property would have to drop the
+// track. Everything else in that space is producer-defined and passes through a
+// relay verbatim.
+const propEmissionIndex message.PropertyType = 0x8002
+
 // layerObjectStride is how far apart two temporal layers' object-ID ranges sit
 // inside one group.
 //
@@ -475,10 +495,12 @@ type trackPublisher struct {
 	// objects counts what each subgroup of the current group has written, so
 	// each layer's object IDs run consecutively from its own base — see
 	// layerObjectStride for why they cannot simply count across the group.
-	//
-	// Ordering therefore does not ride on the object ID any more. It rides on
-	// the LOC timestamp every object already carries; see reorder.go.
 	objects [bridge.MaxTemporalLayer + 1]uint64
+	// emitted counts the group's objects across every subgroup in it, in
+	// emission order, and is stamped on each as propEmissionIndex. That is what
+	// a subscriber reassembles decode order from — see reorder.go, whose
+	// ordering is only as correct as this counter's continuity across layers.
+	emitted uint64
 	// started distinguishes "no group yet" from "in group 0".
 	started bool
 	// objectsInGroup counts objects written to the current group, for
@@ -547,6 +569,7 @@ func (t *trackPublisher) rotateGroup() error {
 	}
 
 	t.objects = [bridge.MaxTemporalLayer + 1]uint64{}
+	t.emitted = 0
 	t.objectsInGroup = 0
 	t.started = true
 	t.counter.AddGroup()
@@ -657,6 +680,13 @@ func (t *trackPublisher) writeObject(f *bridge.MediaFrame) error {
 		}
 	}
 
+	// Where this object falls in the group's emission order, which is decode
+	// order. Every object carries it; it is what reassembly keys on.
+	props.Extras = append(props.Extras, wire.KVPair{
+		Type:   propEmissionIndex,
+		IntVal: t.emitted,
+	})
+
 	// Marks the enhancement layer disposable, on the first object of its
 	// subgroup — which is where §8 says a per-subgroup override lives, the Track
 	// Property being the fallback and one track carrying both layers. It rides
@@ -697,6 +727,7 @@ func (t *trackPublisher) writeObject(f *bridge.MediaFrame) error {
 			t.group, objectID, layer, err)
 	}
 	t.objects[layer]++
+	t.emitted++
 	t.objectsInGroup++
 	t.counter.AddObject(len(payload))
 	return nil

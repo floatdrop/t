@@ -1279,13 +1279,28 @@ func (r *remote) readMedia(
 		}
 
 		counter.AddObject(len(decoded.Payload))
-		// Keyed on the timestamp, not the object ID: each subgroup numbers its
-		// objects from its own base, so IDs order a stream against itself and
-		// nothing else. See reorder.go.
-		reassembler.Push(subgroup, frame.Timestamp, func() {
+		// Keyed on the publisher's emission index, not the object ID: each
+		// subgroup numbers its objects from its own base, so an ID orders a
+		// stream against itself and nothing else. See reorder.go.
+		reassembler.Push(subgroup, emissionIndex(obj.ObjectID, decoded.Properties), func() {
 			r.room.sink.SendMedia(&frame)
 		})
 	}
+}
+
+// emissionIndex reads the object's position in its group's emission order.
+//
+// Falls back to the Object ID for a publisher that stamps none, which is right
+// for the only kind there is: one subgroup per group, where the IDs count from
+// zero without gaps and are the emission order. A layered publisher always
+// stamps it — the layout it uses is what makes the ID unusable.
+func emissionIndex(objectID uint64, props loc.Properties) uint64 {
+	for _, kv := range props.Extras {
+		if kv.Type == propEmissionIndex {
+			return kv.IntVal
+		}
+	}
+	return objectID
 }
 
 // checkLagForStream examines the slip once per audio subgroup.

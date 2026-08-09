@@ -14,15 +14,14 @@ import "sync"
 // video decoder cannot take: a delta frame ahead of the frame it references is
 // not late, it is undecodable.
 //
-// The LOC timestamp is what puts it back together, and it is the only key
-// available. Object IDs cannot be it: they have to be unique within a group,
-// because a relay's cache keys objects on (group, object) alone, and §11.4.3
-// separately forbids forwarding a non-consecutive object on an existing subgroup
-// stream. Both hold only if each subgroup owns a contiguous range of its own —
-// see layerObjectStride — after which an object's ID says nothing whatever about
-// where it belongs relative to another subgroup's. The timestamp does, and for
-// temporal layers it is exact rather than approximate: WebCodecs emits no
-// B-frames, so decode order is presentation order.
+// The publisher's emission index is what puts it back together: every object
+// carries its position in the group's emission order, counted across every
+// subgroup, so ascending index IS decode order — exactly, with no cadence
+// assumptions. Object IDs cannot serve, because each subgroup owns a contiguous
+// range of its own (see layerObjectStride) and an ID therefore orders a stream
+// only against itself. Timestamps could order but not schedule: they say which
+// frame comes first and never whether anything earlier is still to come, so
+// every frame would wait out the other layer.
 //
 // The interesting question is when an object is safe to emit rather than how to
 // order it. Waiting on a timer would be wrong in both directions: too short
@@ -30,15 +29,9 @@ import "sync"
 // layer the relay has shed entirely would cost the timeout on every frame it
 // was supposed to carry. Streams are ordered individually, so there is an exact
 // answer instead — an object is safe once no open stream can still produce
-// something earlier, which is knowable from the latest timestamp each open
-// stream has delivered.
-//
-// The cost is one frame of buffering while a layer is actually being carried.
-// The oldest held frame goes out when the other layer delivers something at or
-// after it, which in a steady L1T2 stream is the very next arrival, so the
-// buffer holds one frame and adds a frame interval to video. A track on a single
-// subgroup — audio, and any unlayered video — never waits at all: the one open
-// stream is always at or past whatever it just delivered.
+// something earlier, which is knowable from the highest index each open stream
+// has delivered. In the common case the object that arrives is the one being
+// waited for and nothing is held at all, layered or not.
 //
 // "No open stream" is the subtle part, and it once meant "no stream this group
 // has seen", which is not the same claim. Streams of a group do not arrive
@@ -57,9 +50,14 @@ import "sync"
 // its first group, which is precisely the backfilled one a joining subscriber
 // receives all at once.
 //
-// Over-declaring costs a frame of latency and nothing else. A track that
-// declares two layers and emits one keeps a group open expecting a stream that
-// never comes, which the track retires once a later group has superseded it.
+// Over-declaring costs nothing while the indices stay contiguous: each object
+// is in turn the one being waited for. A track that declares two layers and
+// emits one keeps a group open expecting a stream that never comes, which the
+// track retires once a later group has superseded it.
+//
+// A subscriber that declined the top layer sees only every other index, so its
+// gaps are conceded by the open-stream rule rather than matched — which is why
+// what a group expects is what was subscribed, not what was declared.
 
 // maxHeldObjects bounds one group's reassembly buffer.
 //
@@ -75,8 +73,8 @@ const maxHeldObjects = 128
 // heldObject is one object waiting for its turn, with whatever the caller needs
 // to emit it. The payload is opaque here: this file owns ordering, not media.
 type heldObject struct {
-	timestamp uint64
-	emit      func()
+	index uint64
+	emit  func()
 }
 
 // groupReassembler orders one group's objects across its subgroup streams.
@@ -88,16 +86,14 @@ type heldObject struct {
 // ordering this exists to establish.
 type groupReassembler struct {
 	mu sync.Mutex
-	// emitted is the timestamp of the last object let out, and hasEmitted says
-	// whether there has been one — zero is a real timestamp, being the first
-	// frame of a track. Anything arriving at or before it has already gone.
-	emitted    uint64
-	hasEmitted bool
-	// held is the out-of-order backlog, kept sorted by timestamp. A slice
+	// next is the emission index the group is waiting to emit. Objects arrive
+	// numbered from the publisher, and a group always opens at 0.
+	next uint64
+	// held is the out-of-order backlog, kept sorted by index. A slice
 	// rather than a heap: it holds one frame per layer in the steady state,
 	// where a linear insert beats a heap's constant factor and its allocation.
 	held []heldObject
-	// open maps a subgroup ID to the latest timestamp it has delivered, for
+	// open maps a subgroup ID to the highest index it has delivered, for
 	// every stream still running. A subgroup absent from both this and expected
 	// cannot produce anything — it ended, or was never subscribed — so it does
 	// not hold the group back.
@@ -105,7 +101,7 @@ type groupReassembler struct {
 	// started marks a subgroup as having delivered at least one object. A
 	// stream that has opened but produced nothing yet must block release —
 	// its first object could be the one being waited for — which a zero
-	// timestamp cannot express on its own, since 0 is a real timestamp.
+	// highest-delivered cannot express on its own, since 0 is a real index.
 	started map[uint64]bool
 	// expected holds subgroups the publisher declared and this group has not
 	// seen a stream for. They block release without blocking it forever: the
@@ -159,13 +155,13 @@ func (g *groupReassembler) CloseSubgroup(subgroup uint64) {
 }
 
 // Push takes one object from one subgroup stream and emits whatever that makes
-// safe, in timestamp order, before returning.
+// safe, in emission order, before returning.
 //
-// An object at or before the last one emitted is either a duplicate — a
-// redundant publisher, or a replayed stream — or one that arrived too late to
-// be placed. Both are dropped: handing a decoder a frame it is already past
-// is worse than not handing it one at all.
-func (g *groupReassembler) Push(subgroup, timestamp uint64, emit func()) {
+// An object below next is either a duplicate — a redundant publisher, or a
+// replayed stream — or one that arrived too late to be placed. Both are
+// dropped: handing a decoder a frame it is already past is worse than not
+// handing it one at all.
+func (g *groupReassembler) Push(subgroup, index uint64, emit func()) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -173,26 +169,26 @@ func (g *groupReassembler) Push(subgroup, timestamp uint64, emit func()) {
 		// A stream pushing after it was closed, or one that never announced
 		// itself. Track it either way: dropping the object would punch a hole
 		// that stalls everything after it.
-		g.open[subgroup] = timestamp
+		g.open[subgroup] = index
 		g.started[subgroup] = true
-	} else if !g.started[subgroup] || timestamp > g.open[subgroup] {
-		g.open[subgroup] = timestamp
+	} else if !g.started[subgroup] || index > g.open[subgroup] {
+		g.open[subgroup] = index
 		g.started[subgroup] = true
 	}
 
-	if g.hasEmitted && timestamp <= g.emitted {
+	if index < g.next {
 		return
 	}
-	g.insertLocked(heldObject{timestamp: timestamp, emit: emit})
+	g.insertLocked(heldObject{index: index, emit: emit})
 	g.drainLocked()
 }
 
-// insertLocked places obj in held, keeping it sorted by timestamp. The scan
+// insertLocked places obj in held, keeping it sorted by index. The scan
 // runs from the back because objects arrive in near-order: the common insert is
 // at or near the end, so this is a comparison or two rather than a search.
 func (g *groupReassembler) insertLocked(obj heldObject) {
 	i := len(g.held)
-	for i > 0 && g.held[i-1].timestamp > obj.timestamp {
+	for i > 0 && g.held[i-1].index > obj.index {
 		i--
 	}
 	g.held = append(g.held, heldObject{})
@@ -204,40 +200,46 @@ func (g *groupReassembler) insertLocked(obj heldObject) {
 func (g *groupReassembler) drainLocked() {
 	for len(g.held) > 0 {
 		head := g.held[0]
-		if !g.releasableLocked(head.timestamp) {
+		if !g.releasableLocked(head.index) {
 			return
 		}
 		g.held = g.held[1:]
-		g.emitted, g.hasEmitted = head.timestamp, true
+		g.next = head.index + 1
 		head.emit()
 	}
 }
 
 // releasableLocked reports whether the oldest held object can be emitted.
 //
-// Two ways to be sure, in the order they matter:
+// Three ways to be sure, in the order they matter:
 //
-// The backlog is full, and something has to give. Here the wait is abandoned
+// It is the object the group is waiting for, so nothing can precede it. This is
+// the common case and it costs nothing.
+//
+// Or the backlog is full, and something has to give. Here the wait is abandoned
 // deliberately rather than run forever — see maxHeldObjects.
 //
-// Or every open stream has already delivered something at or after it, and no
-// subgroup is still expected. Each stream is ordered on its own, so a stream
-// past this timestamp can never come back before it, and a stream with nothing
-// left open cannot produce anything at all — between them, nothing earlier
-// exists to wait for. This is also what covers a gap the relay punched: the
-// frames around the hole arrive, every stream moves past it, and the run
-// continues without the missing one ever showing up. The expected check is what
-// keeps that reasoning honest, since a subgroup whose stream has not arrived yet
-// can still produce something earlier however quiet it looks.
-func (g *groupReassembler) releasableLocked(timestamp uint64) bool {
+// Or every open stream has already delivered something later, and no subgroup is
+// still expected. Each stream is ordered on its own, so a stream past this index
+// can never come back below it, and a stream with nothing left open cannot
+// produce anything at all — between them, nothing earlier exists to wait for.
+// This is what covers both a gap the relay punched and a layer this subscriber
+// declined: the frames around the hole arrive, every stream moves past it, and
+// the run continues without the missing index ever showing up. The expected
+// check is what keeps that reasoning honest, since a subgroup whose stream has
+// not arrived yet can still produce something earlier however quiet it looks.
+func (g *groupReassembler) releasableLocked(index uint64) bool {
+	if index == g.next {
+		return true
+	}
 	if len(g.held) >= maxHeldObjects {
 		return true
 	}
 	if len(g.expected) > 0 {
 		return false
 	}
-	for subgroup, latest := range g.open {
-		if !g.started[subgroup] || latest < timestamp {
+	for subgroup, highest := range g.open {
+		if !g.started[subgroup] || highest < index {
 			return false
 		}
 	}
@@ -264,7 +266,7 @@ func (g *groupReassembler) Flush() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for _, obj := range g.held {
-		g.emitted, g.hasEmitted = obj.timestamp, true
+		g.next = obj.index + 1
 		obj.emit()
 	}
 	g.held = nil

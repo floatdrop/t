@@ -61,18 +61,25 @@ func TestReassemblerOrdersAcrossSubgroups(t *testing.T) {
 	g.Push(0, 0, c.emitter(0))
 	g.Push(0, 2, c.emitter(2))
 
-	// Everything up to 2 goes out. Not 3: subgroup 0 has only reached 2, so it
-	// could still deliver something between the two — and one frame in hand is
-	// what ordering two live streams costs.
-	if got, want := c.order(), []uint64{0, 1, 2}; !equal(got, want) {
+	// Everything goes out, and nothing waits: each is in turn the index the
+	// group was waiting for, which is what emission-ordered indices buy over
+	// ordering on a timestamp.
+	if got, want := c.order(), []uint64{0, 1, 2, 3}; !equal(got, want) {
 		t.Fatalf("order = %v, want %v", got, want)
 	}
 
-	// Once the base layer moves past it, nothing can precede 3 any more — and
-	// 4 takes its place as the one frame in hand.
-	g.Push(0, 4, c.emitter(4))
+	// 6 skips ahead of 4 and 5, so it must wait: subgroup 1 has only reached 3
+	// and could still deliver 5.
+	g.Push(0, 6, c.emitter(6))
 	if got, want := c.order(), []uint64{0, 1, 2, 3}; !equal(got, want) {
-		t.Fatalf("order = %v, want %v", got, want)
+		t.Fatalf("order = %v, want %v — 6 was released while subgroup 1 could "+
+			"still deliver 5", got, want)
+	}
+
+	// Once the enhancement layer ends, nothing can precede 6 any more.
+	g.CloseSubgroup(1)
+	if got, want := c.order(), []uint64{0, 1, 2, 3, 6}; !equal(got, want) {
+		t.Fatalf("after closing the enhancement layer, order = %v, want %v", got, want)
 	}
 }
 
@@ -110,17 +117,21 @@ func TestReassemblerWaitsForADeclaredLayerItHasNotSeen(t *testing.T) {
 	for _, ts := range []uint64{0, 2, 4, 6} {
 		g.Push(0, ts, c.emitter(ts))
 	}
-	if got := c.order(); len(got) != 0 {
-		t.Fatalf("emitted %v while a declared layer had not been heard from; "+
-			"until that stream says something, any frame it holds could belong "+
-			"in front of what has arrived — including in front of the first", got)
+	// Only the first goes out — it is the index the group opens on, so nothing
+	// can precede it. Everything after has a gap in front of it that the
+	// unheard-from layer is entitled to fill.
+	if got, want := c.order(), []uint64{0}; !equal(got, want) {
+		t.Fatalf("order = %v, want %v — a gap must not be conceded while a "+
+			"declared layer has not been heard from", got, want)
 	}
 
 	g.OpenSubgroup(1)
 	for _, ts := range []uint64{1, 3, 5} {
 		g.Push(1, ts, c.emitter(ts))
 	}
-	if got, want := c.order(), []uint64{0, 1, 2, 3, 4, 5}; !equal(got, want) {
+	// The run completes the moment the missing indices arrive: 6 goes out too,
+	// because 5 filled the last gap in front of it.
+	if got, want := c.order(), []uint64{0, 1, 2, 3, 4, 5, 6}; !equal(got, want) {
 		t.Fatalf("order = %v, want %v", got, want)
 	}
 }
@@ -166,7 +177,7 @@ func TestReassemblerReleasesOverAGap(t *testing.T) {
 	g.Push(1, 3, c.emitter(3))
 	g.Push(0, 2, c.emitter(2))
 
-	if got, want := c.order(), []uint64{0, 2}; !equal(got, want) {
+	if got, want := c.order(), []uint64{0, 2, 3}; !equal(got, want) {
 		t.Fatalf("order = %v, want %v — a dropped frame must not stall the group", got, want)
 	}
 }
@@ -186,13 +197,7 @@ func TestReassemblerHoldsForAnOpenButSilentSubgroup(t *testing.T) {
 		t.Fatalf("emitted %v while subgroup 0 was open and silent; its first frame "+
 			"could still come before that one", got)
 	}
-	// 0 goes out; 1 takes its place in hand, because subgroup 0 has still only
-	// reached 0 and could deliver something between the two.
 	g.Push(0, 0, c.emitter(0))
-	if got, want := c.order(), []uint64{0}; !equal(got, want) {
-		t.Fatalf("order = %v, want %v", got, want)
-	}
-	g.Push(0, 2, c.emitter(2))
 	if got, want := c.order(), []uint64{0, 1}; !equal(got, want) {
 		t.Fatalf("order = %v, want %v", got, want)
 	}
@@ -226,10 +231,10 @@ func TestReassemblerBoundsTheBacklog(t *testing.T) {
 	}
 }
 
-// TestReassemblerDropsLateAndDuplicateFrames covers the §9.5 redundant-publisher
-// case, where the same object can reach us twice, and the frame that arrives
-// after the group has already moved past it. Emitting either would hand a
-// decoder something it is already beyond.
+// TestReassemblerDropsLateAndDuplicateFrames covers the §9.5
+// redundant-publisher case, where the same object can reach us twice, and the
+// frame that arrives after the group has already moved past it. Emitting either
+// would hand a decoder something it is already beyond.
 func TestReassemblerDropsLateAndDuplicateFrames(t *testing.T) {
 	g := newGroupReassembler(1)
 	var c collector
@@ -305,20 +310,22 @@ func TestReassemblerConcurrentPushesStayOrdered(t *testing.T) {
 	}
 }
 
-// Guards the assumption every test above is written against: the timestamp is
-// the ordering key, and it is the only one available. Object IDs cannot be —
-// each subgroup numbers from its own base, so the enhancement layer's first
-// object and the base layer's first object are both "object 0" of their stream
-// while sitting a frame apart in time. Stated as a test so a change to the
-// layout trips something rather than silently reordering video.
-func TestReassemblerOrdersOnTimestampsNotArrival(t *testing.T) {
+// Guards the assumption every test above is written against: the publisher's
+// emission index is the ordering key, and it counts across the subgroups of a
+// group. Object IDs cannot serve — each subgroup numbers from its own base, so
+// the enhancement layer's first object and the base layer's first object are
+// both "object 0" of their own stream while sitting a frame apart. Stated as a
+// test so a change to the layout trips something rather than silently
+// reordering video.
+func TestReassemblerOrdersOnEmissionIndex(t *testing.T) {
 	g := newGroupReassembler(2)
 	var c collector
 	g.OpenSubgroup(0)
 	g.OpenSubgroup(1)
 
-	// L1T2 emission: T0, T1, T0, T1... at 0,1,2,3 in time, split across
-	// subgroups by layer and here delivered layer by layer rather than in step.
+	// L1T2 emission: T0, T1, T0, T1... indexed 0,1,2,3 in that order, split
+	// across subgroups by layer and here delivered layer by layer rather than
+	// in step.
 	for _, ts := range []uint64{0, 2, 4, 6} {
 		g.Push(0, ts, c.emitter(ts))
 	}
@@ -333,7 +340,7 @@ func TestReassemblerOrdersOnTimestampsNotArrival(t *testing.T) {
 		want[i] = uint64(i)
 	}
 	if got := c.order(); !equal(got, want) {
-		t.Fatalf("order = %v, want %v — emission order and timestamp order must "+
+		t.Fatalf("order = %v, want %v — emission order and index order must "+
 			"agree, or the layout has drifted from what reassembly keys on", got, want)
 	}
 }

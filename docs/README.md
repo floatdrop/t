@@ -44,14 +44,37 @@ publisher mark sheddable (§8 delivery timeouts), so numbering them by layer is
 what makes the enhancement layer separately droppable — at the cost of frame
 rate rather than a frozen tile.
 
-Object IDs keep counting across the subgroups of a group, in emission order, so
-ascending object ID *is* decode order. That matters because the layers arrive on
-concurrent streams read on separate goroutines: `internal/conf/reorder.go`
-reassembles a group from its streams before anything reaches a decoder. It uses
-no timers — an object is released once no still-open stream can produce anything
-earlier, which is knowable exactly from the highest ID each has delivered. A
-group on a single subgroup, which is what audio and any unlayered video produce,
-releases every object on arrival and pays nothing for the machinery.
+Each layer numbers its objects **from its own base** — subgroup *L* uses IDs
+starting at `L × 65536` — because two rules apply at once. Object IDs must be
+unique within a group, since a relay's cache keys objects on `(group, object)`
+alone and a colliding ID overwrites the other layer's frame in the store that
+answers backfill FETCHes. And §11.4.3 forbids forwarding a non-consecutive
+object on an existing subgroup stream, so a relay handed one resets that stream
+and opens another. Numbering in emission order across the subgroups satisfies
+the first and breaks the second: each layer then sees every other ID, so *every*
+object is non-consecutive on its own stream. Measured against moq-go's relay,
+that produced one QUIC stream and one RESET_STREAM per frame per subscriber, and
+lost about half the frames of a group that arrived as a burst. Per-layer ranges
+bring it back to one stream per subgroup.
+
+That leaves the object ID saying nothing about where a frame belongs relative to
+another subgroup's, so reassembly keys on the **LOC timestamp** instead. It has
+to reassemble at all because the layers arrive on concurrent streams read on
+separate goroutines: `internal/conf/reorder.go` orders a group's streams before
+anything reaches a decoder, with no timers — a frame is released once no
+still-open stream can produce anything earlier, which the latest timestamp each
+has delivered answers exactly. Decode order is presentation order here, since
+WebCodecs emits no B-frames.
+
+Two things follow. A group is told how many subgroups to expect, from a
+`temporalLayers` count the publisher declares in its catalog, because a stream
+that has not arrived yet is indistinguishable from one that never will — and the
+first group of a track, which is the backfilled one a joining subscriber
+receives all at once, is exactly where no history exists to infer it from. And
+while a layer is genuinely being carried, one frame sits in hand: the oldest held
+frame goes out when the other layer delivers something at or after it, which in
+a steady stream is the very next arrival. A group on a single subgroup — audio,
+and any unlayered video — waits for nothing and pays nothing for the machinery.
 
 The small encoding stays flat, on subgroup 0 alone. It already runs at a divided
 framerate, and a subscriber taking it has made the resolution step down that
@@ -600,8 +623,9 @@ path from a `MediaStreamTrack` to WebCodecs, so video frames are pulled off a
   arrival order, with no reordering. Live capture never produces that case
   (audio groups are 500 ms apart and video groups a keyframe interval apart, so
   they are never simultaneously in flight), but a burst of publishes does.
-  Ordering across groups as well would remove the assumption; the object IDs
-  reassembly keys on are per-group, so it would need the group ID too.
+  Ordering across groups as well would remove the assumption, and the key it
+  would use is the same LOC timestamp — what it would need is somewhere to hold
+  a group's worth of frames, which is a jitter buffer rather than a reassembler.
 - **The audio device's startup stall is corrected, not prevented.** Capture
   rendering pauses for around half a second while the page finishes starting up,
   and the clock tracker absorbs it within a second rather than the pause not

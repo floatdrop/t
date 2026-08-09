@@ -52,6 +52,32 @@ var ErrAwaitingKeyFrame = errors.New("conf: waiting for first keyframe")
 // edge — so the blunt one is not worth the holes it costs.
 const videoSubgroupTimeout = 2 * time.Second
 
+// layerObjectStride is how far apart two temporal layers' object-ID ranges sit
+// inside one group.
+//
+// Two rules have to hold at once and they pull in opposite directions. Object
+// IDs must be unique within a group — a relay's cache keys objects on (group,
+// object) and nothing else, so a colliding ID does not merely confuse a reader,
+// it overwrites the other layer's frame in the store that answers backfill
+// FETCHes. And §11.4.3 forbids forwarding a non-consecutive object on an
+// existing subgroup stream, so a relay presented with one resets that stream
+// and opens another.
+//
+// Numbering objects in emission order across a group's subgroups satisfies the
+// first and breaks the second: each layer then sees every other ID, so every
+// object is non-consecutive with the one before it on its own stream. Measured
+// against moq-go's relay, that produced one QUIC stream and one RESET_STREAM
+// per frame per subscriber, and reassembly downstream of it collapsed —
+// nothing about a stream's lifetime means anything when a stream carries a
+// single object.
+//
+// So each layer gets its own contiguous range: consecutive within the subgroup,
+// disjoint between them. The stride only has to exceed the objects one layer
+// can contribute to a group, which is a GOP's frame count — about 30 at a
+// two-second keyframe interval. Sixty-five thousand is four orders of magnitude
+// of headroom for a two-byte varint.
+const layerObjectStride = 1 << 16
+
 // publisher owns the local participant's three publications: the MSF
 // catalog and the two LOC media tracks.
 type publisher struct {
@@ -424,11 +450,13 @@ type trackPublisher struct {
 	// wait on before it can release anything ordered after it.
 	subgroups [bridge.MaxTemporalLayer + 1]*session.OutgoingSubgroupStream
 	group     uint64
-	// object numbers the group's objects across every subgroup in it, in
-	// emission order. That is what lets a subscriber reassemble decode order
-	// from streams that arrive concurrently — see reorder.go, whose ordering is
-	// only as correct as this counter's continuity across layers.
-	object uint64
+	// objects counts what each subgroup of the current group has written, so
+	// each layer's object IDs run consecutively from its own base — see
+	// layerObjectStride for why they cannot simply count across the group.
+	//
+	// Ordering therefore does not ride on the object ID any more. It rides on
+	// the LOC timestamp every object already carries; see reorder.go.
+	objects [bridge.MaxTemporalLayer + 1]uint64
 	// started distinguishes "no group yet" from "in group 0".
 	started bool
 	// objectsInGroup counts objects written to the current group, for
@@ -496,7 +524,7 @@ func (t *trackPublisher) rotateGroup() error {
 		t.group++
 	}
 
-	t.object = 0
+	t.objects = [bridge.MaxTemporalLayer + 1]uint64{}
 	t.objectsInGroup = 0
 	t.started = true
 	t.counter.AddGroup()
@@ -564,7 +592,16 @@ func (t *trackPublisher) writeObject(f *bridge.MediaFrame) error {
 		props.AudioLevel = f.AudioLevel
 		props.HasAudioLevel = true
 	}
-	// The codec config goes on the first object of every group, so a
+	layer := f.TemporalLayer
+	if layer > bridge.MaxTemporalLayer {
+		// The frontend encodes the layer in two bits, so this cannot arrive
+		// over the bridge; it would take a caller constructing a frame by hand.
+		// Clamped to the base rather than rejected: a frame on the wrong layer
+		// is a picture that stutters, and dropping it is a picture with a hole.
+		layer = 0
+	}
+
+	// The codec config goes on the first object of every subgroup, so a
 	// subscriber can configure a decoder from the first object it sees
 	// without waiting for the catalog to come round again.
 	//
@@ -573,10 +610,14 @@ func (t *trackPublisher) writeObject(f *bridge.MediaFrame) error {
 	// output — so the claim held for object 0 of group 0 and nothing else. A
 	// subscriber joining a call in progress, which is the only kind of
 	// subscriber this is for, landed on a group with no config on it at all.
+	//
+	// Per subgroup rather than per group because a subscriber can be sent one
+	// and not the others: a base-only subscription that never saw the layer
+	// above it must still find a config on the first object it is given.
 	config := f.Config
 	if len(config) > 0 {
 		t.config = config
-	} else if t.object == 0 {
+	} else if t.objects[layer] == 0 {
 		config = t.config
 	}
 	if len(config) > 0 {
@@ -591,20 +632,13 @@ func (t *trackPublisher) writeObject(f *bridge.MediaFrame) error {
 	obj := loc.Object{Properties: props, Payload: f.Payload}
 	encodedProps, payload := obj.Encode()
 
-	layer := f.TemporalLayer
-	if layer > bridge.MaxTemporalLayer {
-		// The frontend encodes the layer in two bits, so this cannot arrive
-		// over the bridge; it would take a caller constructing a frame by hand.
-		// Clamped to the base rather than rejected: a frame on the wrong layer
-		// is a picture that stutters, and dropping it is a picture with a hole.
-		layer = 0
-	}
 	sg, err := t.openSubgroup(layer)
 	if err != nil {
 		return err
 	}
 
-	if err := sg.WriteObjectAt(t.object, &message.SubgroupObject{
+	objectID := uint64(layer)*layerObjectStride + t.objects[layer]
+	if err := sg.WriteObjectAt(objectID, &message.SubgroupObject{
 		Properties: encodedProps,
 		Payload:    payload,
 	}); err != nil {
@@ -619,9 +653,9 @@ func (t *trackPublisher) writeObject(f *bridge.MediaFrame) error {
 			t.started = false
 		}
 		return fmt.Errorf("conf: write object group=%d object=%d layer=%d: %w",
-			t.group, t.object, layer, err)
+			t.group, objectID, layer, err)
 	}
-	t.object++
+	t.objects[layer]++
 	t.objectsInGroup++
 	t.counter.AddObject(len(payload))
 	return nil

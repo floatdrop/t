@@ -1,11 +1,13 @@
 package conf
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -273,6 +275,11 @@ type remoteTrack struct {
 // reassemblerFor returns the reassembler for one group, creating it on the
 // first stream to arrive for that group, and registers subgroup as a stream
 // that may still deliver objects.
+//
+// Every group is told how many subgroups to expect from the publisher's own
+// declaration, which is the only thing that knows before the first frame does.
+// A track declaring nothing expects nothing, which is the behaviour it had
+// before layers and the right one for a publisher too old to say.
 func (t *remoteTrack) reassemblerFor(group, subgroup uint64) *groupReassembler {
 	t.groupsMu.Lock()
 	defer t.groupsMu.Unlock()
@@ -281,11 +288,37 @@ func (t *remoteTrack) reassemblerFor(group, subgroup uint64) *groupReassembler {
 	}
 	g, ok := t.groups[group]
 	if !ok {
-		g = newGroupReassembler()
+		g = newGroupReassembler(int(t.config.TemporalLayers))
 		t.groups[group] = g
+		t.retireSupersededLocked(group)
 	}
 	g.OpenSubgroup(subgroup)
 	return g
+}
+
+// retireSupersededLocked flushes groups far enough behind newest that nothing
+// more can be coming for them. The caller holds groupsMu.
+//
+// This is the bound on waiting for an expected stream that never arrives —
+// which a group whose top layer the relay dropped without ever opening will do,
+// as will one whose encoder simply had no enhancement frame to send. Neither
+// produces any signal to wait for, so the only honest end to the wait is the
+// evidence that the publisher has moved on.
+//
+// One whole group of slack, not none. A group's streams do not end together and
+// the relay drains them in whatever order it likes, so the next group opening is
+// no proof that this one is finished — flushing on it would discard exactly the
+// late layer this is here to protect. Two groups on is proof enough: the
+// publisher closes every subgroup of a group before opening the next, so a group
+// two behind the newest has been closed at the source for an entire GOP.
+func (t *remoteTrack) retireSupersededLocked(newest uint64) {
+	for id, g := range t.groups {
+		if id+2 > newest {
+			continue
+		}
+		g.Flush()
+		delete(t.groups, id)
+	}
 }
 
 // finishSubgroup reports one subgroup stream as ended, releasing whatever that
@@ -1016,6 +1049,27 @@ func (r *remote) readMediaFetch(
 	// waiting on it here.
 	defer track.doneBackfilling()
 
+	// A FETCH answers in object-ID order, which is decode order only while a
+	// group is on one subgroup. Layered, each subgroup owns its own ID range
+	// (see layerObjectStride), so the answer arrives as the whole base layer
+	// followed by the whole enhancement layer — every enhancement frame after
+	// every frame it sits between. Ordering it means having all of it, which is
+	// affordable precisely here: a backfill is one group, and the live path is
+	// already waiting for the last of it before it delivers anything.
+	//
+	// Only when there is something to order. An unlayered track streams out as
+	// it arrives, exactly as it did before.
+	layered := track.config.TemporalLayers > 1
+	var pending []bridge.MediaFrame
+	defer func() {
+		slices.SortStableFunc(pending, func(a, b bridge.MediaFrame) int {
+			return cmp.Compare(a.Timestamp, b.Timestamp)
+		})
+		for i := range pending {
+			r.room.sink.SendMedia(&pending[i])
+		}
+	}()
+
 	counter.AddGroup()
 	for {
 		obj, err := s.ReadDecoded()
@@ -1037,14 +1091,19 @@ func (r *remote) readMediaFetch(
 		}
 
 		counter.AddObject(len(decoded.Payload))
-		r.room.sink.SendMedia(&bridge.MediaFrame{
+		frame := bridge.MediaFrame{
 			Kind:      track.kind,
 			Handle:    track.handle,
 			Timestamp: scaleTimestamp(decoded.Properties),
 			KeyFrame:  obj.ObjectID == 0,
 			Config:    decoded.Properties.VideoConfig,
 			Payload:   decoded.Payload,
-		})
+		}
+		if layered {
+			pending = append(pending, frame)
+			continue
+		}
+		r.room.sink.SendMedia(&frame)
 	}
 }
 
@@ -1129,11 +1188,11 @@ func (r *remote) readMedia(
 			Handle:    track.handle,
 			Timestamp: scaleTimestamp(decoded.Properties),
 			// The first object of every group opens it, and for video
-			// every group opens on a keyframe (see the publisher). Still
-			// object 0 with temporal layers: the base layer carries the
-			// keyframe and the base layer is subgroup 0, so the group's
-			// first object is on it.
-			KeyFrame:      obj.ObjectID == 0,
+			// every group opens on a keyframe (see the publisher). Object 0
+			// of subgroup 0 specifically: each layer numbers from its own
+			// base now (see layerObjectStride), so the enhancement layer has
+			// an object 0 too and it is an ordinary delta frame.
+			KeyFrame:      subgroup == 0 && obj.ObjectID == 0,
 			Payload:       decoded.Payload,
 			TemporalLayer: uint8(subgroup),
 		}
@@ -1151,7 +1210,10 @@ func (r *remote) readMedia(
 		}
 
 		counter.AddObject(len(decoded.Payload))
-		reassembler.Push(subgroup, obj.ObjectID, func() {
+		// Keyed on the timestamp, not the object ID: each subgroup numbers its
+		// objects from its own base, so IDs order a stream against itself and
+		// nothing else. See reorder.go.
+		reassembler.Push(subgroup, frame.Timestamp, func() {
 			r.room.sink.SendMedia(&frame)
 		})
 	}

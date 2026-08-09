@@ -46,6 +46,22 @@ const KEYFRAME_INTERVAL_SEC = 2;
 const VIDEO_SCALABILITY_MODE = 'L1T2';
 
 /**
+ * How many temporal layers the mode above asks for, declared to subscribers.
+ *
+ * A subscriber has to know this before the first frame arrives. A group's
+ * layers ride separate subgroups on separate streams, and reassembly cannot
+ * tell a layer that will never come from one the relay has not got to yet
+ * unless it knows how many to expect — see internal/conf/reorder.go. Nothing
+ * observable answers in time: the first group of a track is the one a joining
+ * subscriber is backfilled with, all at once, before any history exists.
+ *
+ * Declaring two when the encoder ignores scalabilityMode and produces one costs
+ * nothing. Every frame then reads as the base layer, the group's object IDs run
+ * contiguously, and each is in turn the object being waited for.
+ */
+const VIDEO_TEMPORAL_LAYERS = 2;
+
+/**
  * Which temporal layer an encoded chunk belongs to.
  *
  * WebCodecs reports it as `svc.temporalLayerId` on the chunk's metadata. An
@@ -933,6 +949,7 @@ export class Capture {
         height,
         framerate,
         bitrate: primaryBitrate,
+        temporalLayers: VIDEO_TEMPORAL_LAYERS,
       },
     });
 

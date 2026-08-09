@@ -25,6 +25,7 @@ func AppendFrame(buf []byte, f *MediaFrame) []byte {
 		hdr[2] |= FlagAudioLevel
 		hdr[3] = f.AudioLevel
 	}
+	hdr[2] |= (f.TemporalLayer << TemporalLayerShift) & TemporalLayerMask
 	binary.BigEndian.PutUint32(hdr[4:8], f.Handle)
 	binary.BigEndian.PutUint64(hdr[8:16], f.Timestamp)
 	binary.BigEndian.PutUint32(hdr[16:20], uint32(len(f.Config)))
@@ -63,6 +64,7 @@ func ParseFrame(b []byte) (MediaFrame, error) {
 		KeyFrame:      b[2]&FlagKeyFrame != 0,
 		HasAudioLevel: b[2]&FlagAudioLevel != 0,
 		AudioLevel:    b[3],
+		TemporalLayer: (b[2] & TemporalLayerMask) >> TemporalLayerShift,
 		Payload:       b[configEnd : configEnd+int(payloadLen)],
 	}
 	if configLen > 0 {

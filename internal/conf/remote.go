@@ -256,6 +256,69 @@ type remoteTrack struct {
 	backfilled   chan struct{}
 	backfillOnce sync.Once
 	label        string
+
+	// groupsMu guards groups, which holds one reassembler per group currently
+	// in flight — keyed by Group ID, entered by every subgroup stream of that
+	// group and removed when the last of them ends.
+	//
+	// More than one at a time only during the overlap where a group's tail is
+	// still arriving as the next one opens, so this holds one or two entries in
+	// practice. Video with temporal layers is what makes it necessary at all: a
+	// group then arrives on several concurrent streams and decode order has to
+	// be put back together — see reorder.go.
+	groupsMu sync.Mutex
+	groups   map[uint64]*groupReassembler
+}
+
+// reassemblerFor returns the reassembler for one group, creating it on the
+// first stream to arrive for that group, and registers subgroup as a stream
+// that may still deliver objects.
+func (t *remoteTrack) reassemblerFor(group, subgroup uint64) *groupReassembler {
+	t.groupsMu.Lock()
+	defer t.groupsMu.Unlock()
+	if t.groups == nil {
+		t.groups = make(map[uint64]*groupReassembler)
+	}
+	g, ok := t.groups[group]
+	if !ok {
+		g = newGroupReassembler()
+		t.groups[group] = g
+	}
+	g.OpenSubgroup(subgroup)
+	return g
+}
+
+// finishSubgroup reports one subgroup stream as ended, releasing whatever that
+// unblocks. The group is forgotten once no stream of it is left, so a call that
+// runs for an hour does not accumulate a reassembler per GOP.
+func (t *remoteTrack) finishSubgroup(group, subgroup uint64) {
+	t.groupsMu.Lock()
+	g, ok := t.groups[group]
+	t.groupsMu.Unlock()
+	if !ok {
+		return
+	}
+	g.CloseSubgroup(subgroup)
+
+	t.groupsMu.Lock()
+	defer t.groupsMu.Unlock()
+	if g.idle() {
+		g.Flush()
+		delete(t.groups, group)
+	}
+}
+
+// dropGroups releases every group still in flight. Called when the track goes
+// away, so frames already received and decodable are painted rather than
+// discarded with the map.
+func (t *remoteTrack) dropGroups() {
+	t.groupsMu.Lock()
+	groups := t.groups
+	t.groups = nil
+	t.groupsMu.Unlock()
+	for _, g := range groups {
+		g.Flush()
+	}
 }
 
 // doneBackfilling releases the live reader. Safe to call from either side and
@@ -1005,6 +1068,10 @@ func (r *remote) dropTrack(slot **remoteTrack) {
 		return
 	}
 
+	// Before the subscription closes, so anything a still-open stream was
+	// holding back is painted rather than discarded with the map.
+	track.dropGroups()
+
 	track.sub.Close()
 	if fetch != nil {
 		fetch.Close()
@@ -1030,7 +1097,20 @@ func (r *remote) readMedia(
 	// there is nothing left to read by then.
 	defer r.checkLagForStream(track, counter)
 
-	counter.AddGroup()
+	// One group can arrive on several subgroup streams at once — one per
+	// temporal layer — each on its own goroutine. Objects go through the
+	// group's reassembler rather than straight to the frontend so the decoder
+	// sees them in decode order however the transport interleaved them.
+	group, subgroup := s.Header.GroupID, s.Header.SubgroupID
+	reassembler := track.reassemblerFor(group, subgroup)
+	defer track.finishSubgroup(group, subgroup)
+
+	// Counted once per group, by the stream that opens it. Every layer of a
+	// group is the same group, so counting per stream would report a group
+	// count that tracked the layer count instead.
+	if subgroup == 0 {
+		counter.AddGroup()
+	}
 	for {
 		obj, err := s.ReadDecoded()
 		if err != nil {
@@ -1049,9 +1129,13 @@ func (r *remote) readMedia(
 			Handle:    track.handle,
 			Timestamp: scaleTimestamp(decoded.Properties),
 			// The first object of every group opens it, and for video
-			// every group opens on a keyframe (see the publisher).
-			KeyFrame: obj.ObjectID == 0,
-			Payload:  decoded.Payload,
+			// every group opens on a keyframe (see the publisher). Still
+			// object 0 with temporal layers: the base layer carries the
+			// keyframe and the base layer is subgroup 0, so the group's
+			// first object is on it.
+			KeyFrame:      obj.ObjectID == 0,
+			Payload:       decoded.Payload,
+			TemporalLayer: uint8(subgroup),
 		}
 		switch track.kind {
 		case bridge.KindVideo:
@@ -1067,7 +1151,9 @@ func (r *remote) readMedia(
 		}
 
 		counter.AddObject(len(decoded.Payload))
-		r.room.sink.SendMedia(&frame)
+		reassembler.Push(subgroup, obj.ObjectID, func() {
+			r.room.sink.SendMedia(&frame)
+		})
 	}
 }
 

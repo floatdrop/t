@@ -22,7 +22,7 @@ import "encoding/json"
 //
 //	 0      u8      Version (always FrameVersion)
 //	 1      u8      Kind (KindVideo / KindAudio)
-//	 2      u8      Flags (FlagKeyFrame, FlagAudioLevel)
+//	 2      u8      Flags (FlagKeyFrame, FlagAudioLevel, TemporalLayer)
 //	 3      u8      AudioLevel — valid only with FlagAudioLevel
 //	 4..8   u32     Handle — identifies the track (see below)
 //	 8..16  u64     Timestamp in microseconds, from the encoder
@@ -44,6 +44,24 @@ const (
 	// FlagAudioLevel marks the AudioLevel byte as carrying a real
 	// measurement. Needed because level 0 means "loudest", not "absent".
 	FlagAudioLevel = 1 << 1
+
+	// TemporalLayerShift and TemporalLayerMask carve the frame's temporal
+	// layer out of the flags byte: bits 2-3, so layers 0-3.
+	//
+	// In the flags byte rather than a field of its own because the header is
+	// a fixed 24 bytes with two hand-written implementations, and widening it
+	// would be a wire break for a value that needs two bits. Byte 3 was the
+	// other candidate and is worse: it belongs to audio, and overloading it
+	// per-kind is how the two implementations drift.
+	//
+	// Zero is the base layer, which is also what a frame from an encoder
+	// producing no temporal layers reports — so an unlayered stream is layer
+	// 0 throughout and needs no special case anywhere.
+	TemporalLayerShift = 2
+	TemporalLayerMask  = 0x3 << TemporalLayerShift
+
+	// MaxTemporalLayer is the highest layer the two bits above can carry.
+	MaxTemporalLayer = 3
 )
 
 // Handles for the two tracks the frontend publishes. Remote handles are
@@ -79,6 +97,14 @@ type MediaFrame struct {
 	// travels with every audio frame in both directions.
 	AudioLevel    uint8
 	HasAudioLevel bool
+
+	// TemporalLayer is which temporal layer of an SVC encoding this frame
+	// belongs to: 0 is the base, which every higher layer references and which
+	// decodes on its own. It decides the subgroup the publisher writes the
+	// frame to, so a subscriber or relay can shed the upper layers without
+	// touching the base. Always 0 for audio, and for video from an encoder
+	// configured without temporal layers.
+	TemporalLayer uint8
 }
 
 // ---- control messages: frontend to backend ----------------------------

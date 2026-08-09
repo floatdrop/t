@@ -28,6 +28,44 @@ import { addTapModule, watchAudioContext, type TapBlock } from './worklets';
 const KEYFRAME_INTERVAL_SEC = 2;
 
 /**
+ * The SVC mode the primary video encoding is configured with.
+ *
+ * One spatial layer, two temporal ones: frames alternate between a base layer
+ * that stands on its own and an enhancement layer nothing else references. The
+ * backend maps the layer onto the subgroup it publishes the frame in, so the
+ * enhancement layer is separately declinable and separately sheddable.
+ *
+ * The small layer stays flat. It already runs at a divided framerate, so
+ * shedding half of what is left is not a degraded picture but a broken one —
+ * and a subscriber small enough to be given that layer has already taken the
+ * step down this would be offering.
+ *
+ * Kept as a constant because two things have to agree on how many layers there
+ * are — this and the two bits the bridge header spends on the layer id.
+ */
+const VIDEO_SCALABILITY_MODE = 'L1T2';
+
+/**
+ * Which temporal layer an encoded chunk belongs to.
+ *
+ * WebCodecs reports it as `svc.temporalLayerId` on the chunk's metadata. An
+ * encoder that ignored `scalabilityMode` reports nothing, and that is the case
+ * this defaults for: every frame then reads as the base layer, the backend puts
+ * them all in one subgroup, and the result is exactly the flat single-subgroup
+ * stream that existed before layers — degraded, but not broken. Which matters,
+ * because whether WebKit honours scalabilityMode for H.264 is not something the
+ * API will tell us in advance; it accepts the config either way.
+ */
+function temporalLayerOf(meta?: EncodedVideoChunkMetadata): number {
+  // `svc` is the WebCodecs SVC extension, which the bundled DOM types do not
+  // describe. Narrowed here rather than declared globally: a global
+  // augmentation would assert the field exists on every platform, and whether
+  // this one populates it is exactly what the runtime check below is for.
+  const svc = (meta as { svc?: { temporalLayerId?: number } } | undefined)?.svc;
+  return typeof svc?.temporalLayerId === 'number' ? svc.temporalLayerId : 0;
+}
+
+/**
  * Most frames a second this will publish, whatever the camera offers.
  *
  * A ceiling rather than a target: a camera that can only manage 24 is left at
@@ -849,6 +887,18 @@ export class Capture {
       bitrate: primaryBitrate,
       framerate,
       latencyMode: 'realtime',
+      // Two temporal layers, so the picture has a step down that costs neither
+      // a keyframe nor a re-subscribe. Nothing references the top layer, so
+      // dropping it costs exactly the frames it carried — half of them — where
+      // dropping frames from a flat encoding corrupts everything up to the next
+      // keyframe. The backend puts each layer in its own subgroup, which is
+      // what lets a subscriber decline one or a relay shed it.
+      //
+      // L1T2 rather than L1T3: shedding takes 30 fps to 15, which reads as a
+      // slightly less fluid picture. L1T3's bottom rung is 7.5 fps, which reads
+      // as broken, and the middle rung is a second decision to get right for a
+      // saving the first rung already mostly banked.
+      scalabilityMode: VIDEO_SCALABILITY_MODE,
       // Annex B puts SPS/PPS in the bitstream ahead of every keyframe, so
       // a subscriber can start decoding from any group without an
       // out-of-band description.
@@ -1554,6 +1604,7 @@ export class Capture {
       keyFrame: isKey,
       config,
       payload,
+      temporalLayer: temporalLayerOf(meta),
     })) {
       this.#dropped++;
     }

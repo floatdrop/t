@@ -221,25 +221,20 @@
               <th scope="col">Participant</th><th scope="col">Kind</th>
               <th scope="col">Codec</th><th scope="col">Resolution</th>
               <th scope="col">fps</th><th scope="col">Queue</th>
-              <!-- Frames decoded and waiting for their turn against the audio
-                   clock. Its own column beside the decode queue, which is the
-                   other depth: the two answer different questions — one is the
-                   decoder falling behind, the other is presentation holding
-                   frames back on purpose. -->
+              <!-- Frames decoded and not yet painted. Its own column beside the
+                   decode queue, which is the other depth: one is the decoder
+                   falling behind, the other is presentation not keeping up with
+                   it. Presentation paints the newest queued frame per display
+                   refresh, so anything above one or two here is a render loop
+                   that is not running. -->
               <th scope="col">Held</th>
               <th scope="col">Dropped</th>
               <!-- One per resolution the publisher has sent. A number that
                    climbs with the frame count means something is resizing the
                    canvas per frame, which clears it every time. -->
               <th scope="col">Resizes</th>
-              <!-- Frames dropped because the bitmap conversion had not
-                   finished. Expected zero; a number that climbs means the
-                   paint path is what is limiting the picture. -->
-              <th scope="col">Skipped</th><th scope="col">Buffered</th>
+              <th scope="col">Buffered</th>
               <th scope="col">Underruns</th>
-              <!-- How far the picture led the sound at the last presented
-                   frame. Nothing corrects from this, but without it a sync
-                   regression is invisible. -->
             </tr>
           </thead>
           <tbody>

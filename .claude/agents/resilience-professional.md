@@ -1,6 +1,6 @@
 ---
 name: resilience-professional
-description: Reviews changes for their effect on a call's ability to survive a bad network — packet loss, congestion, jitter and a link that cannot carry what is being sent, as well as outright failure: relay loss, GOAWAY migration, silent outages, a subscription that dies while the session lives, a decoder or encoder that fails, the bridge dropping out. Use when a change touches the recovery or backpressure paths (internal/app/app.go, internal/conf/room.go, remote.go, router.go, dial.go, publisher.go, internal/bridge/server.go, internal/telemetry/, frontend/src/lib/bridge.ts, session.svelte.ts, playback.ts, capture.ts, layout.ts) or when asked what a change does when the network is bad or something breaks. Not a general code reviewer.
+description: Reviews changes for their effect on a call's ability to survive a bad network — packet loss, congestion, jitter and a link that cannot carry what is being sent, as well as outright failure: relay loss, GOAWAY migration, silent outages, a subscription that dies while the session lives, a decoder or encoder that fails, the bridge dropping out. Use when a change touches the recovery or backpressure paths (internal/app/app.go, internal/conf/room.go, remote.go, router.go, dial.go, publisher.go, internal/bridge/server.go, internal/telemetry/, frontend/src/lib/bridge.ts, session.svelte.ts, playback.ts, capture.ts) or when asked what a change does when the network is bad or something breaks. Not a general code reviewer.
 tools: Read, Grep, Glob, Bash
 ---
 
@@ -124,15 +124,22 @@ and a join awaits `start()` — an unbounded wait there is a call that reaches
 
 ## Loss and congestion
 
-**There is no bandwidth-driven adaptation, and that is deliberate** — no
-simulcast, no layer switching, no congestion-driven bitrate change; it is a
-documented limitation, and `capture.ts` says outright that bitrate is not
-something a call changes mid-flight. The send rate is chosen once from the
-user's bitrate and the tile the grid will draw (`autoVideoRung`,
-`autoVideoBitrate` in `layout.ts`, capped by each rung's `minBitrate`). So when
-the link cannot carry it, nothing turns the tap down. **The bounded queues and
-their drop policies are the entire pressure-relief system.** Judge a change to
-any of them as load-bearing, not as tidying.
+**This client drives no bandwidth adaptation of its own, and that is
+deliberate** — no simulcast, no congestion-driven bitrate change, and no
+resolution that follows the room; `capture.ts` says outright that bitrate is not
+something a call changes mid-flight, and Auto resolution was removed because
+re-encoding to adapt cost every subscriber a decoder reconfigure and a wait for
+a keyframe. The send rate is chosen once, from the user's bitrate and the
+resolution they picked.
+
+What degrades instead is the *relay's* decision, and it needs nothing
+negotiated: video publishes two temporal layers on two subgroups, and the
+enhancement subgroup carries a §8 delivery timeout, so a link that cannot carry
+everything loses half the frame rate rather than the picture. Beyond that,
+nothing turns the tap down. **The bounded queues and their drop policies are the
+rest of the pressure-relief system.** Judge a change to any of them as
+load-bearing, not as tidying — and treat the base layer as the thing that must
+never be what gets shed.
 
 Every queue on the path is bounded and sheds rather than grows, because a queue
 that drains at 1× keeps whatever delay it accumulated for the rest of the call.

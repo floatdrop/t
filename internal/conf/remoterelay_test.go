@@ -1,0 +1,155 @@
+package conf
+
+import (
+	"fmt"
+	"os"
+	"testing"
+	"time"
+
+	"tlmst/internal/bridge"
+)
+
+// Temporal layers against a relay that is actually on a network.
+//
+// Everything else in this suite runs a relay in-process over loopback, where
+// nothing is lost, nothing is reordered and the RTT is a scheduling decision.
+// That is the right default — it is hermetic and it is fast — but it cannot
+// answer whether the layered path survives a real path, which is the one
+// question a subgroup-per-layer layout raises: two streams, two round trips,
+// two chances for the relay to drain one well ahead of the other.
+//
+// Skipped unless TLMST_RELAY names one, so the suite stays hermetic.
+func remoteRelay(t *testing.T) string {
+	t.Helper()
+	addr := os.Getenv("TLMST_RELAY")
+	if addr == "" {
+		t.Skip("set TLMST_RELAY=host:port to run this against a real relay")
+	}
+	return addr
+}
+
+// remoteRoom keeps two runs of this from landing in the same room on a relay
+// other people may be using.
+func remoteRoom(prefix string) string {
+	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+}
+
+// ordering reports how many times the delivered sequence went backwards, which
+// is the invariant that must hold whatever the network does to the frames.
+func ordering(frames []bridge.MediaFrame) int {
+	backwards := 0
+	for i := 1; i < len(frames); i++ {
+		if frames[i].Timestamp <= frames[i-1].Timestamp {
+			backwards++
+		}
+	}
+	return backwards
+}
+
+// TestRemoteRelayCarriesLayeredVideoInOrder publishes a two-layer stream at a
+// real cadence across a real relay and reads it back.
+//
+// Loss is a fact of a real path, so completeness is reported rather than
+// demanded. Order is not: a frame delivered after one that follows it is
+// undecodable whatever the reason, so reassembly must never emit one.
+func TestRemoteRelayCarriesLayeredVideoInOrder(t *testing.T) {
+	addr := remoteRelay(t)
+	room := remoteRoom("svc")
+
+	alice := layeredPublisher(t, addr, room, "alice")
+	_, bobRec := joinRoom(t, addr, room, "bob")
+	waitFor(t, "bob to subscribe to alice's tracks over the network", 30*time.Second,
+		func() bool {
+			_, tracks, _, _ := bobRec.snapshot()
+			return len(tracks) == 2
+		})
+
+	const seconds = 6
+	stop := make(chan struct{})
+	publishPacedLayers(t, alice, stop, temporalLayerFor)
+	time.Sleep(seconds * time.Second)
+	close(stop)
+	// Long enough for the last group in flight to arrive.
+	time.Sleep(2 * time.Second)
+
+	got := videoFrames(bobRec)
+	if len(got) == 0 {
+		t.Fatal("no video arrived at all over the relay")
+	}
+
+	layers := bobRec.layerBytes("video")
+	base, enhancement := layers[0], layers[1]
+	backwards := ordering(got)
+
+	// 30 fps for the publishing window, minus whatever the first subscription
+	// missed. An approximation of what was sent, which is all that is needed to
+	// read the delivered share as a percentage.
+	sent := seconds * 30
+	t.Logf("relay %s: %d video frames in %ds (~%d%% of a 30 fps window)",
+		addr, len(got), seconds, 100*len(got)/sent)
+	t.Logf("  base layer %d bytes, enhancement layer %d bytes (%d%% enhancement)",
+		base, enhancement, 100*enhancement/max(1, base+enhancement))
+	t.Logf("  out-of-order deliveries: %d", backwards)
+
+	if backwards != 0 {
+		t.Errorf("%d frames were delivered after a later one; reassembly must "+
+			"never hand a decoder a frame it is already past", backwards)
+	}
+	if enhancement == 0 {
+		t.Error("nothing arrived on the enhancement layer: the second subgroup " +
+			"did not survive the trip, so there is no layer to shed")
+	}
+	if base == 0 {
+		t.Error("nothing arrived on the base layer")
+	}
+}
+
+// TestRemoteRelayCarriesALayeredBurst is the backfill shape over a real path: a
+// whole group at once, with nothing pacing the two subgroup streams against
+// each other, which is where the relay is free to drain one far ahead of the
+// other.
+func TestRemoteRelayCarriesALayeredBurst(t *testing.T) {
+	addr := remoteRelay(t)
+	room := remoteRoom("svcburst")
+
+	alice := layeredPublisher(t, addr, room, "alice")
+	_, bobRec := joinRoom(t, addr, room, "bob")
+	waitFor(t, "bob to subscribe to alice's tracks over the network", 30*time.Second,
+		func() bool {
+			_, tracks, _, _ := bobRec.snapshot()
+			return len(tracks) == 2
+		})
+
+	const frames = 40
+	for i := range frames {
+		f := layeredVideoFrame(
+			uint64(i)*frameStep, i == 0, 1200, temporalLayerFor(i))
+		if err := alice.WriteFrame(f); err != nil {
+			t.Fatalf("write frame %d: %v", i, err)
+		}
+	}
+	closer := uint64(frames) * frameStep
+	if err := alice.WriteFrame(
+		layeredVideoFrame(closer, true, 1200, 0)); err != nil {
+		t.Fatalf("write the keyframe that closes the group: %v", err)
+	}
+	time.Sleep(5 * time.Second)
+
+	var got []bridge.MediaFrame
+	for _, f := range videoFrames(bobRec) {
+		if f.Timestamp < closer {
+			got = append(got, f)
+		}
+	}
+	backwards := ordering(got)
+	t.Logf("relay %s: %d of %d frames of a burst group, out-of-order %d",
+		addr, len(got), frames, backwards)
+
+	if backwards != 0 {
+		t.Errorf("%d frames of the burst were delivered out of order", backwards)
+	}
+	if len(got) < frames {
+		t.Logf("NOTE: %d frames did not arrive; over a real path that can be "+
+			"loss rather than reassembly", frames-len(got))
+	}
+}

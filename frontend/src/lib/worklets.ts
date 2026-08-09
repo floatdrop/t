@@ -176,7 +176,6 @@ class PCMPlayer extends AudioWorkletProcessor {
     };
   }
 
-  // playoutUs is the timestamp of the sample about to leave the buffer.
   report() {
     this.port.postMessage({
       available: this.available,
@@ -184,8 +183,6 @@ class PCMPlayer extends AudioWorkletProcessor {
       trimmed: this.trimmed,
       trimmedFrom: this.trimmedFrom,
       playing: this.playing,
-      haveClock: this.haveClock,
-      playoutUs: this.writeUs - (this.available / sampleRate) * 1e6,
     });
   }
 
@@ -287,10 +284,6 @@ export interface PlayerReport {
   trimmedFrom: number;
   /** False while prerolling or after a starve, when the clock is not moving. */
   playing: boolean;
-  /** False until a timestamped chunk has arrived. */
-  haveClock: boolean;
-  /** Publisher-clock timestamp of the sample about to be heard. */
-  playoutUs: number;
 }
 
 /** What pcm-player expects on its port. */
@@ -323,10 +316,10 @@ function blobURL(name: string, source: string): string {
  *
  * The two contexts fail differently and both silently. The playback one is
  * shared by every remote participant, so an interruption is the whole room
- * going quiet at once while the tiles carry on painting — presentation falls
- * back to the newest frame when there is no clock, so even lip sync looks
- * deliberate. The capture one stops the tap, so the microphone goes dead
- * while the local preview and everyone else's audio continue.
+ * going quiet at once while the tiles carry on painting, video no longer
+ * having any dependency on audio to give the silence away. The capture one
+ * stops the tap, so the microphone goes dead while the local preview and
+ * everyone else's audio continue.
  *
  * Resuming needs no gesture once one has been given, so this can simply ask.
  */

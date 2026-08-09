@@ -240,7 +240,6 @@
               <!-- How far the picture led the sound at the last presented
                    frame. Nothing corrects from this, but without it a sync
                    regression is invisible. -->
-              <th scope="col">A/V</th>
             </tr>
           </thead>
           <tbody>
@@ -271,19 +270,6 @@
                 </td>
                 <td class={s.underruns ? 'warn' : ''}>
                   {s.underruns ?? '—'}
-                </td>
-                <td>
-                  {#if s.avOffsetMs !== undefined}
-                    <span class={Math.abs(s.avOffsetMs) > 80 ? 'warn' : ''}>
-                      {s.avOffsetMs > 0 ? '+' : ''}{s.avOffsetMs.toFixed(0)} ms
-                    </span>
-                  {:else if s.kind === 'video'}
-                    <!-- No audio from this participant, so the frame is
-                         presented as soon as it decodes. -->
-                    free
-                  {:else}
-                    —
-                  {/if}
                 </td>
               </tr>
             {/each}

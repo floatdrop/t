@@ -12,7 +12,6 @@
 import { bridge } from './bridge';
 import { decodeAudioLevel } from './denoise';
 import { KIND_VIDEO, fromBase64, type MediaFrame, type RemoteTrack } from './protocol';
-import { offsetMillis, presentIndex, projectClock, type ClockSample } from './sync';
 import { addPlayerModule, watchAudioContext, type PlayerChunk, type PlayerReport } from './worklets';
 
 /**
@@ -159,14 +158,7 @@ export interface PlaybackStats {
   paintSkipped?: number;
   /** Codec string the decoder was configured with. */
   codec: string;
-  /**
-   * Video only: how far ahead of the audio clock the last presented frame
-   * was, in milliseconds. Positive means the picture leads the sound. Absent
-   * when the participant publishes no audio, since there is then no clock to
-   * measure against.
-   */
-  avOffsetMs?: number;
-  /** Video only: frames decoded but not yet due for presentation. */
+  /** Video only: frames decoded but not yet painted. */
   queued?: number;
   /**
    * Video only: the resolution frames are actually decoding at, which can
@@ -271,11 +263,6 @@ interface VideoSink {
    * decoder emitted, with nothing tying it to the sound.
    */
   queue: VideoFrame[];
-  /**
-   * Offset of the last presented frame, for the debug panel. Null while the
-   * participant has no audio clock to measure against.
-   */
-  avOffsetMs: number | null;
 }
 
 interface AudioSink {
@@ -295,11 +282,6 @@ interface AudioSink {
   restarts: number;
   /** Trims seen so far, so only an increase is reported. */
   trimmed: number;
-  /**
-   * Latest playout position reported by the worklet — the master clock for
-   * this participant's video. Null until audio actually starts playing.
-   */
-  clock: ClockSample | null;
 }
 
 type Sink = VideoSink | AudioSink;
@@ -449,7 +431,6 @@ export class Playback {
       width: 0,
       height: 0,
       queue: [],
-      avOffsetMs: null,
       restarts: 0,
       config: null as unknown as VideoDecoderConfig,
       decoder: null as unknown as VideoDecoder,
@@ -490,7 +471,6 @@ export class Playback {
       trimmed: 0,
       restarts: 0,
       config: null as unknown as AudioDecoderConfig,
-      clock: null,
       decoder: null as unknown as AudioDecoder,
     };
 
@@ -527,12 +507,6 @@ export class Playback {
           nowMs: String(Math.round((ev.data.available / 48000) * 1000)),
         });
       }
-      // Only a playing buffer has a meaningful position; a prerolling or
-      // starved one would report a clock that is not advancing, and video
-      // scheduled against it would stall.
-      sink.clock = ev.data.playing && ev.data.haveClock
-        ? { playoutUs: ev.data.playoutUs, atMs: performance.now() }
-        : null;
     };
     sink.node = node;
     sink.gain = gain;
@@ -802,7 +776,7 @@ export class Playback {
       const now = performance.now();
       this.#lastTickMs = now;
       for (const sink of this.#sinks.values()) {
-        if (sink.kind === 'video') this.#present(sink, now);
+        if (sink.kind === 'video') this.#present(sink);
       }
     };
     this.#lastTickMs = performance.now();
@@ -862,23 +836,31 @@ export class Playback {
     }
   }
 
-  /** Presents whichever queued frame is due against the audio clock. */
-  #present(sink: VideoSink, nowMs: number): void {
+  /**
+   * Presents the newest decoded frame, once per display refresh.
+   *
+   * Video used to be scheduled against the participant's audio playout clock,
+   * so a frame waited until its timestamp came due. That bought lip sync and
+   * charged for it in coupling: audio that stalled, starved or stopped
+   * reporting took the picture with it, and a fault in either medium showed up
+   * as a fault in both. They are independent now — video is painted as fast as
+   * it decodes, sound played as fast as it arrives, neither waiting on the
+   * other.
+   *
+   * What that gives up is real. Nothing aligns the two timelines any more, and
+   * before there was any synchronisation the picture led the sound by around
+   * two thirds of a second. This is a deliberate step back from that, to make
+   * each medium diagnosable without the other.
+   *
+   * Newest rather than every frame, and still on the display's clock: a
+   * backfilled group arrives as a burst, and painting each frame as it decoded
+   * would run a second of video past in a few milliseconds. Showing the newest
+   * per refresh skips instead of fast-forwarding.
+   */
+  #present(sink: VideoSink): void {
     if (sink.queue.length === 0) return;
 
-    const clockUs = this.#clockFor(sink.track.participant, nowMs);
-    let index: number;
-    if (clockUs === null) {
-      // The participant publishes no audio, or it has not started playing.
-      // There is nothing to synchronise to, so show the newest frame — which
-      // is also the lowest-latency thing to do.
-      index = sink.queue.length - 1;
-      sink.avOffsetMs = null;
-    } else {
-      index = presentIndex(sink.queue.map((frame) => frame.timestamp), clockUs);
-      if (index < 0) return; // Nothing due yet; hold the queue.
-      sink.avOffsetMs = offsetMillis(sink.queue[index].timestamp, clockUs);
-    }
+    const index = sink.queue.length - 1;
 
     // Frames before the chosen one have been overtaken and are never shown.
     for (let i = 0; i < index; i++) sink.queue[i].close();
@@ -893,22 +875,6 @@ export class Playback {
       return;
     }
     this.#paint(sink, frame);
-  }
-
-  /**
-   * The playout position of a participant's audio, projected to now, or null
-   * if they have no clock.
-   *
-   * Looked up by participant rather than held on the video sink because the
-   * two tracks are announced independently and in either order, so a
-   * back-reference would need fixing up on both paths.
-   */
-  #clockFor(participant: string, nowMs: number): number | null {
-    for (const sink of this.#sinks.values()) {
-      if (sink.kind !== 'audio' || sink.track.participant !== participant) continue;
-      return sink.clock ? projectClock(sink.clock, nowMs) : null;
-    }
-    return null;
   }
 
   #paint(sink: VideoSink, frame: VideoFrame): void {
@@ -1063,7 +1029,6 @@ export class Playback {
         row.resizes = sink.resizes;
         row.paintSkipped = sink.paintSkipped;
         row.queued = sink.queue.length;
-        if (sink.avOffsetMs !== null) row.avOffsetMs = sink.avOffsetMs;
       }
       if (sink.kind === 'audio') {
         row.buffered = sink.buffered;

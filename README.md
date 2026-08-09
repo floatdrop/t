@@ -97,7 +97,7 @@ decision cost before it was made:
 
 | | |
 |---|---|
-| [Media and transport](docs/README.md#media-and-transport) | naming and discovery, stream mapping, lip sync and mixing, audio processing, voice activity |
+| [Media and transport](docs/README.md#media-and-transport) | naming and discovery, stream mapping, presentation and mixing, audio processing, voice activity |
 | [Launch flags](docs/README.md#launch-flags) | prefilling and submitting the welcome form from the command line |
 | [Devices](docs/README.md#devices) | camera, microphone, the resolution ladder, and what Auto sizes against |
 | [Version and updates](docs/README.md#version-and-updates) | where the version comes from and how a newer release is offered |

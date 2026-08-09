@@ -31,7 +31,10 @@ namespace, so it can be anything and can repeat.
 
 **Video** uses one group per GOP: a keyframe opens a new group and the frames
 after it are objects `1..n`. A relay can therefore drop a whole group under
-congestion and land the subscriber exactly on the next keyframe. H.264 is
+congestion and land the subscriber exactly on the next keyframe. A group is one
+second long, which is also what a joining subscriber waits before its first
+picture: nothing replays the group in progress any more, so the keyframe
+interval *is* the join latency, and it halves what losing a group costs. H.264 is
 encoded in Annex B, so SPS/PPS travel in-band with every keyframe and no
 out-of-band config is needed.
 
@@ -75,13 +78,15 @@ frame: it says which frame comes first but never whether anything earlier is
 still to come, so the oldest held frame always waited for the other layer to
 move past it.
 
-A group is also told how many subgroups to expect — the `temporalLayers` count
-the publisher declares in its catalog, less any layer this subscriber declined —
-because a stream that has not arrived yet is indistinguishable from one that
-never will, and the first group of a track, the backfilled one a joining
-subscriber receives all at once, is exactly where no history exists to infer it
-from. A group on a single subgroup — audio, and any unlayered video — waits for
-nothing and pays nothing for the machinery.
+A group does *not* wait for a layer it has not seen. It was told what to expect
+once, from a count in the catalog, and that was worse than the problem it
+solved: a relay shedding the enhancement layer never opens that stream, so the
+group conceded nothing, and base-layer frames sat held until it was retired two
+groups later — four seconds of frozen tile, then four seconds of video at once,
+on any link that made the relay shed. What can still produce something earlier
+is what has been seen and has not ended. The backlog is bounded at eight
+objects, one deeper than L1T2's interleave, so the worst a missing layer can
+cost is a quarter of a second rather than a GOP.
 
 The enhancement layer is also marked **disposable**, by a §8 object delivery
 timeout stamped on the first object of its subgroup: half a second, against the
@@ -91,9 +96,16 @@ link that cannot carry everything loses half its frame rate rather than its
 picture. Measured behind a 32 kB/s bottleneck, the enhancement layer fell from
 47% of the video bytes to 19% while the base layer kept arriving.
 
-The small encoding stays flat, on subgroup 0 alone. It already runs at a divided
-framerate, and a subscriber taking it has made the resolution step down that
-shedding a layer would be a weaker version of.
+There is one encoding. There used to be a second, smaller one published
+alongside it, and a ladder that walked a struggling subscriber down onto it —
+both gone. Shedding the enhancement layer does that job without anyone
+negotiating it, and the ladder's cheaper rung (declining the top subgroup with
+a §5.1.3 Range Filter) is unusable in practice anyway: MAX_FILTER_RANGES
+defaults to zero, so a relay that does not advertise it rejects the SUBSCRIBE
+outright. When the relay gives up on a subscription the client simply asks
+again — a fresh SUBSCRIBE starts at the live edge, and on a link that tight
+what comes back has already lost its top layer. Three of those inside a minute
+and video is set aside until the recovery timer tries again.
 
 **Audio** has no keyframes, so it uses a fixed cadence — a new group every 25
 frames, which is 500 ms at the 20 ms framing WebCodecs produces. Opus's
@@ -109,76 +121,66 @@ without decoding their audio, and a relay could prioritise on it.
 [draft-lcurley-moq-hang](https://datatracker.ietf.org/doc/draft-lcurley-moq-hang/)
 was the idea source for this shape; it is not a spec this implements.
 
-### Lip sync and mixing
+### Presentation and mixing
 
-Audio is the master clock, because it has to be: the output device consumes
-samples at its own rate and cannot be asked to wait, whereas a video frame can
-be held for a few milliseconds and painted when its time comes. The player
-worklet reports the LOC timestamp of the sample it is about to play; decoded
-video waits in a short queue and each frame is painted when the clock reaches it
-(`frontend/src/lib/sync.ts`, tested on its own since it is pure arithmetic).
-Timestamps are only comparable within one publisher, so every participant is
-synchronised independently, and one with no audio track is painted as soon as it
-decodes — there is nothing to wait for.
+Video and audio are presented independently. Each decoded frame is painted on
+the next display refresh, and audio is played as it arrives; neither waits on
+the other.
 
-Getting the two capture timelines onto one clock was the whole problem, and
-neither obvious approach survived being measured:
+There used to be lip sync, and it worked: audio was the master clock — the
+output device consumes samples at its own rate and cannot be asked to wait,
+whereas a video frame can be held for a few milliseconds — so the player
+worklet reported the timestamp of the sample it was about to play and each
+decoded frame waited until its own timestamp came due. Getting the two capture
+timelines onto one clock was most of the work, and the reasoning is worth
+keeping even though the code is gone:
 
 - Timestamping audio from a **counter of encoded samples** describes only the
   audio that got through. The microphone is live for ~730 ms before the
   `AudioEncoder` finishes configuring, and every frame dropped in that window
   shifts all later timestamps into the past, permanently.
-- Timestamping from the **AudioContext's capture clock** fails differently: that
-  clock counts *rendered* audio, so it stops when rendering stops — and it does
-  stop, for ~500 ms during startup while the denoiser's WASM compiles and the
-  first subscriptions are set up. Audio after the pause is then named half a
-  second early, again permanently.
+- Timestamping from the **AudioContext's capture clock** fails differently:
+  that clock counts *rendered* audio, so it stops when rendering stops — and it
+  does stop, for ~500 ms during startup while the denoiser's WASM compiles.
+  Audio after the pause is then named half a second early, again permanently.
 
 So `Capture` tracks the offset between the capture clock and the shared media
 clock continuously, as the *smallest* skew seen over a one-second window: the
-main thread can only ever make a block look later than it was, never earlier, so
-the minimum is the least polluted observation, and a stall raises the floor and
-is followed within a second. Separately, a block that has waited more than 80 ms
-is dropped rather than encoded — encoding a backlog sends the audio anyway *and*
-keeps the delay forever, since the queue then drains at exactly 1×.
+main thread can only ever make a block look later than it was, never earlier,
+so the minimum is the least polluted observation. That part remains — it is
+what makes a publisher's timestamps mean anything at all. What went is the
+scheduling built on top of it.
 
-Together those had the picture leading the sound by two thirds of a second on
-every call, invisibly, because nothing compared the two timelines. The **A/V**
-column in the decoders table now does: it shows how far the last presented frame
-was from the audio clock, which is normally under a frame interval.
+It was removed for coupling rather than for cost. A picture that waits on an
+audio clock is a picture that stops when the audio clock does, and an audio
+buffer that stalls, starves or simply stops reporting took the tiles with it —
+so a fault in either medium presented as a fault in both, and neither could be
+diagnosed alone. That is the position a call is in when the sound is wrong and
+the picture is staggering, which is where this was decided. The cost is real
+and worth stating plainly: nothing aligns the two timelines now, and the last
+time there was no synchronisation the picture led the sound by around two
+thirds of a second.
 
-The playback queue is bounded for the same reason the capture one is. Nothing
+The playback buffer is still bounded, for the reason it always was. Nothing
 drains a ring buffer — the reader takes exactly one sample per output sample —
 so any moment where the writer got ahead stays ahead for the rest of the call.
-Measured on a five-way call, every buffer sat pinned at its two-second capacity:
-two full seconds between someone speaking and anyone hearing it, with the
-**BUFFERED** column reading 1995 ms and **A/V** reading +1969 ms. So `pcm-player`
-drops the oldest audio once more than 250 ms has queued, back to 120 ms, and
-reports the count. A gap is audible once; permanent latency is audible for the
-whole call.
+Measured on a five-way call, every buffer sat pinned at its two-second
+capacity: two full seconds between someone speaking and anyone hearing it. So
+`pcm-player` drops the oldest audio once more than 250 ms has queued, back to
+120 ms, and reports the count. A gap is audible once; permanent latency is
+audible for the whole call.
 
 The floor was the 60 ms preroll depth until a nine-minute call over a VPN to a
 remote relay was measured: twenty-four trims across two participants, every one
 firing between 253 and 269 ms. The buffer was never running away — it was
 grazing the ceiling and being cut back to a preroll's worth, which is a 190 ms
-hole in the sound each time and leaves nothing in hand on a path that had just
-demonstrated it delivers in bursts.
-
-Doubling the floor was expected to trade rare large gaps for frequent small ones
-and nothing else, since the discard rate should follow how fast the buffer
-fills. It did not: the same nine minutes on the same path went from twenty-four
-trims to seven. The fill is episodic rather than a steady drift, so a deeper
-cushion absorbs bursts before they reach the ceiling instead of re-slicing the
-same total. The cost is 60 ms of standing latency after each trim. Two runs on
-an uncontrolled path, so the size of that is not worth trusting — the direction
-held for both participants.
-
-That measurement was only possible because the warning reports the depth it
-trimmed *from*. What is left after a trim is the floor by construction, so the
-figure that used to be logged said the same thing every time, whether the
-buffer had reached 260 ms or two seconds. The playout clock needs no correction — it is
-derived from what is still buffered, so skipping ahead in the buffer is skipping
-ahead in time, and the video scheduled against it follows.
+hole in the sound each time. Doubling the floor was expected to trade rare
+large gaps for frequent small ones and nothing else. It did not: the same nine
+minutes went from twenty-four trims to seven. The fill is episodic rather than
+a steady drift, so a deeper cushion absorbs bursts before they reach the
+ceiling instead of re-slicing the same total. Two runs on an uncontrolled path,
+so the size of that is not worth trusting — the direction held for both
+participants.
 
 That buffer filling is a symptom worth chasing rather than absorbing, so a trim
 is logged at WARN. The one that prompted the bound turned out to be two capture
@@ -197,7 +199,6 @@ Mixing is Web Audio summation, but not the accidental kind: each participant
 gets a `GainNode` feeding a shared `DynamicsCompressorNode` before the
 destination. Connecting every player straight to the destination sums at unity
 with no headroom, so several loud speakers clip.
-
 ### Audio processing
 
 **Echo cancellation is the platform's.** `getUserMedia`'s `echoCancellation`
@@ -629,8 +630,13 @@ path from a `MediaStreamTrack` to WebCodecs, so video frames are pulled off a
   `NSCameraUsageDescription` / `NSMicrophoneUsageDescription` keys, which
   `config.yml` has no field for, and the removal of `CFBundleIconName` (see
   "Icon").
-- One video and one audio track per participant; no simulcast, no layer
-  switching, no bandwidth-driven quality adaptation.
+- One video and one audio track per participant, and no bandwidth-driven
+  quality adaptation this client controls. Degrading is the relay's: the
+  enhancement layer carries a §8 timeout, so a link that cannot carry
+  everything loses half the frame rate rather than the picture, without anyone
+  negotiating it.
+- **Audio and video are not synchronised.** Each is presented as it arrives.
+  See "Presentation and mixing" for why that was chosen and what it costs.
 - **Playback assumes *groups* arrive in publication order.** Reassembly
   (`internal/conf/reorder.go`) orders the subgroups *within* a group, which is
   what temporal layers need, but two groups in flight at once may still be
@@ -641,7 +647,11 @@ path from a `MediaStreamTrack` to WebCodecs, so video frames are pulled off a
   Ordering across groups as well would remove the assumption, and the key it
   would use is the LOC timestamp, since the emission index reassembly keys on is
   numbered per group — what it would need is somewhere to hold a group's worth
-  of frames, which is a jitter buffer rather than a reassembler.
+  of frames, which is a jitter buffer rather than a reassembler. Measured
+  against a deployed relay this does not currently happen: zero inversions in
+  1363 video and 2249 audio frames on a healthy path, and under a bottleneck
+  every large inversion turned out to be the backfill racing the live edge
+  rather than the network — which is part of why the backfill went.
 - **The audio device's startup stall is corrected, not prevented.** Capture
   rendering pauses for around half a second while the page finishes starting up,
   and the clock tracker absorbs it within a second rather than the pause not
@@ -652,5 +662,5 @@ path from a `MediaStreamTrack` to WebCodecs, so video frames are pulled off a
   through Wails' cross-platform `Permissions` option (which those two backends
   honour and macOS ignores), but neither has been exercised in a real call.
 - A subscriber discards inbound video until the first keyframe, so joining
-  mid-GOP costs up to the keyframe interval (2 s) before the first frame paints.
+  mid-GOP costs up to the keyframe interval (1 s) before the first frame paints.
   Those frames show up as `dropped` in the decoders table and are expected.

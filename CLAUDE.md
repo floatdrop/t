@@ -8,7 +8,7 @@ A Wails v3 desktop teleconference client. Media travels over Media over QUIC
 (moq-go, draft-19) with no signalling server and no SFU: peers find each other
 through MOQT namespace discovery on a relay and each publishes its own media.
 `docs/README.md` is unusually complete — it explains the *why* behind most
-design decisions here (lip sync, clock tracking, reconnection, invite links,
+design decisions here (presentation, clock tracking, reconnection, invite links,
 icon). Read the relevant section before changing behaviour in those areas;
 the top-level `README.md` is only the short orientation.
 
@@ -61,13 +61,14 @@ bin/tlmst.dev.app/Contents/MacOS/tlmst -relay localhost:4433 -room demo \
 ```
 
 `cmd/shaper` puts a userspace bottleneck in front of one participant, which is
-the only way to see the congestion paths work — the drift meter, the relay's
-TOO_FAR_BEHIND verdict and the demotion ladder never fire on a healthy link.
+the only way to see the congestion paths work — the relay's TOO_FAR_BEHIND
+verdict, the §8 shedding of the enhancement layer and the rebuild that answers
+them never fire on a healthy link.
 Point one instance at it and leave the rest on the relay directly; its doc
 comment explains why the rate matters more than it looks.
 
 The frontend's tests cover the plain-TypeScript policy modules — the arithmetic
-that decides what to send and what to ask for (`layout.ts`, `congestion.ts`).
+that decides what to send and what to ask for (`layout.ts`).
 Nothing renders a component: what touches a camera, a codec or a socket is
 exercised by running the app.
 

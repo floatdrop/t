@@ -431,7 +431,9 @@ type trackPublisher struct {
 	pub     *session.Publication
 	counter *telemetry.TrackCounter
 	// timeouts is applied to every subgroup this track opens — see the
-	// delivery-timeout constants.
+	// delivery-timeout constants. The publisher's half of §8: this is an
+	// original source, so there are no subscriber-supplied values to weigh it
+	// against.
 	timeouts message.DeliveryTimeouts
 
 	// mu serializes writes: the bridge read loop is the only caller
@@ -572,7 +574,13 @@ func (t *trackPublisher) openSubgroup(layer uint8) (*session.OutgoingSubgroupStr
 	}
 	// Returns a copy rather than configuring in place, so the timeout only
 	// applies if the result is what gets kept.
-	t.subgroups[layer] = sg.WithDeliveryTimeouts(t.timeouts)
+	//
+	// The two halves go in separately because §8 does not treat them
+	// symmetrically — a first-object override resolves within the publisher's
+	// half, and only the result is compared against the subscriber's. Nothing
+	// here has a subscriber's values to supply, so the zero one goes in, which
+	// never wins over a non-zero publisher value.
+	t.subgroups[layer] = sg.WithDeliveryTimeouts(t.timeouts, message.DeliveryTimeouts{})
 	return t.subgroups[layer], nil
 }
 

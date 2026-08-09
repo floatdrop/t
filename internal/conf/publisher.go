@@ -52,6 +52,26 @@ var ErrAwaitingKeyFrame = errors.New("conf: waiting for first keyframe")
 // edge — so the blunt one is not worth the holes it costs.
 const videoSubgroupTimeout = 2 * time.Second
 
+// enhancementObjectTimeout is how long a temporal enhancement frame may sit
+// queued for a subscriber before that layer is given up on for the group.
+//
+// The point of putting the layers on separate subgroups: §8 lets a publisher
+// say how long an object is worth delivering, per subgroup, by stamping it on
+// the subgroup's first object — and a relay honouring it resets that one stream
+// with DELIVERY_TIMEOUT rather than terminating the subscription (§3.3.4 is
+// explicit that the two are different). So the enhancement layer expires on its
+// own while the base keeps flowing, and the subscriber loses half its frame
+// rate instead of its picture.
+//
+// Half of what the base layer gets, which is the ordering that matters: the
+// disposable layer must always be given up on first, or shedding it buys
+// nothing that the group being dropped would not have taken anyway. Above a
+// keyframe's own transmission time on the slowest link the ladder tolerates —
+// eight kilobytes at half a megabit is an eighth of a second, and the
+// enhancement layer queues behind every one of them — so a link that is merely
+// slow does not lose its top layer for coping.
+const enhancementObjectTimeout = 500 * time.Millisecond
+
 // layerObjectStride is how far apart two temporal layers' object-ID ranges sit
 // inside one group.
 //
@@ -635,6 +655,19 @@ func (t *trackPublisher) writeObject(f *bridge.MediaFrame) error {
 		case bridge.KindAudio:
 			props.AudioConfig = config
 		}
+	}
+
+	// Marks the enhancement layer disposable, on the first object of its
+	// subgroup — which is where §8 says a per-subgroup override lives, the Track
+	// Property being the fallback and one track carrying both layers. It rides
+	// as a LOC extra because the two live in the same Object Properties blob and
+	// a reader decodes it whether or not it knows what LOC is; 0x02 collides
+	// with none of the LOC property IDs.
+	if layer > 0 && t.objects[layer] == 0 {
+		props.Extras = append(props.Extras, wire.KVPair{
+			Type:   message.PropertyObjectDeliveryTimeout,
+			IntVal: uint64(enhancementObjectTimeout / time.Millisecond),
+		})
 	}
 
 	obj := loc.Object{Properties: props, Payload: f.Payload}

@@ -343,3 +343,68 @@ func TestALayeredGroupSurvivesArrivingAsABurst(t *testing.T) {
 		}
 	}
 }
+
+// layeredShare reports what fraction of the video bytes a recorder received
+// arrived on the enhancement layer.
+func layeredShare(rec *recorder) float64 {
+	bytes := rec.layerBytes("video")
+	total := bytes[0] + bytes[1]
+	if total == 0 {
+		return 0
+	}
+	return float64(bytes[1]) / float64(total)
+}
+
+// The enhancement layer is marked disposable, and a link that cannot carry it
+// should lose it rather than the picture. §8 lets the publisher say so per
+// subgroup, and a relay honouring that resets the one stream with
+// DELIVERY_TIMEOUT instead of terminating the subscription — which is the
+// difference between a tile at half the frame rate and a tile that is gone.
+//
+// Measured as a share rather than a count: the bottleneck decides how much
+// arrives in total, and the question is how it was divided.
+func TestABottleneckCostsTheEnhancementLayerFirst(t *testing.T) {
+	relayServer := startRelay(t)
+	addr := relayServer.Addr()
+	alice := layeredPublisher(t, addr, "shed", "alice")
+
+	// Both subscribers watch the same publisher over the same relay, so the
+	// only difference between them is the link.
+	_, roomyRec := joinRoom(t, addr, "shed", "roomy")
+	link := startShaper(t, addr, 32_000, 64)
+	_, squeezedRec := joinRoom(t, link.Addr(), "shed", "squeezed")
+
+	waitFor(t, "both subscribers to take alice's video", 20*time.Second, func() bool {
+		_, roomy, _, _ := roomyRec.snapshot()
+		_, squeezed, _, _ := squeezedRec.snapshot()
+		return len(roomy) >= 2 && len(squeezed) >= 2
+	})
+
+	stop := make(chan struct{})
+	publishPacedLayers(t, alice, stop, temporalLayerFor)
+	time.Sleep(12 * time.Second)
+	close(stop)
+	time.Sleep(time.Second)
+
+	roomyShare, squeezedShare := layeredShare(roomyRec), layeredShare(squeezedRec)
+	squeezedBase := squeezedRec.layerBytes("video")[0]
+	passed, dropped := link.Stats()
+
+	t.Logf("enhancement layer: %.0f%% of the video on a link with room, "+
+		"%.0f%% through the bottleneck (link passed %d, dropped %d)",
+		100*roomyShare, 100*squeezedShare, passed, dropped)
+
+	if squeezedBase == 0 {
+		t.Fatal("the squeezed subscriber received no base layer at all: the " +
+			"layer that is supposed to survive did not")
+	}
+	if roomyShare == 0 {
+		t.Fatal("no enhancement layer even on the link with room; nothing was " +
+			"shed because nothing was carried")
+	}
+	if squeezedShare >= roomyShare {
+		t.Errorf("the bottleneck took %.0f%% enhancement against %.0f%% on a "+
+			"link with room: the disposable layer was not given up first",
+			100*squeezedShare, 100*roomyShare)
+	}
+}

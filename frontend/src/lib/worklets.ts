@@ -160,10 +160,9 @@ class PCMPlayer extends AudioWorkletProcessor {
     // is a real fault, and silence about it is what let two seconds of delay
     // go unnoticed in the first place.
     this.trimmed = 0;
-    // Chunks that arrived out of order: placed where their timestamp said, or
-    // dropped because the buffer had already played past them.
+    // Chunks that arrived out of order and were placed where their timestamp
+    // said rather than appended.
     this.reordered = 0;
-    this.late = 0;
     // How deep the buffer had got when it was last trimmed. Reported because
     // the depth after a trim is always TRIM_TO by construction and so says
     // nothing: this is the number that measures how far behind the audio was.
@@ -191,7 +190,6 @@ class PCMPlayer extends AudioWorkletProcessor {
       available: this.available,
       underruns: this.underruns,
       reordered: this.reordered,
-      late: this.late,
       trimmed: this.trimmed,
       trimmedFrom: this.trimmedFrom,
       playing: this.playing,
@@ -207,10 +205,6 @@ class PCMPlayer extends AudioWorkletProcessor {
       this.haveClock, this.writeUs, timestampUs,
       this.available, samples.length, sampleRate,
     );
-    if (where.action === 'drop') {
-      this.late++;
-      return;
-    }
     if (where.action === 'place') {
       this.placeSamples(samples, where.behind);
       this.reordered++;
@@ -317,8 +311,6 @@ export interface PlayerReport {
   underruns: number;
   /** Chunks that arrived out of order and were placed by their timestamp. */
   reordered: number;
-  /** Chunks that arrived after the buffer had already played past them. */
-  late: number;
   /** How many times the queue has been trimmed back to bound its latency. */
   trimmed: number;
   /**

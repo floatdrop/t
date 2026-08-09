@@ -38,12 +38,16 @@ describe('placementFor', () => {
       .toEqual({ action: 'place', behind: (behindUs / 1e6) * RATE });
   });
 
-  it('drops a chunk the buffer has already played past', () => {
-    // 200 ms late against 120 ms of queue: the sound it belonged in has been
-    // heard, and writing it would overwrite whatever took its place.
+  it('appends a chunk further behind than the queue is deep', () => {
+    // 200 ms behind against 120 ms of queue. Not a reordered packet — there is
+    // nowhere inside the buffer it belongs — so it goes to the append path,
+    // where the player's resync rule decides what the discontinuity means.
+    // Discarding it here is what an earlier version did, and under congestion
+    // that silenced the audio: with the queue nearly empty, everything looks
+    // further behind than the queue is deep.
     const { writeUs, available } = at(1_000_000, 120);
     expect(placementFor(true, writeUs, writeUs - 200_000, available, CHUNK, RATE))
-      .toEqual({ action: 'drop' });
+      .toEqual({ action: 'append' });
   });
 
   it('appends a chunk that straddles the write cursor', () => {
@@ -77,15 +81,15 @@ describe('placementFor', () => {
     expect(injected(true, writeUs, writeUs - CHUNK_US, available, CHUNK, RATE))
       .toEqual({ action: 'place', behind: CHUNK });
     expect(injected(true, writeUs, writeUs - 200_000, available, CHUNK, RATE))
-      .toEqual({ action: 'drop' });
+      .toEqual({ action: 'append' });
     expect(injected(true, writeUs, writeUs, available, CHUNK, RATE))
       .toEqual({ action: 'append' });
   });
 
-  it('drops rather than places when the buffer has run dry', () => {
-    // Nothing queued: every sample written has been played, so a late chunk
-    // has nowhere to go.
+  it('appends rather than placing when the buffer has run dry', () => {
+    // Nothing queued, which is exactly the state congestion produces. A player
+    // that discarded here would go silent at the moment it has least to spare.
     expect(placementFor(true, 1_000_000, 1_000_000 - CHUNK_US, 0, CHUNK, RATE))
-      .toEqual({ action: 'drop' });
+      .toEqual({ action: 'append' });
   });
 });

@@ -27,9 +27,7 @@ export type Placement =
   /** Append at the write cursor and advance the clock — the ordinary path. */
   | { action: 'append' }
   /** Write it this many samples behind the write cursor, over what is queued. */
-  | { action: 'place'; behind: number }
-  /** Already played. Nothing can be done with it. */
-  | { action: 'drop' };
+  | { action: 'place'; behind: number };
 
 /**
  * Decides where a chunk goes.
@@ -44,6 +42,16 @@ export type Placement =
  * moves whole packets. Anything straddling the cursor is appended, exactly as
  * it was before this existed — the overlap would have to be split between
  * overwriting and appending, for a case that does not arise.
+ *
+ * Nothing is ever discarded here, and an earlier version that discarded what it
+ * judged already played was wrong in the way that matters. A chunk further
+ * behind than the queue is deep is not a late packet, it is a stream that has
+ * jumped — and under congestion, where the queue is nearly empty, *everything*
+ * looks further behind than the queue is deep. Running it against a bottleneck
+ * dropped 121 chunks and placed none, silencing audio the player would
+ * otherwise have resynced to and played. So a chunk that does not fit inside
+ * the queue falls through to the append path, and the resync rule there decides
+ * what it means, exactly as it did before this existed.
  */
 export function placementFor(
   haveClock: boolean,
@@ -57,8 +65,8 @@ export function placementFor(
 
   const behind = Math.round(((writeUs - timestampUs) / 1e6) * rate);
   if (behind < length) return { action: 'append' };
-  // Past the oldest sample still queued: the sound it belonged in has been
-  // heard, and writing it now would overwrite whatever took its place.
-  if (behind > available) return { action: 'drop' };
+  // Further back than anything still queued. Not a reordered packet: a
+  // discontinuity, which the player's own resync rule is what answers.
+  if (behind > available) return { action: 'append' };
   return { action: 'place', behind };
 }

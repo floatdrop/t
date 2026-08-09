@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"tlmst/internal/bridge"
@@ -69,7 +70,40 @@ type App struct {
 	lastKeyFrameAsk time.Time
 	// reattach leaves the room if no frontend comes back. See HandleDisconnect.
 	reattach *time.Timer
+	// videoPump and audioPump carry frames from the bridge's read goroutine to
+	// the relay, so a blocked write never stops the socket being read. Replaced
+	// with the room they belong to; nil when there is none.
+	videoPump *publishPump
+	audioPump *publishPump
 }
+
+// How many frames may wait to be published before the oldest is discarded.
+//
+// These exist because writing to the relay used to happen on the bridge's read
+// goroutine. HandleMedia ran synchronously all the way down to a QUIC stream
+// write, so a write that blocked on flow control — which is what a congested
+// uplink is — stopped the WebSocket being read at all. Audio then waited behind
+// video *at the source*, which is the one place no amount of care downstream
+// can repair: the outbound queues to the WebView were split for exactly this
+// reason and this direction still had the fault they were split to fix.
+//
+// So each kind gets a pump, and the read goroutine only ever hands a frame over
+// and returns. Blocking is replaced by dropping, which is what every other
+// queue on this path does and for the same reason: a frame that cannot be sent
+// now is worth less than the next one.
+//
+// Video is discarded oldest-first like the outbound queue. Audio is 32 kbps
+// against video's 1.5 Mbps and cannot itself be what fills a link, so its queue
+// is here to survive a stall rather than to shed load.
+const (
+	publishVideoDepth = 64
+	publishAudioDepth = 32
+)
+
+// publishDropInterval throttles the warning for a pump that is shedding. A
+// congested uplink drops at the frame rate, and the count is the interesting
+// part rather than each instance.
+const publishDropInterval = 5 * time.Second
 
 // reattachGrace is how long a room outlives the WebView that was driving it.
 //
@@ -173,21 +207,86 @@ func (a *App) HandleControl(ctx context.Context, msg *bridge.ClientMessage) erro
 	}
 }
 
-// HandleMedia publishes one encoded frame captured by the frontend.
+// HandleMedia hands one encoded frame to its publish pump. It never blocks:
+// the caller is the bridge's read goroutine, and stalling it stops every kind
+// being read, not just this one.
 func (a *App) HandleMedia(_ context.Context, f *bridge.MediaFrame) error {
 	a.mu.Lock()
-	room := a.room
+	pump := a.videoPump
+	if f.Kind == bridge.KindAudio {
+		pump = a.audioPump
+	}
 	a.mu.Unlock()
-	if room == nil {
+	if pump == nil {
 		// Frames can trail a Leave by a few milliseconds while the
 		// frontend's encoders wind down. Not an error worth surfacing.
 		return nil
 	}
-	err := room.WriteFrame(f)
-	if errors.Is(err, conf.ErrAwaitingKeyFrame) {
-		a.requestKeyFrame()
+
+	// Copied because the pump outlives this call and the frame's payload
+	// aliases the bridge's read buffer — the Handler contract says so, and a
+	// queue is exactly the case it is warning about.
+	pump.offer(f.Clone())
+	return nil
+}
+
+// publishPump carries frames of one kind from the bridge's read goroutine to
+// the goroutine that writes them to the relay.
+type publishPump struct {
+	frames  chan *bridge.MediaFrame
+	dropped atomic.Uint64
+
+	mu      sync.Mutex
+	lastLog time.Time
+	log     *slog.Logger
+	kind    string
+}
+
+// offer queues a frame, discarding the oldest to make room rather than waiting.
+func (p *publishPump) offer(f *bridge.MediaFrame) {
+	for {
+		select {
+		case p.frames <- f:
+			return
+		default:
+		}
+		select {
+		case <-p.frames:
+			p.note()
+		default:
+		}
 	}
-	return err
+}
+
+// note counts a discard and says so occasionally. Loss here is this client
+// failing to publish what its own camera produced, which no counter on the
+// receive side can distinguish from a quiet participant.
+func (p *publishPump) note() {
+	n := p.dropped.Add(1)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if time.Since(p.lastLog) < publishDropInterval {
+		return
+	}
+	p.lastLog = time.Now()
+	p.log.Warn("dropping frames on the way to the relay; the uplink is behind",
+		"kind", p.kind, "dropped", n)
+}
+
+// runPublishPump writes queued frames until ctx ends.
+func (a *App) runPublishPump(ctx context.Context, room *conf.Room, p *publishPump) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case f := <-p.frames:
+			// The write can block here, which is the whole point: this
+			// goroutine is what absorbs it so the bridge's reader does not.
+			if err := room.WriteFrame(f); errors.Is(err, conf.ErrAwaitingKeyFrame) {
+				a.requestKeyFrame()
+			}
+		}
+	}
 }
 
 // requestKeyFrame asks the frontend's encoder for an immediate keyframe.
@@ -394,16 +493,34 @@ func (a *App) stopMetrics() {
 func (a *App) installRoom(ctx context.Context, room *conf.Room) {
 	metCtx, stopMet := context.WithCancel(ctx)
 
+	// One set of pumps per room, on the same lifetime as the metrics sampler:
+	// a frame queued for a session that has ended is not worth carrying into
+	// the next one, which starts from a keyframe anyway.
+	video := newPublishPump(a.log, "video", publishVideoDepth)
+	audio := newPublishPump(a.log, "audio", publishAudioDepth)
+
 	a.mu.Lock()
 	previous := a.stopMet
 	a.room = room
 	a.stopMet = stopMet
+	a.videoPump = video
+	a.audioPump = audio
 	a.mu.Unlock()
 
 	if previous != nil {
 		previous()
 	}
 	go a.sampleMetrics(metCtx, room)
+	go a.runPublishPump(metCtx, room, video)
+	go a.runPublishPump(metCtx, room, audio)
+}
+
+func newPublishPump(log *slog.Logger, kind string, depth int) *publishPump {
+	return &publishPump{
+		frames: make(chan *bridge.MediaFrame, depth),
+		log:    log,
+		kind:   kind,
+	}
 }
 
 // superviseSession keeps the room joined: it moves when the relay asks and

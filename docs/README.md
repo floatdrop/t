@@ -218,6 +218,15 @@ reader. Underruns are logged too, throttled: they were counted from the
 beginning and never once said out loud, which is why every trim in the logs
 looked unexplained.
 
+The same coupling existed in the *other* direction and was missed the first
+time. Frames from the frontend were written to the relay on the bridge's read
+goroutine, all the way down to a QUIC stream write — so a write blocked on flow
+control, which is what a congested uplink is, stopped the WebSocket being read
+at all, and audio queued behind video at the source where nothing downstream
+could tell. Each kind now has a bounded pump between the reader and the relay:
+the read goroutine hands a frame over and returns, and a pump that cannot keep
+up drops rather than blocks, saying so at WARN.
+
 One suspected source of episodic fill was the bridge itself. Audio and video shared
 one 256-slot outbound queue to the WebView, so a video backlog both delayed
 sound behind it and evicted sound to make room for itself — and the WebView does

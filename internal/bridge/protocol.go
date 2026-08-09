@@ -418,3 +418,17 @@ func (e Endpoint) JSON() []byte {
 	b, _ := json.Marshal(e)
 	return b
 }
+
+// Clone returns a deep copy, so the frame can outlive the read buffer its
+// Config and Payload alias.
+//
+// The Handler contract says those two are only valid for the duration of
+// HandleMedia, and anything that queues a frame is exactly what that warning
+// is about: the buffer belongs to the WebSocket read, and the publisher may
+// still be writing this frame long after the reader has moved on.
+func (f *MediaFrame) Clone() *MediaFrame {
+	out := *f
+	out.Config = append([]byte(nil), f.Config...)
+	out.Payload = append([]byte(nil), f.Payload...)
+	return &out
+}

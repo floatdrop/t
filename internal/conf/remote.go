@@ -694,7 +694,7 @@ func (r *remote) resubscribe() {
 		}
 
 		r.mu.Lock()
-		closed, video, audio := r.closed, r.wantVideo, r.wantAudio
+		closed := r.closed
 		r.mu.Unlock()
 		if closed || !r.missing() {
 			return
@@ -702,9 +702,7 @@ func (r *remote) resubscribe() {
 
 		// Through reconcile under the same lock a catalog would take, so a
 		// retry and an arriving catalog cannot both subscribe the same track.
-		r.applying.Lock()
-		r.reconcile(video, audio)
-		r.applying.Unlock()
+		r.reapply()
 
 		if !r.missing() {
 			r.log.Info("track subscription recovered", "attempt", attempt)
@@ -728,6 +726,30 @@ func (r *remote) displayName() string {
 		return r.nickname
 	}
 	return r.id
+}
+
+// reapply brings the subscriptions back in line with whatever the last catalog
+// asked for.
+//
+// The wants are read *inside* applying, which is the whole point of it existing
+// as a method. Every caller used to read them, then block on applying, then
+// reconcile — and reconcile begins by remembering what it was handed. So a
+// catalog that arrived while a caller was blocked had its configs written back
+// over by the older snapshot the caller was still holding: a publisher that
+// re-encoded from 720p to 360p had the 360p subscription torn down and rebuilt
+// under the 720p config it no longer publishes, and stayed that way until it
+// republished.
+func (r *remote) reapply() {
+	r.applying.Lock()
+	defer r.applying.Unlock()
+
+	r.mu.Lock()
+	video, audio, closed := r.wantVideo, r.wantAudio, r.closed
+	r.mu.Unlock()
+	if closed {
+		return
+	}
+	r.reconcile(video, audio)
 }
 
 // reconcile brings the media subscriptions in line with the wanted
@@ -1096,10 +1118,6 @@ func (r *remote) demote(track *remoteTrack, code string) {
 		r.log.Warn("the relay stopped forwarding audio: we are not keeping up",
 			"handle", track.handle, "code", code, "action", "rebuilding it unchanged")
 
-		r.mu.Lock()
-		video, audio := r.wantVideo, r.wantAudio
-		r.mu.Unlock()
-
 		// Rebuilt here rather than handed to the retry loop. That loop is
 		// guarded by a flag it clears in a defer, after its last check for
 		// anything missing — so a verdict landing in that window found a loop
@@ -1109,9 +1127,7 @@ func (r *remote) demote(track *remoteTrack, code string) {
 		// merely talking never republishes their catalog. That participant went
 		// silent for the rest of the call.
 		r.dropTrack(&r.audio)
-		r.applying.Lock()
-		r.reconcile(video, audio)
-		r.applying.Unlock()
+		r.reapply()
 		return
 	}
 
@@ -1146,7 +1162,6 @@ func (r *remote) demote(track *remoteTrack, code string) {
 		r.recoveryWait = nextRecoveryWait(r.recoveryWait, heldFor, !r.recoveredAt.IsZero())
 		backoff = r.recoveryWait.String()
 	}
-	video, audio := r.wantVideo, r.wantAudio
 	r.mu.Unlock()
 
 	fields := []any{"handle", track.handle, "code", code}
@@ -1171,9 +1186,7 @@ func (r *remote) demote(track *remoteTrack, code string) {
 	if !givingUp {
 		r.dropTrack(&r.video)
 	}
-	r.applying.Lock()
-	r.reconcile(video, audio)
-	r.applying.Unlock()
+	r.reapply()
 
 	if givingUp {
 		// Said out loud. VideoLevel exists so a participant this client gave up
@@ -1255,14 +1268,11 @@ func (r *remote) recover() {
 	// Cleared so the next verdict on the rebuilt subscription is acted on.
 	r.demotedFor = 0
 	r.rebuilds, r.rebuiltSince = 0, time.Time{}
-	video, audio := r.wantVideo, r.wantAudio
 	r.mu.Unlock()
 
 	r.log.Info("the link has been quiet; asking for video again")
 
-	r.applying.Lock()
-	r.reconcile(video, audio)
-	r.applying.Unlock()
+	r.reapply()
 
 	// The roster still says this participant has no video until it is told
 	// otherwise; see the same call on the way down.
@@ -1288,7 +1298,6 @@ func (r *remote) checkLag(counter *telemetry.TrackCounter) {
 		return
 	}
 	r.resyncedAt = time.Now()
-	video, audio := r.wantVideo, r.wantAudio
 	r.mu.Unlock()
 
 	r.log.Warn("this participant has slipped behind the live edge; resubscribing",
@@ -1300,9 +1309,7 @@ func (r *remote) checkLag(counter *telemetry.TrackCounter) {
 	r.dropTrack(&r.video)
 	r.dropTrack(&r.audio)
 
-	r.applying.Lock()
-	r.reconcile(video, audio)
-	r.applying.Unlock()
+	r.reapply()
 }
 
 // scaleTimestamp converts a LOC timestamp to microseconds, which is what

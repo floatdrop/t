@@ -20,6 +20,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 
+	"github.com/floatdrop/moq-go/pkg/moqt/session"
 	"github.com/floatdrop/moq-go/pkg/moqt/session/quicconn"
 	"github.com/floatdrop/moq-go/pkg/relay"
 
@@ -131,6 +132,11 @@ type testRelay struct {
 
 	// mu guards running and addr. Tests stop the relay from a goroutine —
 	// draining is what they are observing — while t.Cleanup may stop it too.
+	// sessionOptions are handed to every session the relay accepts, which is
+	// how a test can stand up a relay that refuses §5.1.3 Range Filters — the
+	// shape a deployed one turned out to have.
+	sessionOptions []session.Option
+
 	mu sync.Mutex
 	// running holds what Stop tears down; nil while stopped.
 	running *relayInstance
@@ -148,7 +154,14 @@ type relayInstance struct {
 // own port and a self-signed certificate, torn down with the test.
 func startRelay(t *testing.T) *testRelay {
 	t.Helper()
-	r := &testRelay{t: t, cert: selfSignedCert(t)}
+	return startRelayWith(t)
+}
+
+// startRelayWith is startRelay with session options, for a relay whose setup
+// parameters are what the test is about.
+func startRelayWith(t *testing.T, opts ...session.Option) *testRelay {
+	t.Helper()
+	r := &testRelay{t: t, cert: selfSignedCert(t), sessionOptions: opts}
 	r.Start()
 	t.Cleanup(r.Stop)
 	return r
@@ -206,8 +219,9 @@ func (r *testRelay) Start() {
 	ctx, cancel := context.WithCancel(context.Background())
 	instance.cancel = cancel
 	instance.server = relay.New(quicconn.NewListener(ql), relay.Config{
-		Logger:        testLogger(r.t).With("component", "relay"),
-		GoawayTimeout: r.goawayGrace,
+		Logger:         testLogger(r.t).With("component", "relay"),
+		GoawayTimeout:  r.goawayGrace,
+		SessionOptions: r.sessionOptions,
 	})
 	go func() {
 		defer close(instance.done)

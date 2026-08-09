@@ -828,8 +828,8 @@ func (r *remote) chooseVideoLayer(
 	case level == videoNone:
 		return VideoTrack, nil, 0
 
-	case level == videoBaseOnly && !wantsSmall &&
-		video != nil && video.TemporalLayers > 1:
+	case level == videoBaseOnly &&
+		shedsALayer(video, wantsSmall, subgroupFiltersPermitted(r.room.sess)):
 		// The cheap step: the same subscription with its top layer declined.
 		//
 		// Only against a publisher that has one to decline. A rung that resolves
@@ -1480,6 +1480,7 @@ func (r *remote) demote(track *remoteTrack, code string) {
 	// inward, so reaching back the other way under this one would close the
 	// cycle — the same ordering chooseVideoLayer keeps.
 	wantsSmall := r.room.wantsLowLayer(r.id)
+	canFilter := subgroupFiltersPermitted(r.room.sess)
 
 	r.mu.Lock()
 	// Only the subscription that is still current, and only once for it. Every
@@ -1492,7 +1493,7 @@ func (r *remote) demote(track *remoteTrack, code string) {
 	}
 	r.demotedFor = track.handle
 	from := r.level
-	r.level = stepDown(r.level, r.wantVideo, wantsSmall)
+	r.level = stepDown(r.level, r.wantVideo, wantsSmall, canFilter)
 	to := r.level
 	// Cut off again soon after climbing back: the link has not recovered, so
 	// wait longer before believing it has. Doubling rather than resetting is
@@ -1521,29 +1522,51 @@ func (r *remote) demote(track *remoteTrack, code string) {
 	r.scheduleRecovery()
 }
 
+// subgroupFiltersPermitted reports whether the peer will accept the §5.1.3
+// Range Filter the base-only rung is expressed as.
+//
+// §10.3.1.6: MAX_FILTER_RANGES is what a peer will accept across all Range
+// Filter parameters of one request, and omitting it means zero — filters
+// prohibited. Sending one anyway is not ignored, it is rejected: the relay
+// answers INVALID_FILTER and the SUBSCRIBE fails outright. Against a relay that
+// does not advertise the option, the first congestion event therefore took the
+// rung, lost the subscription, exhausted the retry loop and gave up on the
+// participant's video for the rest of the call — worse than the demotion it was
+// meant to be an improvement on. Measured against a deployed relay; every
+// in-process test passed, because the test relay permits them.
+func subgroupFiltersPermitted(sess *session.Session) bool {
+	for _, kv := range sess.PeerOptions() {
+		if kv.Type == uint64(message.SetupOptionMaxFilterRanges) {
+			return kv.IntVal >= 1
+		}
+	}
+	return false
+}
+
 // shedsALayer reports whether the base-only rung would actually take anything
 // off the wire for this publisher.
 //
-// It only does against one that publishes a layer to decline, and only while
-// the frontend is asking for the primary encoding — a tile already on the small
-// one has taken a bigger step than this rung offers. Everywhere else it resolves
-// to exactly what the rung below it resolves to.
+// It only does against one that publishes a layer to decline, only while the
+// frontend is asking for the primary encoding — a tile already on the small one
+// has taken a bigger step than this rung offers — and only where the peer
+// accepts the filter that expresses it. Everywhere else it resolves to exactly
+// what the rung below it resolves to.
 //
 // The ladder skips it there rather than resolving it away, which is a real
 // distinction: a rung that changes nothing still costs a step, so the next
 // verdict arrives with the link no lighter and one fewer step left to take. That
 // is how this was got wrong on the first attempt.
-func shedsALayer(video *bridge.TrackConfig, wantsSmall bool) bool {
-	return !wantsSmall && video != nil && video.TemporalLayers > 1
+func shedsALayer(video *bridge.TrackConfig, wantsSmall, canFilter bool) bool {
+	return canFilter && !wantsSmall && video != nil && video.TemporalLayers > 1
 }
 
 // stepDown is the next rung below cur, skipping base-only where it is not one.
-func stepDown(cur videoLevel, video *bridge.TrackConfig, wantsSmall bool) videoLevel {
+func stepDown(cur videoLevel, video *bridge.TrackConfig, wantsSmall, canFilter bool) videoLevel {
 	if cur >= videoNone {
 		return videoNone
 	}
 	next := cur + 1
-	if next == videoBaseOnly && !shedsALayer(video, wantsSmall) {
+	if next == videoBaseOnly && !shedsALayer(video, wantsSmall, canFilter) {
 		next = videoSmall
 	}
 	return next
@@ -1551,12 +1574,12 @@ func stepDown(cur videoLevel, video *bridge.TrackConfig, wantsSmall bool) videoL
 
 // stepUp is the next rung above cur, skipping base-only on the way back for the
 // same reason stepDown skips it on the way down.
-func stepUp(cur videoLevel, video *bridge.TrackConfig, wantsSmall bool) videoLevel {
+func stepUp(cur videoLevel, video *bridge.TrackConfig, wantsSmall, canFilter bool) videoLevel {
 	if cur <= videoFull {
 		return videoFull
 	}
 	next := cur - 1
-	if next == videoBaseOnly && !shedsALayer(video, wantsSmall) {
+	if next == videoBaseOnly && !shedsALayer(video, wantsSmall, canFilter) {
 		next = videoFull
 	}
 	return next
@@ -1593,6 +1616,7 @@ func (r *remote) recover() {
 	}
 
 	wantsSmall := r.room.wantsLowLayer(r.id)
+	canFilter := subgroupFiltersPermitted(r.room.sess)
 
 	r.mu.Lock()
 	if r.closed || r.level == videoFull {
@@ -1600,7 +1624,7 @@ func (r *remote) recover() {
 		return
 	}
 	from := r.level
-	r.level = stepUp(r.level, r.wantVideo, wantsSmall)
+	r.level = stepUp(r.level, r.wantVideo, wantsSmall, canFilter)
 	to := r.level
 	r.recoveredAt = time.Now()
 	// Cleared so the next verdict on the rebuilt subscription is acted on.

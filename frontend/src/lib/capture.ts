@@ -81,6 +81,16 @@ function temporalLayerOf(meta?: EncodedVideoChunkMetadata): number {
 }
 
 /**
+ * How many chunks to watch before saying whether the encoder is really
+ * producing temporal layers.
+ *
+ * One GOP at the keyframe interval, which is every layer's cadence several
+ * times over: L1T2 alternates, so a single missing layer id shows up within two
+ * frames and this is well past needing the benefit of the doubt.
+ */
+const SVC_SAMPLE_CHUNKS = 30;
+
+/**
  * Most frames a second this will publish, whatever the camera offers.
  *
  * A ceiling rather than a target: a camera that can only manage 24 is left at
@@ -574,6 +584,10 @@ export class Capture {
   #audioBytes = 0;
   #keyFrames = 0;
   #dropped = 0;
+  /** Chunks watched, chunks that carried an svc layer id, and the split. */
+  #svcSampled = 0;
+  #svcReported = 0;
+  #svcLayers: Record<number, number> = {};
   #lastSample = 0;
   #stats: CaptureStats = {
     videoFps: 0, videoKbps: 0, encodeQueue: 0,
@@ -873,6 +887,11 @@ export class Capture {
       avc: { format: 'annexb' },
     });
     this.#videoEncoder = encoder;
+    // A fresh encoder is a fresh answer: scalabilityMode is configured here,
+    // and whether this one honours it is not something the last one settled.
+    this.#svcSampled = 0;
+    this.#svcReported = 0;
+    this.#svcLayers = {};
 
     // Reported after the call, not before it: this line used to be written
     // first and so claimed a configuration that had not happened yet, which is
@@ -1365,6 +1384,9 @@ export class Capture {
     this.#videoFrames++;
     this.#videoBytes += payload.byteLength;
 
+    const layer = temporalLayerOf(meta);
+    this.#sampleSVC(meta, layer);
+
     if (!bridge.sendFrame({
       kind: KIND_VIDEO,
       handle: HANDLE_LOCAL_VIDEO,
@@ -1372,10 +1394,57 @@ export class Capture {
       keyFrame: isKey,
       config,
       payload,
-      temporalLayer: temporalLayerOf(meta),
+      temporalLayer: layer,
     })) {
       this.#dropped++;
     }
+  }
+
+  /**
+   * Says once per encoder whether `scalabilityMode` was actually honoured.
+   *
+   * WebCodecs accepts the configuration either way and reports nothing back, so
+   * an encoder that ignores it is indistinguishable from one that obeys it
+   * until you look at what comes out. The difference matters well beyond the
+   * frame rate: the backend puts each layer in its own subgroup, and the
+   * enhancement subgroup is what a relay sheds under pressure and what carries
+   * the §8 disposable timeout. A flat stream publishes one subgroup, so there
+   * is nothing to shed and a link that cannot keep up loses the picture rather
+   * than half the frame rate — silently, and looking exactly like a working
+   * call until the link gets tight.
+   *
+   * Reported at WARN when it is flat, because that is a real degradation of
+   * what the call can survive, and at INFO with the split when it is not.
+   */
+  #sampleSVC(meta: EncodedVideoChunkMetadata | undefined, layer: number): void {
+    if (this.#svcSampled >= SVC_SAMPLE_CHUNKS) return;
+    const svc = (meta as { svc?: { temporalLayerId?: number } } | undefined)?.svc;
+    if (typeof svc?.temporalLayerId === 'number') this.#svcReported++;
+    this.#svcLayers[layer] = (this.#svcLayers[layer] ?? 0) + 1;
+
+    if (++this.#svcSampled < SVC_SAMPLE_CHUNKS) return;
+
+    const layers = Object.keys(this.#svcLayers).length;
+    const split = Object.entries(this.#svcLayers)
+      .map(([id, n]) => `${id}:${n}`)
+      .join(' ');
+    if (layers > 1) {
+      bridge.report('INFO', 'temporal layers are being produced', {
+        mode: VIDEO_SCALABILITY_MODE,
+        layers: String(layers),
+        chunksPerLayer: split,
+      });
+      return;
+    }
+    bridge.report('WARN', 'the encoder ignored scalabilityMode; publishing flat video', {
+      mode: VIDEO_SCALABILITY_MODE,
+      // Told apart because they are different faults: no svc field at all is an
+      // encoder without the extension, while a field that only ever says 0 is
+      // one that has it and is not layering.
+      reportedLayerId: this.#svcReported > 0 ? 'yes' : 'no',
+      sampled: String(this.#svcSampled),
+      consequence: 'a relay has no enhancement layer to shed under pressure',
+    });
   }
 
   async #startAudio(settings: AudioSettings): Promise<void> {

@@ -61,13 +61,16 @@ const (
 type videoLevel int
 
 const (
-	videoFull  videoLevel = iota // the primary encoding
-	videoSmall                   // the publisher's smaller encoding
-	videoNone                    // audio only
+	videoFull     videoLevel = iota // the primary encoding, every layer of it
+	videoBaseOnly                   // the primary encoding without its top temporal layer
+	videoSmall                      // the publisher's smaller encoding
+	videoNone                       // audio only
 )
 
 func (l videoLevel) String() string {
 	switch l {
+	case videoBaseOnly:
+		return "base-only"
 	case videoSmall:
 		return "small"
 	case videoNone:
@@ -243,8 +246,14 @@ type remoteTrack struct {
 	// name is the track subscribed, which for video says which encoding this
 	// is. Two layers can carry identical configs — same codec, same
 	// framerate — so the config alone cannot tell them apart.
-	name   string
+	name string
+	// config is what the publisher declared. layers is how many subgroups of it
+	// this subscription actually asked for, which is the smaller number
+	// whenever a §5.1.3 filter declined the top of the stack — and the one
+	// reassembly must expect, since a subgroup this client declined is one no
+	// group of it should ever wait for.
 	config bridge.TrackConfig
+	layers uint8
 	sub    *session.Subscription
 	// fetch is the joining FETCH that backfilled the group in progress when
 	// this track was subscribed. Nil on audio, and on video whose backfill was
@@ -276,10 +285,12 @@ type remoteTrack struct {
 // first stream to arrive for that group, and registers subgroup as a stream
 // that may still deliver objects.
 //
-// Every group is told how many subgroups to expect from the publisher's own
-// declaration, which is the only thing that knows before the first frame does.
-// A track declaring nothing expects nothing, which is the behaviour it had
-// before layers and the right one for a publisher too old to say.
+// Every group is told how many subgroups to expect: what the publisher declared,
+// less anything this subscription declined, since the declaration is the only
+// thing that knows before the first frame does and the filter is the only thing
+// that knows what was asked for. A track carrying one subgroup expects one,
+// which is the behaviour it had before layers and the right one for a publisher
+// too old to say.
 func (t *remoteTrack) reassemblerFor(group, subgroup uint64) *groupReassembler {
 	t.groupsMu.Lock()
 	defer t.groupsMu.Unlock()
@@ -288,7 +299,7 @@ func (t *remoteTrack) reassemblerFor(group, subgroup uint64) *groupReassembler {
 	}
 	g, ok := t.groups[group]
 	if !ok {
-		g = newGroupReassembler(int(t.config.TemporalLayers))
+		g = newGroupReassembler(int(t.layers))
 		t.groups[group] = g
 		t.retireSupersededLocked(group)
 	}
@@ -686,7 +697,7 @@ func (r *remote) missing() bool {
 	// failed, so the retry loop spent all five attempts chasing a track this
 	// client had decided not to take, and then told the user the participant
 	// could not be reached while their audio was working.
-	_, wantedVideo := r.chooseVideoLayer(video, videoLow)
+	_, wantedVideo, _ := r.chooseVideoLayer(video, videoLow)
 	return (wantedVideo != nil && !haveVideo) || (audio != nil && !haveAudio)
 }
 
@@ -768,9 +779,9 @@ func (r *remote) displayName() string {
 // configs. A nil config means the track should not be subscribed.
 func (r *remote) reconcile(video, videoLow, audio *bridge.TrackConfig) {
 	r.remember(video, videoLow, audio)
-	name, wanted := r.chooseVideoLayer(video, videoLow)
-	r.syncTrack(&r.video, name, bridge.KindVideo, wanted)
-	r.syncTrack(&r.audio, AudioTrack, bridge.KindAudio, audio)
+	name, wanted, layers := r.chooseVideoLayer(video, videoLow)
+	r.syncTrack(&r.video, name, bridge.KindVideo, wanted, layers)
+	r.syncTrack(&r.audio, AudioTrack, bridge.KindAudio, audio, 0)
 }
 
 // chooseVideoLayer picks which of a publisher's video encodings to take.
@@ -784,12 +795,19 @@ func (r *remote) reconcile(video, videoLow, audio *bridge.TrackConfig) {
 // offers one video track and no low layer, and a publisher whose primary
 // encoder died may offer only the small one; in both cases taking what exists
 // beats taking nothing, because nothing is a permanently blank tile.
-func (r *remote) chooseVideoLayer(video, videoLow *bridge.TrackConfig) (string, *bridge.TrackConfig) {
+// The third return is how many temporal layers to ask for, zero meaning all of
+// them. It is what makes the base-only rung a filter on the subscription this
+// client already holds rather than a different track: same encoding, same
+// decoder, same handle, no keyframe to wait for — the whole reason a temporal
+// layer is a cheaper step than a smaller picture.
+func (r *remote) chooseVideoLayer(
+	video, videoLow *bridge.TrackConfig,
+) (string, *bridge.TrackConfig, uint8) {
 	// Both room lookups first, and neither under this remote's lock:
 	// publishParticipants holds the room's and calls inward, so reaching back
 	// the other way would close the cycle.
 	if !r.room.wantsVideo(r.id) {
-		return VideoTrack, nil
+		return VideoTrack, nil, 0
 	}
 	wantsSmall := r.room.wantsLowLayer(r.id)
 
@@ -802,28 +820,41 @@ func (r *remote) chooseVideoLayer(video, videoLow *bridge.TrackConfig) (string, 
 	// because the link happens to be quiet.
 	switch {
 	case level == videoNone:
-		return VideoTrack, nil
+		return VideoTrack, nil, 0
 
-	case level == videoSmall:
+	case level == videoBaseOnly && !wantsSmall &&
+		video != nil && video.TemporalLayers > 1:
+		// The cheap step: the same subscription with its top layer declined.
+		//
+		// Only against a publisher that has one to decline. A rung that resolves
+		// to exactly what the rung above it resolves to is not a step down, and
+		// taking it as one is how this was got wrong before — the ladder spent a
+		// rung, shed nothing, and arrived at the next verdict no lighter than it
+		// started. Where there is no layer to drop, this falls through and
+		// behaves as the smaller encoding, which is what the ladder did before
+		// the rung existed.
+		return VideoTrack, video, 1
+
+	case level >= videoSmall || level == videoBaseOnly:
 		// Demoted by the relay. If this publisher offers nothing smaller then
 		// there is no smaller thing to ask for, and re-asking for the full
 		// picture would be offering back the load that was just refused — so
 		// the only step down left is off.
 		if videoLow != nil {
-			return VideoLowTrack, videoLow
+			return VideoLowTrack, videoLow, 0
 		}
-		return VideoTrack, nil
+		return VideoTrack, nil, 0
 
 	case wantsSmall && videoLow != nil:
-		return VideoLowTrack, videoLow
+		return VideoLowTrack, videoLow, 0
 
 	case video != nil:
-		return VideoTrack, video
+		return VideoTrack, video, 0
 
 	case videoLow != nil:
-		return VideoLowTrack, videoLow
+		return VideoLowTrack, videoLow, 0
 	}
-	return VideoTrack, nil
+	return VideoTrack, nil, 0
 }
 
 // applyInterest re-runs reconcile against the catalog this remote last
@@ -844,7 +875,9 @@ func (r *remote) applyInterest() {
 
 // syncTrack subscribes, unsubscribes, or resubscribes one track so its
 // live state matches want. slot points at r.video or r.audio.
-func (r *remote) syncTrack(slot **remoteTrack, name string, kind uint8, want *bridge.TrackConfig) {
+func (r *remote) syncTrack(
+	slot **remoteTrack, name string, kind uint8, want *bridge.TrackConfig, layers uint8,
+) {
 	r.mu.Lock()
 	current := *slot
 	closed := r.closed
@@ -858,8 +891,13 @@ func (r *remote) syncTrack(slot **remoteTrack, name string, kind uint8, want *br
 		r.dropTrack(slot)
 		return
 
-	case current != nil && current.name == name && current.config == *want:
-		// Already subscribed to this exact track with this config.
+	case current != nil && current.name == name && current.config == *want &&
+		current.layers == effectiveLayers(want, layers):
+		// Already subscribed to this exact track with this config, and asking
+		// for the same layers of it. The layer count belongs in that comparison
+		// because the base-only rung changes neither the name nor the config —
+		// without it, stepping onto or off that rung would decide nothing had
+		// changed and leave the subscription exactly as it was.
 		return
 
 	case current != nil:
@@ -870,6 +908,10 @@ func (r *remote) syncTrack(slot **remoteTrack, name string, kind uint8, want *br
 			r.log.Info("track re-encoded, resubscribing", "track", name,
 				"from", fmt.Sprintf("%dx%d", current.config.Width, current.config.Height),
 				"to", fmt.Sprintf("%dx%d", want.Width, want.Height))
+		} else if current.name == name {
+			r.log.Info("temporal layers changed, resubscribing",
+				"track", name, "from", current.layers,
+				"to", effectiveLayers(want, layers))
 		} else {
 			r.log.Info("layer changed, resubscribing",
 				"from", current.name, "to", name)
@@ -880,13 +922,27 @@ func (r *remote) syncTrack(slot **remoteTrack, name string, kind uint8, want *br
 	if closed {
 		return
 	}
-	if err := r.subscribeTrack(slot, name, kind, want); err != nil {
+	if err := r.subscribeTrack(slot, name, kind, want, layers); err != nil {
 		r.log.Warn("track subscribe failed", "track", name, "err", err)
 		r.scheduleResubscribe()
 	}
 }
 
-func (r *remote) subscribeTrack(slot **remoteTrack, name string, kind uint8, cfg *bridge.TrackConfig) error {
+// effectiveLayers resolves how many subgroups a subscription will actually
+// carry: what was asked for, bounded by what the publisher says it has. Zero
+// asked for means all of them, and a publisher that declares nothing gets the
+// single subgroup every track had before layers existed.
+func effectiveLayers(cfg *bridge.TrackConfig, want uint8) uint8 {
+	declared := max(cfg.TemporalLayers, 1)
+	if want == 0 || want > declared {
+		return declared
+	}
+	return want
+}
+
+func (r *remote) subscribeTrack(
+	slot **remoteTrack, name string, kind uint8, cfg *bridge.TrackConfig, layers uint8,
+) error {
 	priority := uint8(videoPriority)
 	if kind == bridge.KindAudio {
 		priority = audioPriority
@@ -898,6 +954,18 @@ func (r *remote) subscribeTrack(slot **remoteTrack, name string, kind uint8, cfg
 			message.LargestObjectFilter(),
 			message.SubscriberPriorityParam(priority),
 		},
+	}
+	// Declining the layers above this one, by the §5.1.3 Range Filter that
+	// names the subgroups worth sending. Asked of the relay rather than dropped
+	// on arrival, because a frame discarded here has already been paid for on
+	// the wire, and the wire is what ran out.
+	subscribed := effectiveLayers(cfg, layers)
+	if declared := max(cfg.TemporalLayers, 1); subscribed < declared {
+		subMsg.Parameters = append(subMsg.Parameters,
+			message.RangeFilterParam(&message.RangeFilter{
+				Type:   message.ParamSubgroupFilter,
+				Ranges: []message.Range{{Start: 0, End: uint64(subscribed - 1)}},
+			}))
 	}
 	sub, err := r.room.sess.Subscribe(r.ctx, subMsg)
 	if err != nil {
@@ -911,6 +979,7 @@ func (r *remote) subscribeTrack(slot **remoteTrack, name string, kind uint8, cfg
 		kind:       kind,
 		name:       name,
 		config:     *cfg,
+		layers:     subscribed,
 		sub:        sub,
 		label:      label,
 		backfilled: make(chan struct{}),
@@ -1059,7 +1128,7 @@ func (r *remote) readMediaFetch(
 	//
 	// Only when there is something to order. An unlayered track streams out as
 	// it arrives, exactly as it did before.
-	layered := track.config.TemporalLayers > 1
+	layered := track.layers > 1
 	var pending []bridge.MediaFrame
 	defer func() {
 		slices.SortStableFunc(pending, func(a, b bridge.MediaFrame) int {
@@ -1339,6 +1408,11 @@ func (r *remote) demote(track *remoteTrack, code string) {
 		return
 	}
 
+	// Read before the lock: publishParticipants holds the room's and calls
+	// inward, so reaching back the other way under this one would close the
+	// cycle — the same ordering chooseVideoLayer keeps.
+	wantsSmall := r.room.wantsLowLayer(r.id)
+
 	r.mu.Lock()
 	// Only the subscription that is still current, and only once for it. Every
 	// open group of a dead subscription is reset separately, so this arrives
@@ -1350,9 +1424,7 @@ func (r *remote) demote(track *remoteTrack, code string) {
 	}
 	r.demotedFor = track.handle
 	from := r.level
-	if r.level < videoNone {
-		r.level++
-	}
+	r.level = stepDown(r.level, r.wantVideo, wantsSmall)
 	to := r.level
 	// Cut off again soon after climbing back: the link has not recovered, so
 	// wait longer before believing it has. Doubling rather than resetting is
@@ -1379,6 +1451,47 @@ func (r *remote) demote(track *remoteTrack, code string) {
 	r.applying.Unlock()
 
 	r.scheduleRecovery()
+}
+
+// shedsALayer reports whether the base-only rung would actually take anything
+// off the wire for this publisher.
+//
+// It only does against one that publishes a layer to decline, and only while
+// the frontend is asking for the primary encoding — a tile already on the small
+// one has taken a bigger step than this rung offers. Everywhere else it resolves
+// to exactly what the rung below it resolves to.
+//
+// The ladder skips it there rather than resolving it away, which is a real
+// distinction: a rung that changes nothing still costs a step, so the next
+// verdict arrives with the link no lighter and one fewer step left to take. That
+// is how this was got wrong on the first attempt.
+func shedsALayer(video *bridge.TrackConfig, wantsSmall bool) bool {
+	return !wantsSmall && video != nil && video.TemporalLayers > 1
+}
+
+// stepDown is the next rung below cur, skipping base-only where it is not one.
+func stepDown(cur videoLevel, video *bridge.TrackConfig, wantsSmall bool) videoLevel {
+	if cur >= videoNone {
+		return videoNone
+	}
+	next := cur + 1
+	if next == videoBaseOnly && !shedsALayer(video, wantsSmall) {
+		next = videoSmall
+	}
+	return next
+}
+
+// stepUp is the next rung above cur, skipping base-only on the way back for the
+// same reason stepDown skips it on the way down.
+func stepUp(cur videoLevel, video *bridge.TrackConfig, wantsSmall bool) videoLevel {
+	if cur <= videoFull {
+		return videoFull
+	}
+	next := cur - 1
+	if next == videoBaseOnly && !shedsALayer(video, wantsSmall) {
+		next = videoFull
+	}
+	return next
 }
 
 // scheduleRecovery tries one step back up once the link has been quiet for
@@ -1411,13 +1524,15 @@ func (r *remote) recover() {
 		return
 	}
 
+	wantsSmall := r.room.wantsLowLayer(r.id)
+
 	r.mu.Lock()
 	if r.closed || r.level == videoFull {
 		r.mu.Unlock()
 		return
 	}
 	from := r.level
-	r.level--
+	r.level = stepUp(r.level, r.wantVideo, wantsSmall)
 	to := r.level
 	r.recoveredAt = time.Now()
 	// Cleared so the next verdict on the rebuilt subscription is acted on.

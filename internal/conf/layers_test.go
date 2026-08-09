@@ -1,10 +1,12 @@
 package conf
 
 import (
+	"log/slog"
 	"testing"
 	"time"
 
 	"tlmst/internal/bridge"
+	"tlmst/internal/telemetry"
 )
 
 // A publisher that actually emits temporal layers.
@@ -406,5 +408,66 @@ func TestABottleneckCostsTheEnhancementLayerFirst(t *testing.T) {
 		t.Errorf("the bottleneck took %.0f%% enhancement against %.0f%% on a "+
 			"link with room: the disposable layer was not given up first",
 			100*squeezedShare, 100*roomyShare)
+	}
+}
+
+// The step the whole layered layout was for. When the relay gives up on a
+// subscription, the ladder's first answer should be to decline the top temporal
+// layer rather than to change encoding: same track, same decoder, same picture
+// at half the frame rate, and no keyframe to wait for. Only the frames stop —
+// nothing is torn down.
+func TestTheFirstStepDownIsALayerNotAnEncoding(t *testing.T) {
+	relayServer := startRelay(t)
+	addr := relayServer.Addr()
+
+	// Declares both encodings, and says the primary carries two layers — so
+	// the ladder has both a rung to skip to and a layer to shed first.
+	alice, _ := joinRoom(t, addr, "rung", "alice")
+	for _, cfg := range []*bridge.TrackConfig{
+		{Kind: "video", Codec: "avc1.42e01f", Width: 1280, Height: 720, TemporalLayers: 2},
+		{Kind: KindVideoLow, Codec: "avc1.42e01f", Width: 640, Height: 360},
+		{Kind: "audio", Codec: "opus", SampleRate: 48000, Channels: 1},
+	} {
+		if err := alice.DeclareTrack(cfg); err != nil {
+			t.Fatalf("declare %s: %v", cfg.Kind, err)
+		}
+	}
+
+	link := startShaper(t, addr, 32_000, 64)
+	spy := newLogSpy(t)
+	_, bobRec := joinRoomWithCounters(
+		t, link.Addr(), "rung", "bob", telemetry.NewRegistry(), slog.New(spy))
+
+	waitFor(t, "bob to take the full picture", 15*time.Second, func() bool {
+		v, ok := bobRec.trackFor("video")
+		return ok && v.Config.Width == 1280
+	})
+
+	stop := make(chan struct{})
+	publishPacedLayers(t, alice, stop, temporalLayerFor)
+	defer close(stop)
+
+	waitFor(t, "the relay to give up on the full picture", 30*time.Second, func() bool {
+		return spy.sawAttr("msg",
+			"the relay stopped forwarding a track: we are not keeping up")
+	})
+	waitFor(t, "the ladder to step down to the base layer", 15*time.Second, func() bool {
+		return spy.sawAttr("to", "base-only")
+	})
+
+	// The encoding is unchanged: this rung is a filter on the subscription, not
+	// a different picture.
+	v, ok := bobRec.trackFor("video")
+	if !ok {
+		t.Fatal("no video subscription after the demotion")
+	}
+	if v.Config.Width != 1280 {
+		t.Errorf("the first step down changed encoding to %dx%d; the point of "+
+			"the layer rung is that the picture stays the same size",
+			v.Config.Width, v.Config.Height)
+	}
+	if spy.sawAttr("to", "small") {
+		t.Error("the ladder went straight to the smaller encoding, skipping " +
+			"the cheaper step it now has")
 	}
 }

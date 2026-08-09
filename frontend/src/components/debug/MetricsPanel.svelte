@@ -129,7 +129,8 @@
         <tr><th scope="row">Objects out</th><td>{(current?.objectsOutPerSec ?? 0).toFixed(1)}</td><td>obj/s</td></tr>
         <tr><th scope="row">Objects in</th><td>{(current?.objectsInPerSec ?? 0).toFixed(1)}</td><td>obj/s</td></tr>
         <tr><th scope="row">Groups out</th><td>{(current?.groupsOutPerSec ?? 0).toFixed(2)}</td><td>grp/s</td></tr>
-        <tr><th scope="row">Frames dropped by the bridge</th><td>{current?.bridgeDropped ?? 0}</td><td>count</td></tr>
+        <tr><th scope="row">Video dropped by the bridge</th><td>{current?.bridgeDroppedVideo ?? 0}</td><td>count</td></tr>
+        <tr><th scope="row">Audio dropped by the bridge</th><td>{current?.bridgeDroppedAudio ?? 0}</td><td>count</td></tr>
       </tbody>
     </table>
   {/if}

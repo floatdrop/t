@@ -279,8 +279,13 @@ export interface Metrics {
   objectsInPerSec: number;
   groupsOutPerSec: number;
 
-  /** Frames the bridge dropped on the way here, cumulative for the connection. */
-  bridgeDropped: number;
+  /**
+   * Frames the bridge dropped on the way here, cumulative for the connection
+   * and split by medium — the two have separate queues on the backend, so a
+   * backlog in one says nothing about the other.
+   */
+  bridgeDroppedVideo: number;
+  bridgeDroppedAudio: number;
 
   tracks?: TrackMetrics[];
 }

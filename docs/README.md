@@ -200,6 +200,17 @@ ceiling instead of re-slicing the same total. Two runs on an uncontrolled path,
 so the size of that is not worth trusting — the direction held for both
 participants.
 
+One source of that episodic fill was the bridge itself. Audio and video shared
+one 256-slot outbound queue to the WebView, so a video backlog both delayed
+sound behind it and evicted sound to make room for itself — and the WebView does
+stop reading, for as long as macOS is resizing its window. Whatever the frontend
+had missed then arrived in a burst the moment it caught up, which is exactly
+what the player trims. They have separate queues now, sized per medium, and
+audio is written ahead of video: 32 kbps against video's 1.5 Mbps cannot starve
+anything, and a conference survives a dropped frame far better than a gap in the
+sound. How much of the measured trimming this accounts for is not established —
+the runs above predate the split.
+
 That buffer filling is a symptom worth chasing rather than absorbing, so a trim
 is logged at WARN. The one that prompted the bound turned out to be two capture
 pipelines running at once: `open` and `start` both decide what to do by

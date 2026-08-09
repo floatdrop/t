@@ -22,15 +22,35 @@ import (
 // runaway frontend can make the backend buffer.
 const maxFrameBytes = 4 << 20
 
-// sendQueueDepth bounds the per-connection outbound media queue. Media is
-// live: when the queue is full the oldest frames are worthless, so enqueuing
-// discards them rather than blocking the MOQ read path (see Server.SendMedia).
+// videoQueueDepth and audioQueueDepth bound the per-connection outbound media
+// queues. Media is live: when a queue is full the oldest frames are worthless,
+// so enqueuing discards them rather than blocking the MOQ read path (see
+// Server.SendMedia).
 //
-// Deep enough to hold more than one keyframe interval at 30 fps, which is what
-// makes discarding the oldest safe: the frames kept always contain a recent
-// keyframe, so a subscriber that fell behind can resume from the queue instead
-// of waiting for the publisher's next scheduled one.
-const sendQueueDepth = 256
+// One queue per medium, because they were sharing 256 slots and a shared queue
+// is a coupling: video is 1.5 Mbps against audio's 32 kbps, so a video backlog
+// both delayed audio behind it and evicted audio to make room for itself. Every
+// time the WebView stopped reading — macOS resizing its window, a busy main
+// thread — the sound came back as a burst, which the player then trimmed to
+// bound its latency, and each trim is an audible chop. The player's own notes
+// record the symptom without naming the cause: the queue was filling
+// episodically rather than drifting.
+//
+// Video is deep enough to hold more than one keyframe interval at 30 fps, which
+// is what makes discarding the oldest safe: the frames kept always contain a
+// recent keyframe, so a frontend that fell behind resumes from the queue
+// instead of waiting for the publisher's next scheduled one.
+//
+// Audio is sized in time rather than in keyframes, every Opus packet standing
+// on its own: about two thirds of a second at the 20 ms cadence. It does not
+// need to be deeper, because the player's ring buffer is what bounds audio
+// latency downstream and trims anything past a quarter of a second — queueing
+// more here would only move the discard, and hand the player a burst it would
+// have to chop anyway.
+const (
+	videoQueueDepth = 64
+	audioQueueDepth = 32
+)
 
 // controlQueueDepth bounds the outbound control queue, which is separate
 // because control messages are not interchangeable the way frames are. A
@@ -81,14 +101,18 @@ type Server struct {
 
 type conn struct {
 	ws *websocket.Conn
-	// Two queues, because the two kinds fail differently: a frame that cannot
-	// be sent should be abandoned, and a control message never should.
-	media   chan outbound
+	// Three queues. Control is separate from media because the two fail
+	// differently: a frame that cannot be sent should be abandoned, and a
+	// control message never should. Video is separate from audio so that
+	// neither medium's backlog can delay or evict the other.
+	video   chan outbound
+	audio   chan outbound
 	control chan outbound
 	ctx     context.Context
 	cancel  context.CancelFunc
 
-	dropped atomic.Uint64
+	droppedVideo atomic.Uint64
+	droppedAudio atomic.Uint64
 }
 
 // outbound is one queued frame plus the WebSocket opcode to send it
@@ -165,7 +189,8 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithCancel(r.Context())
 	c := &conn{
 		ws:      ws,
-		media:   make(chan outbound, sendQueueDepth),
+		video:   make(chan outbound, videoQueueDepth),
+		audio:   make(chan outbound, audioQueueDepth),
 		control: make(chan outbound, controlQueueDepth),
 		ctx:     ctx,
 		cancel:  cancel,
@@ -191,7 +216,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	_ = ws.CloseNow()
 	s.handler.HandleDisconnect()
-	s.log.Info("bridge: frontend disconnected", "droppedFrames", c.dropped.Load())
+	s.log.Info("bridge: frontend disconnected",
+		"droppedVideo", c.droppedVideo.Load(),
+		"droppedAudio", c.droppedAudio.Load())
 }
 
 func (s *Server) readLoop(ctx context.Context, c *conn) {
@@ -243,20 +270,14 @@ func (c *conn) writeLoop(log *slog.Logger) {
 	}
 
 	for {
-		// Control first, and drained before any frame is considered. A state
-		// change is what tells the frontend how to interpret the frames around
-		// it, so it should not wait behind a queue of them.
-		select {
-		case <-c.ctx.Done():
-			return
-		case msg := <-c.control:
+		if msg, ok := c.nextReady(); ok {
 			if !write(msg) {
 				return
 			}
 			continue
-		default:
 		}
-
+		// Nothing queued: block until something is, on any of the three. The
+		// order does not matter here, because only one can be ready.
 		select {
 		case <-c.ctx.Done():
 			return
@@ -264,12 +285,46 @@ func (c *conn) writeLoop(log *slog.Logger) {
 			if !write(msg) {
 				return
 			}
-		case msg := <-c.media:
+		case msg := <-c.audio:
+			if !write(msg) {
+				return
+			}
+		case msg := <-c.video:
 			if !write(msg) {
 				return
 			}
 		}
 	}
+}
+
+// nextReady takes the highest-priority message already queued, reporting false
+// when all three queues are empty.
+//
+// Control first: a state change is what tells the frontend how to interpret the
+// frames around it, so it should not wait behind a queue of them.
+//
+// Then audio ahead of video. Separate queues stop a video backlog evicting
+// sound; this is what stops it delaying sound, which a queue of stale frames
+// ahead of it in one write loop would still do. It cannot starve video however
+// busy the call gets: audio is 32 kbps against video's 1.5 Mbps, so there is
+// never more than a packet every 20 ms of it to prefer.
+func (c *conn) nextReady() (outbound, bool) {
+	select {
+	case msg := <-c.control:
+		return msg, true
+	default:
+	}
+	select {
+	case msg := <-c.audio:
+		return msg, true
+	default:
+	}
+	select {
+	case msg := <-c.video:
+		return msg, true
+	default:
+	}
+	return outbound{}, false
 }
 
 // SendControl queues a JSON control message. It never blocks.
@@ -302,11 +357,24 @@ func (s *Server) SendError(detail string) {
 // after the resize had finished.
 //
 // Keeping the newest instead means the queue always holds the live edge, and
-// at this depth that edge spans more than one keyframe interval — so there is
-// always something decodable in it.
+// at the video depth that edge spans more than one keyframe interval — so there
+// is always something decodable in it.
+//
+// Which queue is decided here, by kind, and it is the whole reason there are
+// two: a frame is only ever interchangeable with another of its own medium.
 func (s *Server) SendMedia(f *MediaFrame) {
 	buf := make([]byte, 0, FrameHeaderLen+len(f.Config)+len(f.Payload))
-	s.enqueueMedia(outbound{websocket.MessageBinary, AppendFrame(buf, f)})
+	msg := outbound{websocket.MessageBinary, AppendFrame(buf, f)}
+
+	c := s.current()
+	if c == nil {
+		return
+	}
+	if f.Kind == KindAudio {
+		enqueueMedia(c, c.audio, &c.droppedAudio, msg)
+		return
+	}
+	enqueueMedia(c, c.video, &c.droppedVideo, msg)
 }
 
 // enqueueControl queues a control message, which is never dropped for
@@ -340,17 +408,13 @@ func (s *Server) enqueueControl(msg outbound) {
 	}
 }
 
-// enqueueMedia queues a frame, making room by discarding the oldest if it
-// must. Never blocks: the caller is a MOQ read loop, and stalling it would
-// hold up every other track on the session.
-func (s *Server) enqueueMedia(msg outbound) {
-	c := s.current()
-	if c == nil {
-		return
-	}
+// enqueueMedia queues a frame on one medium's queue, making room by discarding
+// that medium's oldest if it must. Never blocks: the caller is a MOQ read loop,
+// and stalling it would hold up every other track on the session.
+func enqueueMedia(c *conn, q chan outbound, dropped *atomic.Uint64, msg outbound) {
 	for {
 		select {
-		case c.media <- msg:
+		case q <- msg:
 			return
 		case <-c.ctx.Done():
 			return
@@ -360,8 +424,8 @@ func (s *Server) enqueueMedia(msg outbound) {
 		// another producer may have refilled the slot in between, which is why
 		// this loops rather than assuming one drop is enough.
 		select {
-		case <-c.media:
-			c.dropped.Add(1)
+		case <-q:
+			dropped.Add(1)
 		default:
 		}
 	}
@@ -380,19 +444,26 @@ func (s *Server) Connected() bool {
 	return s.conn != nil
 }
 
-// DroppedFrames returns how many outbound frames the current connection
-// has dropped for backpressure. Sampled into every metrics message, so a
-// rising count is visible in the debug panel while it is rising: it means
+// DroppedFrames returns how many outbound video and audio frames the current
+// connection has dropped for backpressure. Sampled into every metrics message,
+// so a rising count is visible in the debug panel while it is rising: it means
 // the WebView cannot keep up with its decoders, and the loss is ours rather
 // than the network's.
-func (s *Server) DroppedFrames() uint64 {
+//
+// Reported per medium because they have separate queues, and the two say
+// different things. Dropped video is a frontend that cannot decode and paint as
+// fast as frames arrive, which the picture shows anyway. Dropped audio is a
+// frontend that has stopped reading its socket altogether — a queue that small,
+// carrying that little, does not fill for any other reason — and that is worth
+// telling apart from the network.
+func (s *Server) DroppedFrames() (video, audio uint64) {
 	s.mu.Lock()
 	c := s.conn
 	s.mu.Unlock()
 	if c == nil {
-		return 0
+		return 0, 0
 	}
-	return c.dropped.Load()
+	return c.droppedVideo.Load(), c.droppedAudio.Load()
 }
 
 // Close releases the listener.

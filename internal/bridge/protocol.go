@@ -379,12 +379,19 @@ type Metrics struct {
 	ObjectsInPerSec  float64 `json:"objectsInPerSec"`
 	GroupsOutPerSec  float64 `json:"groupsOutPerSec"`
 
-	// BridgeDropped is how many frames this bridge has dropped on its way to
-	// the WebView, cumulative for the connection. Loss here is not the
-	// network's and does not show up anywhere else: the send queue is bounded
-	// and a full one discards rather than blocks, so a WebView that cannot
-	// drain fast enough loses audio and video with nothing else to say so.
-	BridgeDropped uint64 `json:"bridgeDropped"`
+	// BridgeDroppedVideo and BridgeDroppedAudio are how many frames this bridge
+	// has dropped on its way to the WebView, cumulative for the connection.
+	// Loss here is not the network's and does not show up anywhere else: each
+	// send queue is bounded and a full one discards rather than blocks, so a
+	// WebView that cannot drain fast enough loses frames with nothing else to
+	// say so.
+	//
+	// Split by medium because the queues are, and because they mean different
+	// things: video fills whenever the frontend cannot paint as fast as frames
+	// arrive, while audio is a thirty-two-slot queue carrying 32 kbps and only
+	// fills if the WebView has stopped reading its socket at all.
+	BridgeDroppedVideo uint64 `json:"bridgeDroppedVideo"`
+	BridgeDroppedAudio uint64 `json:"bridgeDroppedAudio"`
 
 	Tracks []TrackMetrics `json:"tracks,omitempty"`
 }

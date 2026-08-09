@@ -16,12 +16,33 @@ func stalledConn(t *testing.T) (*Server, *conn) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	c := &conn{
-		media:   make(chan outbound, sendQueueDepth),
+		video:   make(chan outbound, videoQueueDepth),
+		audio:   make(chan outbound, audioQueueDepth),
 		control: make(chan outbound, controlQueueDepth),
 		ctx:     ctx,
 		cancel:  cancel,
 	}
 	return &Server{conn: c}, c
+}
+
+// videoFrame and audioFrame are frames identifiable by timestamp, so what
+// survived a queue can be named rather than counted.
+func videoFrame(ts uint64) *MediaFrame {
+	return &MediaFrame{
+		Kind:      KindVideo,
+		Handle:    HandleRemoteBase,
+		Timestamp: ts,
+		Payload:   []byte{byte(ts)},
+	}
+}
+
+func audioFrame(ts uint64) *MediaFrame {
+	return &MediaFrame{
+		Kind:      KindAudio,
+		Handle:    HandleRemoteBase + 1,
+		Timestamp: ts,
+		Payload:   []byte{byte(ts)},
+	}
 }
 
 // TestMediaQueueKeepsTheNewest covers the policy the whole bridge rests on: a
@@ -34,28 +55,22 @@ func stalledConn(t *testing.T) (*Server, *conn) {
 func TestMediaQueueKeepsTheNewest(t *testing.T) {
 	s, c := stalledConn(t)
 
-	// One frame more than the queue can hold, each identifiable by its
-	// timestamp, so what survived can be named rather than counted.
+	// One frame more than the queue can hold.
 	const overflow = 10
-	for i := range sendQueueDepth + overflow {
-		s.SendMedia(&MediaFrame{
-			Kind:      KindVideo,
-			Handle:    HandleRemoteBase,
-			Timestamp: uint64(i),
-			Payload:   []byte{byte(i)},
-		})
+	for i := range videoQueueDepth + overflow {
+		s.SendMedia(videoFrame(uint64(i)))
 	}
 
-	if got := s.DroppedFrames(); got != overflow {
-		t.Errorf("dropped %d frames, want %d", got, overflow)
+	if got, _ := s.DroppedFrames(); got != overflow {
+		t.Errorf("dropped %d video frames, want %d", got, overflow)
 	}
-	if got := len(c.media); got != sendQueueDepth {
-		t.Fatalf("queue holds %d frames, want %d", got, sendQueueDepth)
+	if got := len(c.video); got != videoQueueDepth {
+		t.Fatalf("queue holds %d frames, want %d", got, videoQueueDepth)
 	}
 
 	// The survivors must be the last ones sent. The oldest `overflow` frames
 	// are the ones that should have gone.
-	first := <-c.media
+	first := <-c.video
 	f, err := ParseFrame(first.data)
 	if err != nil {
 		t.Fatalf("parse queued frame: %v", err)
@@ -74,8 +89,8 @@ func TestMediaQueueKeepsTheNewest(t *testing.T) {
 func TestControlSurvivesASaturatedMediaQueue(t *testing.T) {
 	s, c := stalledConn(t)
 
-	for i := range sendQueueDepth * 2 {
-		s.SendMedia(&MediaFrame{Timestamp: uint64(i), Payload: []byte{1}})
+	for i := range videoQueueDepth * 2 {
+		s.SendMedia(videoFrame(uint64(i)))
 	}
 
 	s.SendControl(&ServerMessage{
@@ -95,6 +110,87 @@ func TestControlSurvivesASaturatedMediaQueue(t *testing.T) {
 		if got := decodeType(t, msg.data); got != want {
 			t.Errorf("control message type = %q, want %q", got, want)
 		}
+	}
+}
+
+// TestAudioSurvivesASaturatedVideoQueue is the property the split exists for.
+//
+// The two shared 256 slots once, so a video backlog evicted audio to make room
+// for itself — 32 kbps of sound thrown away to hold stale 1.5 Mbps video. What
+// the listener heard was a gap, and then, when the frontend caught up, a burst
+// the player had to trim to bound its latency: another gap. Video is now
+// discarded from its own queue and audio never notices.
+func TestAudioSurvivesASaturatedVideoQueue(t *testing.T) {
+	s, c := stalledConn(t)
+
+	// Far past what the video queue can hold, with audio arriving throughout at
+	// roughly the ratio a real call produces.
+	const audioFrames = audioQueueDepth
+	for i := range videoQueueDepth * 4 {
+		s.SendMedia(videoFrame(uint64(i)))
+		if i%8 == 0 && uint64(i/8) < audioFrames {
+			s.SendMedia(audioFrame(uint64(i / 8)))
+		}
+	}
+
+	video, audio := s.DroppedFrames()
+	if video == 0 {
+		t.Fatal("no video was dropped, so this proves nothing about audio")
+	}
+	if audio != 0 {
+		t.Errorf("dropped %d audio frames while video was saturated; the two "+
+			"queues are meant to be independent", audio)
+	}
+	if got := len(c.audio); got != audioFrames {
+		t.Fatalf("audio queue holds %d frames, want %d", got, audioFrames)
+	}
+
+	// And in order, from the first one sent: nothing was evicted from the front.
+	for want := range uint64(audioFrames) {
+		f, err := ParseFrame((<-c.audio).data)
+		if err != nil {
+			t.Fatalf("parse queued audio frame: %v", err)
+		}
+		if f.Timestamp != want {
+			t.Fatalf("audio frame %d has timestamp %d; the queue lost or "+
+				"reordered sound while video was backing up", want, f.Timestamp)
+		}
+	}
+}
+
+// TestAudioIsWrittenAheadOfVideo pins the ordering half of the split. Separate
+// queues stop audio being evicted; taking audio first is what stops it waiting
+// behind a video backlog already queued ahead of it in one write loop.
+func TestAudioIsWrittenAheadOfVideo(t *testing.T) {
+	s, c := stalledConn(t)
+
+	// A full video queue, then one audio packet behind all of it.
+	for i := range uint64(videoQueueDepth) {
+		s.SendMedia(videoFrame(i))
+	}
+	s.SendMedia(audioFrame(999))
+
+	msg, ok := c.nextReady()
+	if !ok {
+		t.Fatal("nothing ready with both queues loaded")
+	}
+	f, err := ParseFrame(msg.data)
+	if err != nil {
+		t.Fatalf("parse queued frame: %v", err)
+	}
+	if f.Kind != KindAudio {
+		t.Fatalf("the write loop would send video first; audio queued behind "+
+			"%d video frames waits for all of them", videoQueueDepth)
+	}
+
+	// And control still outranks both.
+	s.SendControl(&ServerMessage{Type: MsgState, State: &SessionState{Phase: PhaseJoined}})
+	msg, ok = c.nextReady()
+	if !ok {
+		t.Fatal("nothing ready with all three queues loaded")
+	}
+	if msg.typ != websocket.MessageText {
+		t.Error("a control message did not outrank queued media")
 	}
 }
 

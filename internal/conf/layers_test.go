@@ -292,22 +292,18 @@ func TestTheEnhancementLayerIsWorthShedding(t *testing.T) {
 // A group can arrive all at once rather than at the frame rate — a backfilled
 // group replayed to someone who has just joined, or a publisher catching up
 // after a stall. Nothing then paces the two subgroup streams against each
-// other, and the relay drains one nearly to the end before starting the other.
+// other, and the relay is free to drain one far ahead of the other.
 //
-// This is the case a group that judged safety by the streams it had already
-// seen got wrong, and it got it wrong by discarding rather than by reordering:
-// the base layer released the whole group, then every enhancement object
-// arrived numbered below what had already gone out and was dropped as a
-// duplicate. Measured at about half the frames of the group, against the same
-// frames at 30 fps arriving perfectly.
-//
-// The first group, deliberately. It is both the one a joining subscriber is
-// backfilled with and the one no amount of watching this track can have
-// prepared for, which is why the layer count is declared rather than learned.
-func TestALayeredGroupSurvivesArrivingAsABurst(t *testing.T) {
+// What must survive that is the base layer, whole and in order: it is what makes
+// the group decodable at all, and a hole in it is a hole in the picture. The
+// enhancement layer is best-effort here and deliberately so. A group that has
+// only seen the base cannot tell a layer that was shed from one that has not
+// arrived yet, and waiting for it is what froze tiles for four seconds at a
+// time; conceding it costs this group half its frame rate instead.
+func TestABurstDeliversTheBaseLayerWhole(t *testing.T) {
 	alice, bobRec := layeredPair(t, "burst1")
 
-	const frames = 40
+	const frames = 40 // twenty on each layer
 	for i := range frames {
 		f := layeredVideoFrame(
 			uint64(i)*frameStep, i == 0, 300, temporalLayerFor(i))
@@ -315,37 +311,47 @@ func TestALayeredGroupSurvivesArrivingAsABurst(t *testing.T) {
 			t.Fatalf("write frame %d: %v", i, err)
 		}
 	}
-	// Ends the group. Its own group stays open waiting for a layer that never
-	// comes, so it is excluded from what follows.
+	// Ends the group, and is excluded from what follows.
 	closer := uint64(frames) * frameStep
 	if err := alice.WriteFrame(
 		layeredVideoFrame(closer, true, 300, 0)); err != nil {
 		t.Fatalf("write the keyframe that closes the group: %v", err)
 	}
 
-	inGroup := func() []bridge.MediaFrame {
+	base := func() []bridge.MediaFrame {
 		var got []bridge.MediaFrame
 		for _, f := range videoFrames(bobRec) {
-			if f.Timestamp < closer {
+			if f.Timestamp < closer && f.TemporalLayer == 0 {
 				got = append(got, f)
 			}
 		}
 		return got
 	}
-	waitFor(t, "every frame of the burst to reach bob", 15*time.Second, func() bool {
-		return len(inGroup()) >= frames
-	})
+	waitFor(t, "every base-layer frame of the burst to reach bob", 15*time.Second,
+		func() bool { return len(base()) >= frames/2 })
 
-	got := inGroup()
-	if len(got) != frames {
-		t.Fatalf("bob received %d of %d frames written back to back", len(got), frames)
+	got := base()
+	if len(got) != frames/2 {
+		t.Fatalf("bob received %d of %d base-layer frames written back to back",
+			len(got), frames/2)
 	}
 	for i, f := range got {
-		if want := uint64(i) * frameStep; f.Timestamp != want {
-			t.Fatalf("frame %d of the burst arrived out of decode order: "+
+		if want := uint64(2*i) * frameStep; f.Timestamp != want {
+			t.Fatalf("base frame %d of the burst arrived out of order: "+
 				"timestamp %d, want %d", i, f.Timestamp, want)
 		}
 	}
+
+	// Reported, not required: how much of the disposable layer a burst happens
+	// to carry says something about the path, and nothing about correctness.
+	var enhancement int
+	for _, f := range videoFrames(bobRec) {
+		if f.Timestamp < closer && f.TemporalLayer == 1 {
+			enhancement++
+		}
+	}
+	t.Logf("the burst carried %d of %d enhancement frames alongside a whole "+
+		"base layer", enhancement, frames/2)
 }
 
 // layeredShare reports what fraction of the video bytes a recorder received

@@ -57,16 +57,27 @@ import "sync"
 // earlier is what has actually been seen and not yet ended, which is the
 // question the open streams answer.
 
-// maxHeldObjects bounds one group's reassembly buffer.
+// maxHeldObjects bounds one group's reassembly buffer, and with it how long a
+// picture can be held for a layer that is not arriving.
 //
-// Reached only when a stream stops delivering without ending — a publisher that
-// stalls mid-group, or a relay holding a subgroup open with nothing on it. The
-// other layers keep arriving and pile up behind the object that will never
-// come, so this is the release valve: past it the oldest held object goes out
-// and the gap is conceded. Sized well above a GOP's frame count (two seconds at
-// 30 fps is 60 objects across all layers) so a healthy group never approaches
-// it; small enough to bound the memory one wedged publisher can cost.
-const maxHeldObjects = 128
+// The interleave this has to cover is one object deep: L1T2 puts a single
+// enhancement frame between consecutive base frames, so in a stream that is
+// keeping up the next index is already there and nothing is held at all. Eight
+// is slack for jitter, not for a stall.
+//
+// It used to be 128, sized "well above a GOP" on the reasoning that a healthy
+// group should never approach it. That is true and was the wrong thing to size
+// for: the valve is not for healthy groups, it is the only bound on an unhealthy
+// one. A relay draining the base layer well ahead of the enhancement layer —
+// which is what a burst is — left the picture held behind an object that was
+// coming much later, and at 128 objects that is four seconds of frozen tile
+// before the group gives up. Eight is a quarter of a second.
+//
+// Conceding early costs the enhancement frames that arrive after their turn has
+// passed. That is the layer built to be disposable, and a stutter-free picture
+// at half the frame rate is the trade this whole layout exists to be able to
+// make.
+const maxHeldObjects = 8
 
 // heldObject is one object waiting for its turn, with whatever the caller needs
 // to emit it. The payload is opaque here: this file owns ordering, not media.

@@ -28,6 +28,18 @@ const catalogNicknameKey = "tlmstNickname"
 // roster shows no version for them rather than a wrong one.
 const catalogVersionKey = "tlmstVersion"
 
+// catalogTemporalLayersKey is the per-track extra carrying how many temporal
+// layers a video track is published on, as a §5.6.6 producer field.
+//
+// MSF describes SVC as one track per layer, with temporalId and depends saying
+// how they relate. This publishes the layers as subgroups of a single track
+// instead — a subgroup being the smallest thing §5.1.3 lets a subscriber
+// decline and §8 lets a publisher mark sheddable — so neither field says what a
+// subscriber here needs to know, and inventing a reading for temporalId would
+// be a lie to anyone else parsing the catalog. A producer extra says the one
+// true thing plainly and is ignored by everyone it does not concern.
+const catalogTemporalLayersKey = "tlmstTemporalLayers"
+
 // audioInitRef is the initDataList ID linking the audio track to its
 // codec configuration payload (§5.1.7).
 const audioInitRef = "audio-config"
@@ -55,7 +67,7 @@ func buildCatalog(nickname, version string, video, videoLow, audio *bridge.Track
 			continue
 		}
 		v := layer.cfg
-		tracks = append(tracks, msf.Track{
+		track := msf.Track{
 			Name:        layer.name,
 			Packaging:   msf.PackagingLOC,
 			IsLive:      &live,
@@ -67,7 +79,15 @@ func buildCatalog(nickname, version string, video, videoLow, audio *bridge.Track
 			Bitrate:     v.Bitrate,
 			Timescale:   timescaleMicros,
 			RenderGroup: &renderGroup,
-		})
+		}
+		// Declared only when there is more than one, so a flat encoding says
+		// nothing rather than claiming a layering it does not have.
+		if v.TemporalLayers > 1 {
+			track.Extras = map[string]any{
+				catalogTemporalLayersKey: int(v.TemporalLayers),
+			}
+		}
+		tracks = append(tracks, track)
 	}
 	if audio != nil {
 		track := msf.Track{
@@ -180,6 +200,13 @@ func parseCatalog(payload []byte) (parsedCatalog, error) {
 				Height:    tr.Height,
 				Framerate: tr.Framerate,
 				Bitrate:   tr.Bitrate,
+			}
+			// JSON numbers decode as float64 through the extras map, and a
+			// publisher old enough not to say leaves it absent — which reads as
+			// zero and means the single subgroup every track used to have.
+			if n, ok := tr.Extras[catalogTemporalLayersKey].(float64); ok &&
+				n > 1 && n <= float64(bridge.MaxTemporalLayer+1) {
+				cfg.TemporalLayers = uint8(n)
 			}
 			// A publisher too old to simulcast names its only video track
 			// "video"; anything else with the video role that is not the low

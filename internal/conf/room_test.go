@@ -317,6 +317,14 @@ func videoFrame(tsMicros uint64, key bool, size int) *bridge.MediaFrame {
 	}
 }
 
+// layeredVideoFrame is videoFrame on a nominated temporal layer, which is what
+// decides the subgroup the publisher writes it to.
+func layeredVideoFrame(tsMicros uint64, key bool, size int, layer uint8) *bridge.MediaFrame {
+	f := videoFrame(tsMicros, key, size)
+	f.TemporalLayer = layer
+	return f
+}
+
 func audioFrame(tsMicros uint64, size int) *bridge.MediaFrame {
 	payload := make([]byte, size)
 	for i := range payload {

@@ -13,6 +13,19 @@ export const FLAG_KEYFRAME = 1 << 0;
 /** Marks the header's audio-level byte as a real measurement. */
 export const FLAG_AUDIO_LEVEL = 1 << 1;
 
+/**
+ * The frame's temporal layer lives in bits 2-3 of the flags byte, so layers
+ * 0-3. It rides in the flags rather than a field of its own because the header
+ * is a fixed 24 bytes with a hand-written implementation at each end, and
+ * widening it would be a wire break for a two-bit value.
+ *
+ * Layer 0 is the base — decodable alone, referenced by every layer above it —
+ * and is also what an encoder producing no temporal layers reports, so an
+ * unlayered stream needs no special case.
+ */
+export const TEMPORAL_LAYER_SHIFT = 2;
+export const TEMPORAL_LAYER_MASK = 0x3 << TEMPORAL_LAYER_SHIFT;
+
 /** Handles for the two tracks this frontend publishes. */
 export const HANDLE_LOCAL_VIDEO = 0;
 export const HANDLE_LOCAL_AUDIO = 1;
@@ -38,6 +51,12 @@ export interface MediaFrame {
    * bits 0-6 magnitude in -dBov. Audio frames only.
    */
   audioLevel?: number;
+  /**
+   * Which temporal layer of an SVC encoding this frame belongs to. Decides the
+   * subgroup the publisher writes it to, so the upper layers can be shed
+   * without disturbing the base. Absent means the base layer.
+   */
+  temporalLayer?: number;
 }
 
 /** Encodes one media frame into the binary layout the backend parses. */
@@ -54,6 +73,7 @@ export function encodeFrame(f: MediaFrame): ArrayBuffer {
     flags |= FLAG_AUDIO_LEVEL;
     view.setUint8(3, f.audioLevel & 0xff);
   }
+  flags |= ((f.temporalLayer ?? 0) << TEMPORAL_LAYER_SHIFT) & TEMPORAL_LAYER_MASK;
   view.setUint8(2, flags);
   view.setUint32(4, f.handle);
   // Timestamps are microseconds in a u64. Number stays exact to 2^53 µs,
@@ -89,6 +109,7 @@ export function decodeFrame(buf: ArrayBuffer): MediaFrame | null {
     config: configLen > 0 ? new Uint8Array(buf, FRAME_HEADER_LEN, configLen) : undefined,
     payload: new Uint8Array(buf, configEnd, payloadLen),
     audioLevel: (flags & FLAG_AUDIO_LEVEL) !== 0 ? view.getUint8(3) : undefined,
+    temporalLayer: (flags & TEMPORAL_LAYER_MASK) >> TEMPORAL_LAYER_SHIFT,
   };
 }
 
@@ -111,6 +132,13 @@ export interface TrackConfig {
   bitrate?: number;
   sampleRate?: number;
   channels?: number;
+  /**
+   * How many temporal layers the encoder was configured to emit, and so how
+   * many subgroups a group of this track is published on. One or absent both
+   * mean a single subgroup. A subscriber needs it before the first frame —
+   * see internal/conf/reorder.go.
+   */
+  temporalLayers?: number;
 }
 
 export interface ClientStats {

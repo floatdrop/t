@@ -102,7 +102,23 @@ func joinRoomWithCounters(
 // until stop is closed: audio every 20 ms, video at 30 fps with a keyframe
 // every two seconds. Together they come to roughly half a megabit, which is
 // the figure the bottleneck in these tests is set against.
+//
+// Flat video: every frame on the base layer, which is one subgroup and the
+// shape every track had before temporal layers existed. See layers_test.go for
+// the publisher that emits two.
 func publishPaced(t *testing.T, room *Room, stop <-chan struct{}) {
+	t.Helper()
+	publishPacedLayers(t, room, stop, func(int) uint8 { return 0 })
+}
+
+// publishPacedLayers is publishPaced with each video frame's temporal layer
+// chosen by layerFor, which is what decides how many subgroups a group opens.
+func publishPacedLayers(
+	t *testing.T,
+	room *Room,
+	stop <-chan struct{},
+	layerFor func(frame int) uint8,
+) {
 	t.Helper()
 	const (
 		audioStep = 20 * time.Millisecond
@@ -139,7 +155,8 @@ func publishPaced(t *testing.T, room *Room, stop <-chan struct{}) {
 			if key {
 				size = keySize
 			}
-			_ = room.WriteFrame(videoFrame(uint64(i)*33_000, key, size))
+			_ = room.WriteFrame(
+				layeredVideoFrame(uint64(i)*33_000, key, size, layerFor(i)))
 		}
 	}()
 }

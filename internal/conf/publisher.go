@@ -52,6 +52,32 @@ var ErrAwaitingKeyFrame = errors.New("conf: waiting for first keyframe")
 // edge — so the blunt one is not worth the holes it costs.
 const videoSubgroupTimeout = 2 * time.Second
 
+// layerObjectStride is how far apart two temporal layers' object-ID ranges sit
+// inside one group.
+//
+// Two rules have to hold at once and they pull in opposite directions. Object
+// IDs must be unique within a group — a relay's cache keys objects on (group,
+// object) and nothing else, so a colliding ID does not merely confuse a reader,
+// it overwrites the other layer's frame in the store that answers backfill
+// FETCHes. And §11.4.3 forbids forwarding a non-consecutive object on an
+// existing subgroup stream, so a relay presented with one resets that stream
+// and opens another.
+//
+// Numbering objects in emission order across a group's subgroups satisfies the
+// first and breaks the second: each layer then sees every other ID, so every
+// object is non-consecutive with the one before it on its own stream. Measured
+// against moq-go's relay, that produced one QUIC stream and one RESET_STREAM
+// per frame per subscriber, and reassembly downstream of it collapsed —
+// nothing about a stream's lifetime means anything when a stream carries a
+// single object.
+//
+// So each layer gets its own contiguous range: consecutive within the subgroup,
+// disjoint between them. The stride only has to exceed the objects one layer
+// can contribute to a group, which is a GOP's frame count — about 30 at a
+// two-second keyframe interval. Sixty-five thousand is four orders of magnitude
+// of headroom for a two-byte varint.
+const layerObjectStride = 1 << 16
+
 // publisher owns the local participant's three publications: the MSF
 // catalog and the two LOC media tracks.
 type publisher struct {
@@ -411,10 +437,26 @@ type trackPublisher struct {
 	// mu serializes writes: the bridge read loop is the only caller
 	// today, but a group boundary spans two operations (close the old
 	// subgroup, open the new one) that must not interleave.
-	mu       sync.Mutex
-	subgroup *session.OutgoingSubgroupStream
-	group    uint64
-	object   uint64
+	mu sync.Mutex
+	// subgroups holds one open stream per temporal layer of the current group,
+	// indexed by layer. Video with temporal layers writes each frame to the
+	// subgroup matching its layer, so a subscriber can decline the upper ones
+	// (§5.1.3) and a relay can shed them, without either touching the base.
+	// Audio and unlayered video use index 0 alone, which is the shape every
+	// track had before layers existed.
+	//
+	// Opened lazily. An encoder that never emits a layer costs no stream, and a
+	// subgroup opened eagerly and left empty is one the subscriber must still
+	// wait on before it can release anything ordered after it.
+	subgroups [bridge.MaxTemporalLayer + 1]*session.OutgoingSubgroupStream
+	group     uint64
+	// objects counts what each subgroup of the current group has written, so
+	// each layer's object IDs run consecutively from its own base — see
+	// layerObjectStride for why they cannot simply count across the group.
+	//
+	// Ordering therefore does not ride on the object ID any more. It rides on
+	// the LOC timestamp every object already carries; see reorder.go.
+	objects [bridge.MaxTemporalLayer + 1]uint64
 	// started distinguishes "no group yet" from "in group 0".
 	started bool
 	// objectsInGroup counts objects written to the current group, for
@@ -470,33 +512,68 @@ func (t *trackPublisher) writeAudio(f *bridge.MediaFrame) error {
 	return t.writeObject(f)
 }
 
-// rotateGroup closes any open subgroup and opens the next group's. The
+// rotateGroup closes every open subgroup and starts the next group. The
 // caller holds mu.
+//
+// The base layer's stream is opened here rather than lazily: every group opens
+// on it (video's keyframe, audio's first object), so deferring it would buy
+// nothing and would leave the group with no stream to report a failure on.
 func (t *trackPublisher) rotateGroup() error {
-	if t.subgroup != nil {
-		if err := t.subgroup.Close(); err != nil {
-			t.log.Debug("close subgroup failed", "group", t.group, "err", err)
-		}
-		t.subgroup = nil
+	if t.started {
+		t.closeSubgroups()
 		t.group++
 	}
 
-	sg, err := t.pub.OpenSubgroup(message.SubgroupHeader{
-		Properties:     true, // LOC metadata rides in Object Properties
-		SubgroupIDMode: message.SubgroupIDImplicitZero,
-		GroupID:        t.group,
-	})
-	if err != nil {
-		return fmt.Errorf("conf: open subgroup group=%d: %w", t.group, err)
-	}
-	// Returns a copy rather than configuring in place, so the timeout only
-	// applies if the result is what gets kept.
-	t.subgroup = sg.WithDeliveryTimeouts(t.timeouts)
-	t.object = 0
+	t.objects = [bridge.MaxTemporalLayer + 1]uint64{}
 	t.objectsInGroup = 0
 	t.started = true
 	t.counter.AddGroup()
-	return nil
+	_, err := t.openSubgroup(0)
+	return err
+}
+
+// closeSubgroups ends every open stream of the current group. The caller holds
+// mu. A close that fails is logged and dropped: the group is over either way,
+// and the next one opens its own streams.
+func (t *trackPublisher) closeSubgroups() {
+	for layer, sg := range t.subgroups {
+		if sg == nil {
+			continue
+		}
+		if err := sg.Close(); err != nil {
+			t.log.Debug("close subgroup failed",
+				"group", t.group, "layer", layer, "err", err)
+		}
+		t.subgroups[layer] = nil
+	}
+}
+
+// openSubgroup opens this group's stream for one temporal layer, or returns the
+// one already open. The caller holds mu.
+//
+// The Subgroup ID is the layer, which is the whole mechanism: §5.1.3 range
+// filters and §8 per-subgroup delivery timeouts both address a subgroup by ID,
+// so numbering them by layer is what lets a subscriber decline the upper layers
+// and a relay shed them. Spelled out explicitly rather than left implicit —
+// implicit-zero can only ever name subgroup 0.
+func (t *trackPublisher) openSubgroup(layer uint8) (*session.OutgoingSubgroupStream, error) {
+	if sg := t.subgroups[layer]; sg != nil {
+		return sg, nil
+	}
+	sg, err := t.pub.OpenSubgroup(message.SubgroupHeader{
+		Properties:     true, // LOC metadata rides in Object Properties
+		SubgroupIDMode: message.SubgroupIDExplicit,
+		SubgroupID:     uint64(layer),
+		GroupID:        t.group,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("conf: open subgroup group=%d layer=%d: %w",
+			t.group, layer, err)
+	}
+	// Returns a copy rather than configuring in place, so the timeout only
+	// applies if the result is what gets kept.
+	t.subgroups[layer] = sg.WithDeliveryTimeouts(t.timeouts)
+	return t.subgroups[layer], nil
 }
 
 // writeObject LOC-packages f and writes it as the next object in the open
@@ -515,7 +592,16 @@ func (t *trackPublisher) writeObject(f *bridge.MediaFrame) error {
 		props.AudioLevel = f.AudioLevel
 		props.HasAudioLevel = true
 	}
-	// The codec config goes on the first object of every group, so a
+	layer := f.TemporalLayer
+	if layer > bridge.MaxTemporalLayer {
+		// The frontend encodes the layer in two bits, so this cannot arrive
+		// over the bridge; it would take a caller constructing a frame by hand.
+		// Clamped to the base rather than rejected: a frame on the wrong layer
+		// is a picture that stutters, and dropping it is a picture with a hole.
+		layer = 0
+	}
+
+	// The codec config goes on the first object of every subgroup, so a
 	// subscriber can configure a decoder from the first object it sees
 	// without waiting for the catalog to come round again.
 	//
@@ -524,10 +610,14 @@ func (t *trackPublisher) writeObject(f *bridge.MediaFrame) error {
 	// output — so the claim held for object 0 of group 0 and nothing else. A
 	// subscriber joining a call in progress, which is the only kind of
 	// subscriber this is for, landed on a group with no config on it at all.
+	//
+	// Per subgroup rather than per group because a subscriber can be sent one
+	// and not the others: a base-only subscription that never saw the layer
+	// above it must still find a config on the first object it is given.
 	config := f.Config
 	if len(config) > 0 {
 		t.config = config
-	} else if t.object == 0 {
+	} else if t.objects[layer] == 0 {
 		config = t.config
 	}
 	if len(config) > 0 {
@@ -542,16 +632,30 @@ func (t *trackPublisher) writeObject(f *bridge.MediaFrame) error {
 	obj := loc.Object{Properties: props, Payload: f.Payload}
 	encodedProps, payload := obj.Encode()
 
-	if err := t.subgroup.WriteObjectAt(t.object, &message.SubgroupObject{
+	sg, err := t.openSubgroup(layer)
+	if err != nil {
+		return err
+	}
+
+	objectID := uint64(layer)*layerObjectStride + t.objects[layer]
+	if err := sg.WriteObjectAt(objectID, &message.SubgroupObject{
 		Properties: encodedProps,
 		Payload:    payload,
 	}); err != nil {
-		t.subgroup.Cancel(moqt.StreamResetInternalError)
-		t.subgroup = nil
-		t.started = false
-		return fmt.Errorf("conf: write object group=%d object=%d: %w", t.group, t.object, err)
+		// Only this layer's stream is torn down. The group keeps its object
+		// numbering and its other layers: a failure writing an enhancement
+		// frame should cost that frame, not the base layer the subscriber is
+		// actually watching. Restarting the whole group is reserved for the
+		// base layer, which nothing above it can survive without.
+		sg.Cancel(moqt.StreamResetInternalError)
+		t.subgroups[layer] = nil
+		if layer == 0 {
+			t.started = false
+		}
+		return fmt.Errorf("conf: write object group=%d object=%d layer=%d: %w",
+			t.group, objectID, layer, err)
 	}
-	t.object++
+	t.objects[layer]++
 	t.objectsInGroup++
 	t.counter.AddObject(len(payload))
 	return nil
@@ -559,10 +663,7 @@ func (t *trackPublisher) writeObject(f *bridge.MediaFrame) error {
 
 func (t *trackPublisher) close() {
 	t.mu.Lock()
-	if t.subgroup != nil {
-		_ = t.subgroup.Close()
-		t.subgroup = nil
-	}
+	t.closeSubgroups()
 	t.mu.Unlock()
 	_ = t.pub.Done(moqt.PublishDoneTrackEnded, "")
 }

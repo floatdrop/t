@@ -191,31 +191,40 @@ func TestReassemblerHoldsForAnOpenButSilentSubgroup(t *testing.T) {
 	}
 }
 
-// TestReassemblerBoundsTheBacklog pins the release valve. A publisher that
-// stalls mid-group leaves its stream open forever, and everything behind the
-// frame it owes piles up. Past maxHeldObjects the group gives up waiting rather
-// than growing without limit.
+// TestReassemblerBoundsTheBacklog pins the release valve on a group that has
+// started. A publisher that stalls mid-group leaves its stream open, and
+// everything behind the object it owes piles up; past maxHeldObjects the group
+// concedes the gap rather than growing without limit.
+//
+// Only once the keyframe is in. Before that there is nothing to concede *to* —
+// see TestReassemblerDiscardsAGroupWhoseFirstObjectIsNotComing.
 func TestReassemblerBoundsTheBacklog(t *testing.T) {
 	g := newGroupReassembler()
 	var c collector
 	g.OpenSubgroup(0)
 	g.OpenSubgroup(1)
 
-	// Subgroup 0 never delivers anything; subgroup 1 keeps going.
+	// The group starts properly, then subgroup 0 owes index 2 and never sends
+	// it while subgroup 1 keeps going.
+	g.Push(0, 0, c.emitter(0))
+	g.Push(1, 1, c.emitter(1))
 	for i := range uint64(maxHeldObjects + 4) {
-		g.Push(1, i+1, c.emitter(i+1))
+		g.Push(1, i+3, c.emitter(i+3))
 	}
 	got := c.order()
-	if len(got) == 0 {
-		t.Fatal("nothing was emitted: a stalled publisher held the group forever")
+	if len(got) < 3 {
+		t.Fatalf("emitted %v: a stalled publisher held the group past the bound", got)
 	}
-	if got[0] != 1 {
-		t.Fatalf("first emitted = %d, want 1 (the oldest held frame)", got[0])
+	if got[0] != 0 {
+		t.Fatalf("first emitted = %d, want the keyframe at 0", got[0])
 	}
 	for i := 1; i < len(got); i++ {
 		if got[i] <= got[i-1] {
 			t.Fatalf("emitted out of order at %d: %v", i, got[:i+1])
 		}
+	}
+	if held := g.backlog(); held > maxHeldObjects {
+		t.Errorf("backlog grew to %d, past the bound of %d", held, maxHeldObjects)
 	}
 }
 
@@ -367,26 +376,44 @@ func TestReassemblerNeverConcedesTheKeyFrame(t *testing.T) {
 	}
 }
 
-// A subscriber that joins mid-group never receives index 0, and must not wait
-// for it for ever. The backlog valve is what lets go — the frames it releases
-// are ones the decoder will refuse anyway, having no keyframe, so the cost is
-// a quarter of a second of nothing.
-func TestReassemblerGivesUpOnAFirstObjectThatIsNotComing(t *testing.T) {
+// A subscriber that joins mid-group never receives index 0, and must not grow
+// its backlog for ever waiting for one. It is discarded rather than emitted:
+// frames with no keyframe in front of them are undecodable whatever order they
+// go out in, and letting one out would move next past the keyframe that a
+// later group's worth of arrivals still might not supply.
+func TestReassemblerDiscardsAGroupWhoseFirstObjectIsNotComing(t *testing.T) {
 	g := newGroupReassembler()
 	var c collector
 	g.OpenSubgroup(0)
 
-	for i := range uint64(maxHeldObjects + 2) {
+	for i := range uint64(maxHeldObjects * 3) {
 		g.Push(0, i+4, c.emitter(i+4)) // joined at index 4; 0..3 never arrive
 	}
-	got := c.order()
-	if len(got) == 0 {
-		t.Fatal("nothing was emitted: a group joined part-way through waited " +
-			"for a first object that was never going to arrive")
+	if got := c.order(); len(got) != 0 {
+		t.Errorf("emitted %v from a group whose keyframe never arrived; a "+
+			"decoder cannot use any of it", got)
 	}
-	for i := 1; i < len(got); i++ {
-		if got[i] <= got[i-1] {
-			t.Fatalf("emitted out of order at %d: %v", i, got[:i+1])
-		}
+	if held := g.backlog(); held > maxHeldObjects {
+		t.Errorf("backlog grew to %d, past the bound of %d", held, maxHeldObjects)
+	}
+}
+
+// And the keyframe still starts the group if it turns up late but inside the
+// backlog: the frames held for it are exactly the ones it makes decodable.
+func TestReassemblerStartsOnceTheKeyFrameArrives(t *testing.T) {
+	g := newGroupReassembler()
+	var c collector
+	g.OpenSubgroup(0)
+	g.OpenSubgroup(1)
+
+	g.Push(1, 1, c.emitter(1))
+	g.Push(1, 3, c.emitter(3))
+	if got := c.order(); len(got) != 0 {
+		t.Fatalf("emitted %v before the keyframe", got)
+	}
+	g.Push(0, 0, c.emitter(0))
+	g.Push(0, 2, c.emitter(2))
+	if got, want := c.order(), []uint64{0, 1, 2, 3}; !equal(got, want) {
+		t.Fatalf("order = %v, want %v", got, want)
 	}
 }

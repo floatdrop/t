@@ -196,6 +196,17 @@ func (g *groupReassembler) drainLocked() {
 	for len(g.held) > 0 {
 		head := g.held[0]
 		if !g.releasableLocked(head.index) {
+			// A group still waiting for its first object cannot let anything
+			// out, so a full backlog is discarded rather than conceded. The
+			// valve exists to bound waiting, and here conceding would buy
+			// nothing: without the keyframe these frames are undecodable, and
+			// emitting one moves next past the keyframe so the rest become so
+			// too. Dropping them bounds the memory and leaves index 0 able to
+			// arrive and start the group properly.
+			if g.next == 0 && len(g.held) >= maxHeldObjects {
+				g.held = g.held[1:]
+				continue
+			}
 			return
 		}
 		g.held = g.held[1:]
@@ -225,9 +236,6 @@ func (g *groupReassembler) releasableLocked(index uint64) bool {
 	if index == g.next {
 		return true
 	}
-	if len(g.held) >= maxHeldObjects {
-		return true
-	}
 	// Nothing can precede a group's first object, so nothing may go out before
 	// it has arrived — and it is the keyframe, on the base layer, because that
 	// is what opens a group.
@@ -247,12 +255,22 @@ func (g *groupReassembler) releasableLocked(index uint64) bool {
 	if g.next == 0 {
 		return false
 	}
+	if len(g.held) >= maxHeldObjects {
+		return true
+	}
 	for subgroup, highest := range g.open {
 		if !g.started[subgroup] || highest < index {
 			return false
 		}
 	}
 	return true
+}
+
+// backlog is how many objects are waiting, for tests that pin the bound.
+func (g *groupReassembler) backlog() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.held)
 }
 
 // idle reports whether every subgroup stream of this group has ended, which is

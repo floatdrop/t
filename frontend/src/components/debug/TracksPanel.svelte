@@ -138,6 +138,16 @@
         <dt>Voice activity</dt>
         <dd class:on={store.speaking}>{store.speaking ? 'speaking' : 'silent'}</dd>
       </div>
+      <!-- Should read 0 with one person talking: the limiter is there to catch
+           several voices summing, not to compress anybody's speech. A number
+           that sits here during ordinary conversation is the threshold set too
+           low, which sounds like the level breathing rather than like a fault. -->
+      <div>
+        <dt>Limiter</dt>
+        <dd class:warn={store.limiterReduction < -1}>
+          {store.limiterReduction.toFixed(1)} dB
+        </dd>
+      </div>
     </dl>
     <p class="note">
       Echo cancellation is the platform's: only it can see what the speakers

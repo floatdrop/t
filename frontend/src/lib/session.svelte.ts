@@ -121,6 +121,8 @@ class Store {
     denoiseActive: false,
   });
   playbackStats = $state<PlaybackStats[]>([]);
+  /** Gain reduction the shared output limiter is applying, in dB. */
+  limiterReduction = $state(0);
 
   /** Local preview stream, shown in the welcome screen and own tile. */
   previewStream = $state<MediaStream | null>(null);
@@ -374,6 +376,7 @@ class Store {
     this.#statsTimer = setInterval(() => {
       this.captureStats = capture.sampleStats();
       this.playbackStats = playback.sampleStats();
+      this.limiterReduction = playback.limiterReduction;
     }, STATS_INTERVAL_MS);
 
   }

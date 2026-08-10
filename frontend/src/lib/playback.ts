@@ -995,6 +995,19 @@ export class Playback {
     return out;
   }
 
+  /**
+   * How hard the shared limiter is working right now, in dB of gain reduction.
+   *
+   * Zero while it is out of the way, which is what it should be for one talker
+   * on a normalised signal. Anything sustained means it is compressing ordinary
+   * speech rather than catching a sum — the fault the threshold was raised to
+   * avoid, and the only way to tell is to look, because it sounds like nothing
+   * in particular until you compare.
+   */
+  get limiterReduction(): number {
+    return this.#limiter?.reduction ?? 0;
+  }
+
   get stats(): PlaybackStats[] {
     return this.#stats;
   }

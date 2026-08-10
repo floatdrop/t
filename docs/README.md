@@ -123,7 +123,12 @@ defaults to zero, so a relay that does not advertise it rejects the SUBSCRIBE
 outright. When the relay gives up on a subscription the client simply asks
 again — a fresh SUBSCRIBE starts at the live edge, and on a link that tight
 what comes back has already lost its top layer. Three of those inside a minute
-and video is set aside until the recovery timer tries again.
+and video is set aside for a while, and only for a while: the wait between
+attempts lengthens to a minute and stops there. Nothing on this path gives up
+permanently, because a link that cannot carry the picture now is not one that
+never will — and the two places that used to, a five-minute ceiling here and an
+allowance of five decoder rebuilds in the frontend, were both indistinguishable
+from having given up while looking like ordinary operation.
 
 **Audio** has no keyframes, so it uses a fixed cadence — a new group every 25
 frames, which is 500 ms at the 20 ms framing WebCodecs produces. Opus's

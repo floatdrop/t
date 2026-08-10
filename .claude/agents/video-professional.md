@@ -55,7 +55,8 @@ because dropping one costs exactly itself where dropping a base frame costs
 every frame after it until the next keyframe.
 
 Decode and present — `frontend/src/lib/playback.ts`. A decoder per announced
-handle, `MAX_QUEUE` 60, `MAX_DECODER_RESTARTS` 5, inbound frames discarded until
+handle, `MAX_QUEUE` 60, a failed decoder rebuilt indefinitely at
+`DECODER_REBUILD_INTERVAL_MS`, inbound frames discarded until
 the first keyframe (`sawKeyFrame`). Presentation paints the **newest queued
 frame per display refresh** from one shared rAF loop, with a timer watchdog that
 restarts the loop when WebKit stops delivering callbacks. Video is **not**

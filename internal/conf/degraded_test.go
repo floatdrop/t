@@ -12,24 +12,6 @@ import (
 	"tlmst/internal/telemetry"
 )
 
-// shapedSubscribeWait is how long a test behind the shaper waits for discovery,
-// the catalog and both subscriptions before calling the setup broken.
-//
-// Generous on purpose, and it costs nothing: waitFor polls every 10 ms and
-// returns the moment the condition holds, so this only decides how long an
-// already-broken run takes to fail. It is setup rather than an assertion —
-// nothing here measures how long subscribing took, and the tests below start
-// measuring afterwards.
-//
-// It has to be generous because these run behind a userspace forwarder rather
-// than straight at the relay, which puts a goroutine and a queue in the path of
-// every packet, and the whole thing shares a CI runner with the race detector.
-// TestSkewStaysFlatOnAHealthyPath timed out at ten seconds there while passing
-// six times in a row locally — and that is the test with the *most* bandwidth
-// of the three, so what ran out was CPU, not link. Matched to what the
-// remote-relay tests already allow for crossing an extra hop.
-const shapedSubscribeWait = 30 * time.Second
-
 // logSpy records what a room logged, so a test can assert on a signal whose
 // only output is a log line.
 //
@@ -233,7 +215,7 @@ func TestSkewRisesOnACongestedPath(t *testing.T) {
 	_, bobRec := joinRoomWithCounters(
 		t, link.Addr(), "congested", "bob", counters, testLogger(t))
 
-	waitFor(t, "bob to subscribe to alice", shapedSubscribeWait, func() bool {
+	waitFor(t, "bob to subscribe to alice", subscribeWait, func() bool {
 		_, tracks, _, _ := bobRec.snapshot()
 		return len(tracks) == 2
 	})
@@ -299,7 +281,7 @@ func TestRelayReportsWhenWeCannotKeepUp(t *testing.T) {
 	_, bobRec := joinRoomWithCounters(
 		t, link.Addr(), "overloaded", "bob", telemetry.NewRegistry(), slog.New(spy))
 
-	waitFor(t, "bob to subscribe to alice", shapedSubscribeWait, func() bool {
+	waitFor(t, "bob to subscribe to alice", subscribeWait, func() bool {
 		_, tracks, _, _ := bobRec.snapshot()
 		return len(tracks) == 2
 	})
@@ -336,7 +318,7 @@ func TestSkewStaysFlatOnAHealthyPath(t *testing.T) {
 	_, bobRec := joinRoomWithCounters(
 		t, link.Addr(), "healthy", "bob", counters, testLogger(t))
 
-	waitFor(t, "bob to subscribe to alice", shapedSubscribeWait, func() bool {
+	waitFor(t, "bob to subscribe to alice", subscribeWait, func() bool {
 		_, tracks, _, _ := bobRec.snapshot()
 		return len(tracks) == 2
 	})

@@ -37,7 +37,7 @@ func TestAJoiningSubscriberStartsAtAKeyFrame(t *testing.T) {
 	}
 
 	_, bobRec := joinRoom(t, addr, "join", "bob")
-	waitFor(t, "bob to subscribe to alice's video", 10*time.Second, func() bool {
+	waitFor(t, "bob to subscribe to alice's video", subscribeWait, func() bool {
 		_, tracks, _, _ := bobRec.snapshot()
 		return len(tracks) >= 2
 	})

@@ -111,7 +111,7 @@ func layeredPair(t *testing.T, room string) (*Room, *recorder) {
 
 	alice := layeredPublisher(t, addr, room, "alice")
 	_, bobRec := joinRoom(t, addr, room, "bob")
-	waitFor(t, "bob to subscribe to alice's tracks", 10*time.Second, func() bool {
+	waitFor(t, "bob to subscribe to alice's tracks", subscribeWait, func() bool {
 		_, tracks, _, _ := bobRec.snapshot()
 		return len(tracks) == 2
 	})
@@ -391,7 +391,7 @@ func TestABottleneckCostsTheEnhancementLayerFirst(t *testing.T) {
 	link := startShaper(t, addr, 32_000, 64)
 	_, squeezedRec := joinRoom(t, link.Addr(), "shed", "squeezed")
 
-	waitFor(t, "both subscribers to take alice's video", 20*time.Second, func() bool {
+	waitFor(t, "both subscribers to take alice's video", subscribeWait, func() bool {
 		_, roomy, _, _ := roomyRec.snapshot()
 		_, squeezed, _, _ := squeezedRec.snapshot()
 		return len(roomy) >= 2 && len(squeezed) >= 2

@@ -105,21 +105,22 @@ const (
 // to a thumbnail for the rest of the call.
 const videoRecovery = 30 * time.Second
 
-// videoRecoveryMax is as long as the wait between attempts to climb back gets.
+// videoRecoveryMax is as long as the wait between attempts to ask for video
+// again ever gets.
 //
-// Without a ceiling the wait would be fixed, and a link that cannot hold the
-// full picture never settles: it steps up on schedule, is cut off a lag window
-// later, steps up again — a black tile for most of every cycle, for the rest of
-// the call, each turn costing a SUBSCRIBE, a decoder and a backfilled group.
-// That is worst against a publisher offering no small layer, where the ladder
-// has nothing between the full picture and nothing at all.
+// There has to be a ceiling on the *wait*, not on the attempts. A link that
+// cannot hold the picture will otherwise never settle: it asks on schedule, is
+// cut off a lag window later, asks again — a black tile for most of every
+// cycle, each turn costing a SUBSCRIBE, a decoder and a wait for a keyframe. So
+// an attempt that does not survive lengthens the next wait.
 //
-// So a step up that does not survive lengthens the next wait, and the reduced
-// state becomes somewhere to stay rather than somewhere to bounce off. Five
-// minutes is long enough to stop being the thing anyone notices, and short
-// enough that a link which genuinely recovered is not written off for the
-// evening.
-const videoRecoveryMax = 5 * time.Minute
+// It used to lengthen to five minutes, and that was too far. Nothing here is
+// permanent — a link that recovers gets its video back — but five minutes of
+// audio-only is indistinguishable from having given up, and a call that was
+// briefly congested should not spend the rest of the hour proving it. A minute
+// is long enough to stop being the thing anyone notices and short enough that
+// the picture comes back while the conversation is still happening.
+const videoRecoveryMax = time.Minute
 
 // remote is one other participant in the room: their catalog
 // subscription, whichever media subscriptions their catalog declares, and

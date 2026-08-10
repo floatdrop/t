@@ -319,6 +319,24 @@ func joinRoom(t *testing.T, addr, room, nickname string) (*Room, *recorder) {
 // waitFor polls until cond holds or the deadline passes. Discovery and
 // media delivery are asynchronous, so tests wait on outcomes rather than
 // sleeping a fixed amount.
+// subscribeWait is how long any test waits for a subscription to come up
+// before calling the setup broken: discovery, a catalog, and the SUBSCRIBE
+// round trip.
+//
+// One budget for all of them, and a generous one, because it costs nothing.
+// waitFor polls every 10 ms and returns the moment the condition holds, so this
+// only decides how long an already-broken run takes to fail — and it guards
+// setup rather than an assertion: no test measures how long subscribing took,
+// they all start measuring afterwards.
+//
+// It had drifted to 10, 15 and 20 seconds across the suite, each chosen against
+// whatever the machine was doing that day, and the short ones flaked whenever
+// the machine was busy — a CI runner with the race detector on, or a developer
+// with two clients of this very app encoding video beside it. Both were
+// diagnosed as regressions before being recognised as the clock running out on
+// setup.
+const subscribeWait = 30 * time.Second
+
 func waitFor(t *testing.T, what string, timeout time.Duration, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -382,7 +400,7 @@ func TestAudioLevelRoundTrip(t *testing.T) {
 	}
 
 	_, bobRec := joinRoom(t, addr, "room5", "bob")
-	waitFor(t, "bob to subscribe to audio", 10*time.Second, func() bool {
+	waitFor(t, "bob to subscribe to audio", subscribeWait, func() bool {
 		_, tracks, _, _ := bobRec.snapshot()
 		return len(tracks) == 1
 	})
@@ -484,7 +502,7 @@ func TestAudioConfigOpensEveryGroup(t *testing.T) {
 	}
 
 	_, bobRec := joinRoom(t, addr, "room-config", "bob")
-	waitFor(t, "bob to subscribe to audio", 10*time.Second, func() bool {
+	waitFor(t, "bob to subscribe to audio", subscribeWait, func() bool {
 		_, tracks, _, _ := bobRec.snapshot()
 		return len(tracks) == 1
 	})
@@ -557,7 +575,7 @@ func TestTwoParticipants(t *testing.T) {
 
 	// Bob must discover alice through SUBSCRIBE_NAMESPACE and pick both of
 	// her tracks out of the catalog the joining FETCH backfills.
-	waitFor(t, "bob to subscribe to both of alice's tracks", 10*time.Second, func() bool {
+	waitFor(t, "bob to subscribe to both of alice's tracks", subscribeWait, func() bool {
 		_, tracks, _, _ := bobRec.snapshot()
 		return len(tracks) == 2
 	})
@@ -752,7 +770,7 @@ func TestAudioOnly(t *testing.T) {
 	}
 
 	_, bobRec := joinRoom(t, addr, "room4", "bob")
-	waitFor(t, "bob to subscribe to audio", 10*time.Second, func() bool {
+	waitFor(t, "bob to subscribe to audio", subscribeWait, func() bool {
 		_, tracks, _, _ := bobRec.snapshot()
 		return len(tracks) == 1
 	})
@@ -789,7 +807,7 @@ func TestTrackReconfiguration(t *testing.T) {
 	}
 
 	_, bobRec := joinRoom(t, addr, "room6", "bob")
-	waitFor(t, "bob to subscribe to the first configuration", 10*time.Second, func() bool {
+	waitFor(t, "bob to subscribe to the first configuration", subscribeWait, func() bool {
 		_, tracks, _, _ := bobRec.snapshot()
 		return len(tracks) == 1
 	})
@@ -817,7 +835,7 @@ func TestTrackReconfiguration(t *testing.T) {
 		t.Fatalf("redeclare video: %v", err)
 	}
 
-	waitFor(t, "bob to resubscribe under a new handle", 10*time.Second, func() bool {
+	waitFor(t, "bob to resubscribe under a new handle", subscribeWait, func() bool {
 		_, tracks, _, _ := bobRec.snapshot()
 		for _, tr := range tracks {
 			if tr.Config.Width == 1280 && tr.Handle != first.Handle {

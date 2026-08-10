@@ -42,7 +42,7 @@ func alicePublishing(t *testing.T, room string) (*Room, *Room, *recorder) {
 
 	alice := publisherWithBothTracks(t, addr, room, "alice")
 	bob, bobRec := joinRoom(t, addr, room, "bob")
-	waitFor(t, "bob to subscribe to both of alice's tracks", 10*time.Second, func() bool {
+	waitFor(t, "bob to subscribe to both of alice's tracks", subscribeWait, func() bool {
 		_, tracks, _, _ := bobRec.snapshot()
 		return len(tracks) == 2
 	})
@@ -134,7 +134,7 @@ func TestVisibilityGatingCutsInboundBitrate(t *testing.T) {
 
 	counters := telemetry.NewRegistry()
 	bob, bobRec := joinRoomWithCounters(t, addr, "measure", "bob", counters, testLogger(t))
-	waitFor(t, "bob to subscribe to both publishers", 15*time.Second, func() bool {
+	waitFor(t, "bob to subscribe to both publishers", subscribeWait, func() bool {
 		_, tracks, _, _ := bobRec.snapshot()
 		return len(tracks) == 4
 	})
@@ -212,7 +212,7 @@ func TestTurningVideoOffStopsTheInboundBytes(t *testing.T) {
 	counters := telemetry.NewRegistry()
 	_, bobRec := joinRoomWithCounters(
 		t, addr, "cameraoff", "bob", counters, testLogger(t))
-	waitFor(t, "bob to subscribe to alice's tracks", 15*time.Second, func() bool {
+	waitFor(t, "bob to subscribe to alice's tracks", subscribeWait, func() bool {
 		_, tracks, _, _ := bobRec.snapshot()
 		return len(tracks) == 2
 	})

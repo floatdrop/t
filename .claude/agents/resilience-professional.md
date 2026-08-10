@@ -98,8 +98,10 @@ cached endpoint on failure, because the app may have restarted on a new port.
 `session.svelte.ts` drops all remote state on `reconnecting` — those handles
 and decoders belong to a dead session — while capture keeps running so the call
 resumes the instant the relay returns. `playback.ts` rebuilds a failed decoder
-up to `MAX_DECODER_RESTARTS` 5, with the allowance restored on any successful
-output so only a decoder that never works gives up. `capture.ts` withdraws the
+for as long as the track exists, paced by `DECODER_REBUILD_INTERVAL_MS` rather
+than bounded by a count — a link that cannot carry video now is not one that
+never will, and an allowance of five spent in a bad second used to blank a
+participant for the rest of the call. `capture.ts` withdraws the
 video track when its encoder dies, guarded on that encoder still being the
 current one, and degrades rather than dies when the denoiser will not load.
 

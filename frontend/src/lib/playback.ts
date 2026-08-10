@@ -32,15 +32,23 @@ const LIMITER = {
 } as const;
 
 /**
- * Most times a decoder may be rebuilt without ever producing a frame.
+ * Shortest gap between rebuilds of one decoder.
  *
- * A decoder error is terminal, so recovery means building a new one — but a
- * stream this decoder simply cannot handle would otherwise be rebuilt for every
- * frame that arrives, forever. The counter resets on output, so this only
- * counts failures that never got anywhere: a decoder that recovers has its
- * whole allowance back.
+ * A decoder error is terminal, so recovery means building a new one — and a
+ * stream this decoder cannot handle would be rebuilt for every frame that
+ * arrives if nothing paced it. That used to be answered with an allowance of
+ * five attempts, after which the participant's video was given up on for the
+ * rest of the call: a permanently blank tile that no amount of the link
+ * recovering could bring back, from a burst of five errors that may have lasted
+ * a second.
+ *
+ * A link that cannot carry video right now is not a link that will never carry
+ * it, so the allowance is gone and this paces the retries instead. It keeps
+ * trying for as long as the track exists, once a second, which costs nothing
+ * against a decoder that will never work and costs a second against one that
+ * only needed the network to come back.
  */
-const MAX_DECODER_RESTARTS = 5;
+const DECODER_REBUILD_INTERVAL_MS = 1000;
 
 /**
  * Hard cap on the presentation queue, as a backstop rather than a working
@@ -198,11 +206,13 @@ interface VideoSink {
    */
   config: VideoDecoderConfig;
   /**
-   * Consecutive rebuilds since the last frame came out. Reset by output, so a
-   * decoder that recovers starts its allowance again and only a decoder that
-   * fails repeatedly without ever decoding anything runs out.
+   * Rebuilds since the last frame came out, reset by output. Reported in the
+   * log so a decoder that keeps failing is visible; nothing bounds it any more.
    */
   restarts: number;
+  /** A rebuild waiting out its interval, so a failing decoder is rebuilt once
+   * rather than once per frame. */
+  rebuildTimer: ReturnType<typeof setTimeout> | null;
   /**
    * Decoded frames awaiting their presentation time, oldest first. Painting
    * on decode is what left the picture unsynchronised: it ran as fast as the
@@ -224,8 +234,9 @@ interface AudioSink {
   underruns: number;
   /** What the decoder was configured with, kept so it can be built again. */
   config: AudioDecoderConfig;
-  /** Consecutive rebuilds since the last frame came out. See the video sink. */
+  /** Rebuilds since the last frame came out. See the video sink. */
   restarts: number;
+  rebuildTimer: ReturnType<typeof setTimeout> | null;
   /** Trims seen so far, so only an increase is reported. */
   trimmed: number;
   /** When an underrun was last logged, so a run of them is not a run of logs. */
@@ -329,21 +340,15 @@ export class Playback {
     return true;
   }
 
-  /** Replaces a decoder that has failed, while it is still worth trying. */
+  /** Replaces a decoder that has failed. It keeps trying for as long as the
+   * track exists — see DECODER_REBUILD_INTERVAL_MS. */
   #onVideoDecoderError(sink: VideoSink, err: unknown): void {
     if (this.#sinks.get(sink.track.handle) !== sink) return; // already retired
+    // One rebuild in flight is enough: a dying decoder reports per frame, and
+    // every one of those errors is the same fault.
+    if (sink.rebuildTimer !== null) return;
 
     sink.restarts++;
-    if (sink.restarts > MAX_DECODER_RESTARTS) {
-      bridge.report('ERROR', 'video decoder failed repeatedly; giving up', {
-        participant: sink.track.participant,
-        restarts: String(sink.restarts),
-        err: String(err),
-      });
-      this.onFailure?.(sink.track.participant, 'their video cannot be decoded');
-      return;
-    }
-
     bridge.report('WARN', 'video decoder failed; rebuilding it', {
       participant: sink.track.participant,
       restarts: String(sink.restarts),
@@ -356,7 +361,16 @@ export class Playback {
     sink.pending?.close();
     sink.pending = null;
 
-    if (!this.#buildVideoDecoder(sink)) this.#sinks.delete(sink.track.handle);
+    sink.rebuildTimer = setTimeout(() => {
+      sink.rebuildTimer = null;
+      if (this.#sinks.get(sink.track.handle) !== sink) return;
+      if (!this.#buildVideoDecoder(sink)) {
+        // Configure refused the description outright, which retrying with the
+        // same one cannot fix. This is the only way video is given up on now.
+        this.#sinks.delete(sink.track.handle);
+        this.onFailure?.(sink.track.participant, 'their video cannot be decoded');
+      }
+    }, DECODER_REBUILD_INTERVAL_MS);
   }
 
   #addVideo(track: RemoteTrack): void {
@@ -376,6 +390,7 @@ export class Playback {
       height: 0,
       queue: [],
       restarts: 0,
+      rebuildTimer: null,
       config: null as unknown as VideoDecoderConfig,
       decoder: null as unknown as VideoDecoder,
     };
@@ -415,6 +430,7 @@ export class Playback {
       trimmed: 0,
       lastUnderrunLogMs: 0,
       restarts: 0,
+      rebuildTimer: null,
       config: null as unknown as AudioDecoderConfig,
       decoder: null as unknown as AudioDecoder,
     };
@@ -536,23 +552,22 @@ export class Playback {
 
   #onAudioDecoderError(sink: AudioSink, err: unknown): void {
     if (this.#sinks.get(sink.track.handle) !== sink) return; // already retired
+    if (sink.rebuildTimer !== null) return;
 
     sink.restarts++;
-    if (sink.restarts > MAX_DECODER_RESTARTS) {
-      bridge.report('ERROR', 'audio decoder failed repeatedly; giving up', {
-        participant: sink.track.participant,
-        restarts: String(sink.restarts),
-        err: String(err),
-      });
-      this.onFailure?.(sink.track.participant, 'their audio cannot be decoded');
-      return;
-    }
     bridge.report('WARN', 'audio decoder failed; rebuilding it', {
       participant: sink.track.participant,
       restarts: String(sink.restarts),
       err: String(err),
     });
-    if (!this.#buildAudioDecoder(sink)) this.#sinks.delete(sink.track.handle);
+    sink.rebuildTimer = setTimeout(() => {
+      sink.rebuildTimer = null;
+      if (this.#sinks.get(sink.track.handle) !== sink) return;
+      if (!this.#buildAudioDecoder(sink)) {
+        this.#sinks.delete(sink.track.handle);
+        this.onFailure?.(sink.track.participant, 'their audio cannot be decoded');
+      }
+    }, DECODER_REBUILD_INTERVAL_MS);
   }
 
   /**
@@ -607,6 +622,12 @@ export class Playback {
     const sink = this.#sinks.get(handle);
     if (!sink) return;
     this.#sinks.delete(handle);
+    // A rebuild scheduled for a track that has gone would build a decoder
+    // nothing will ever feed, and hold the sink alive to do it.
+    if (sink.rebuildTimer !== null) {
+      clearTimeout(sink.rebuildTimer);
+      sink.rebuildTimer = null;
+    }
 
     if (sink.kind === 'video') {
       sink.pending?.close();

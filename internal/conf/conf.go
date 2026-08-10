@@ -50,8 +50,8 @@ import (
 // shared relay, so changing it is a compatibility break: a client using a
 // different root is invisible to this one and this one is invisible to it, both
 // of them sitting in what looks like an empty room. It changed once, from
-// "tlmst" to "t" alongside the binary and the invite scheme, which is why
-// releases before 0.6.0 cannot see releases after it.
+// "tlmst" to "t" in 0.5.6, alongside the binary and the invite scheme, so a
+// client older than that and one from 0.5.6 on are invisible to each other.
 const NamespaceRoot = "t"
 
 // Track names published under a participant's namespace. CatalogTrack

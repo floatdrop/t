@@ -681,6 +681,13 @@ path from a `MediaStreamTrack` to WebCodecs, so video frames are pulled off a
   versions yet, so `go.mod` carries a pseudo-version and `go get -u` will not
   move it. Update it deliberately with `go get github.com/floatdrop/moq-go@<ref>`,
   and switch to a semver version once one is published.
+- **Leaving is said, not just done.** Closing the window terminates the app, and
+  the teardown after `wailsApp.Run()` returns does not get to run when it does —
+  so nothing closed the MOQ session and the relay had no way to know anyone had
+  gone until the QUIC idle timeout expired. Measured: a peer kept showing a tile
+  for a departed participant for a full ten seconds, exactly that timeout. The
+  application's `OnShutdown` hook now leaves the room synchronously while the
+  process is still alive, which takes it to the same second.
 - **Departure detection does not rely on `NAMESPACE_DONE` alone.** moq-go's
   relay only sends it to subscribers that were already watching when the
   namespace was announced, so a peer who joined later would never hear about a

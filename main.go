@@ -120,6 +120,21 @@ func main() {
 		Assets: application.AssetOptions{
 			Handler: assetHandler(endpoint),
 		},
+		// Leave the room before the process goes, not after.
+		//
+		// Closing the window terminates the app (see the Mac option below), and
+		// the Shutdown after wailsApp.Run() below never gets to run when it
+		// does — measured: the peer kept showing a tile for a departed
+		// participant for a full ten seconds, which is exactly the QUIC idle
+		// timeout. Nothing had closed the session, so the relay had no way to
+		// know anyone had gone until it gave up waiting, and only then told
+		// the room.
+		//
+		// This hook runs synchronously on the main thread while the app is
+		// still alive, so the session closes properly and the relay reports
+		// the departure at once. Shutdown is idempotent, so the call after
+		// Run() returning stays where it is for the paths that do reach it.
+		OnShutdown: backend.Shutdown,
 		Mac: application.MacOptions{
 			ApplicationShouldTerminateAfterLastWindowClosed: true,
 		},

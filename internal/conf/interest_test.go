@@ -192,3 +192,65 @@ func TestRosterReportsWhatIsPublishedNotWhatIsSubscribed(t *testing.T) {
 		return false
 	})
 }
+
+// Turning the camera off must stop the bytes, not just the picture.
+//
+// Withdrawing a track is a claim made in the catalog, and a subscriber that
+// believed the claim while the relay kept forwarding would show a "camera off"
+// tile and go on paying full video bitrate for it — the worst of both, and
+// invisible from either end: the publisher sees a stopped camera, the
+// subscriber sees a stopped picture, and only a byte counter disagrees.
+//
+// So this asserts the two halves together: the subscriber is told the track has
+// gone, and the inbound rate actually collapses to what audio alone costs.
+func TestTurningVideoOffStopsTheInboundBytes(t *testing.T) {
+	relayServer := startRelay(t)
+	addr := relayServer.Addr()
+
+	alice := publisherWithBothTracks(t, addr, "cameraoff", "alice")
+
+	counters := telemetry.NewRegistry()
+	_, bobRec := joinRoomWithCounters(
+		t, addr, "cameraoff", "bob", counters, testLogger(t))
+	waitFor(t, "bob to subscribe to alice's tracks", 15*time.Second, func() bool {
+		_, tracks, _, _ := bobRec.snapshot()
+		return len(tracks) == 2
+	})
+
+	stop := make(chan struct{})
+	publishPaced(t, alice, stop)
+	defer close(stop)
+
+	sampler := telemetry.NewSampler(counters, nil)
+	const window = 3 * time.Second
+
+	withVideo := inboundKbps(sampler, window)
+
+	// The camera goes off: the frontend sends untrack, and this is what that
+	// reaches. Frames stop at the same moment in a real client; here the pacer
+	// keeps writing, which is deliberately the harder case — it proves the
+	// subscription went away rather than the source merely going quiet.
+	if err := alice.UndeclareTrack("video"); err != nil {
+		t.Fatalf("undeclare video: %v", err)
+	}
+
+	waitFor(t, "bob to be told the video track has gone", 15*time.Second, func() bool {
+		_, _, gone, _ := bobRec.snapshot()
+		return len(gone) > 0
+	})
+
+	audioOnly := inboundKbps(sampler, window)
+
+	saved := 100 * (1 - audioOnly/withVideo)
+	t.Logf("camera on: %.0f kbps; camera off: %.0f kbps (%.0f%% less)",
+		withVideo, audioOnly, saved)
+
+	// Video is the overwhelming majority of a participant's bitrate, so what is
+	// left should be a small fraction. Two thirds is well clear of measurement
+	// noise while still failing loudly if the subscription outlived the track.
+	if saved < 66 {
+		t.Errorf("turning the camera off saved only %.0f%% of inbound bitrate "+
+			"(%.0f -> %.0f kbps); the video subscription is still being paid for",
+			saved, withVideo, audioOnly)
+	}
+}

@@ -92,9 +92,15 @@ const CANVAS_RESIZE_INTERVAL_MS = 500;
 /**
  * Shortest gap between underrun warnings for one participant.
  *
- * An underrun arrives per render quantum's worth of starvation, so a bad
- * stretch produces a run of them; what matters is that it happened and how
- * often, not each instance. The count carried in the log is what to read.
+ * Each underrun is one distinct starvation, not one per render quantum of it:
+ * the counter sits after the preroll branch in pcm-player's process(), so it
+ * increments only on the transition into starvation and not again until the
+ * buffer has refilled and drained a second time. A count of 180 is 180 audible
+ * gaps.
+ *
+ * This throttles the log rather than the counter, and only because a bad
+ * stretch produces genuinely many of them. The number in the line is what to
+ * read; `since` says how many it stands for.
  */
 const UNDERRUN_LOG_INTERVAL_MS = 5000;
 

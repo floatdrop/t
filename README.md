@@ -2,7 +2,7 @@
   <img src="icon.svg" alt="" width="88" height="88">
 </p>
 
-# tlmst
+# t
 
 A desktop teleconference client that carries every participant's camera and
 microphone over **Media over QUIC**, using

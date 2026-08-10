@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"tlmst/internal/bridge"
+	"t/internal/bridge"
 )
 
 // Temporal layers against a relay that is actually on a network.

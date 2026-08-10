@@ -20,11 +20,11 @@ import (
 	"github.com/floatdrop/moq-go/pkg/moqt/session/wtconn"
 	"github.com/floatdrop/moq-go/pkg/moqt/uri"
 
-	"tlmst/internal/telemetry"
+	"t/internal/telemetry"
 )
 
 // implementation is the MOQT_IMPLEMENTATION SETUP option value.
-const implementation = "tlmst/0.1"
+const implementation = "t/0.1"
 
 // alpnDraft19 is the draft-19 ALPN. draft-19 SETUP carries no version
 // field, so the ALPN is the version signal (§3.1).

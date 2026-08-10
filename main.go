@@ -1,4 +1,4 @@
-// Command tlmst is a teleconference client that carries every
+// Command t is a teleconference client that carries every
 // participant's camera and microphone over Media over QUIC.
 //
 // The process is split in two halves. The WebView owns the media: it holds
@@ -26,11 +26,11 @@ import (
 	"github.com/wailsapp/wails/v3/pkg/application"
 	"github.com/wailsapp/wails/v3/pkg/events"
 
-	"tlmst/internal/app"
-	"tlmst/internal/bridge"
-	"tlmst/internal/conf"
-	"tlmst/internal/telemetry"
-	"tlmst/internal/version"
+	"t/internal/app"
+	"t/internal/bridge"
+	"t/internal/conf"
+	"t/internal/telemetry"
+	"t/internal/version"
 )
 
 //go:embed all:frontend/dist
@@ -86,7 +86,7 @@ func main() {
 	slog.SetDefault(logger)
 
 	appVersion := version.Parse(buildConfig)
-	logger.Info("starting tlmst", "version", appVersion)
+	logger.Info("starting t", "version", appVersion)
 
 	backend := app.New(logger, sink, appVersion)
 	server, err := bridge.NewServer(logger, backend)
@@ -294,7 +294,7 @@ func systemUserName() string {
 }
 
 // parseInviteURL pulls the relay and room out of an invite link —
-// tlmst://<relay>/<room>, where the relay is the authority and the room the
+// t://<relay>/<room>, where the relay is the authority and the room the
 // path. Must stay in step with buildInviteLink in frontend/src/lib/invite.ts.
 //
 // A `relay` query parameter overrides the authority. It is only present when

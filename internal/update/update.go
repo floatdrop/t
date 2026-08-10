@@ -16,7 +16,7 @@ import (
 	"net/http"
 	"time"
 
-	"tlmst/internal/version"
+	"t/internal/version"
 )
 
 // Repo is where releases are published. Not configurable: an update prompt

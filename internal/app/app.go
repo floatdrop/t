@@ -14,10 +14,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tlmst/internal/bridge"
-	"tlmst/internal/conf"
-	"tlmst/internal/telemetry"
-	"tlmst/internal/update"
+	"t/internal/bridge"
+	"t/internal/conf"
+	"t/internal/telemetry"
+	"t/internal/update"
 )
 
 // metricsInterval is how often a joined session samples transport and

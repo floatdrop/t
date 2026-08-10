@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"tlmst/internal/bridge"
-	"tlmst/internal/telemetry"
+	"t/internal/bridge"
+	"t/internal/telemetry"
 )
 
 // logSpy records what a room logged, so a test can assert on a signal whose

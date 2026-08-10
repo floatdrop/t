@@ -8,7 +8,7 @@
         <key>CFBundleExecutable</key>
             <string>t</string>
         <key>CFBundleIdentifier</key>
-            <string>ru.yandex.tlmst</string>
+            <string>ru.yandex.t</string>
         <key>CFBundleVersion</key>
             <string>0.5.5</string>
         <key>CFBundleGetInfoString</key>

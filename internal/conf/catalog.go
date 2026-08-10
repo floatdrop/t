@@ -10,14 +10,14 @@ import (
 
 	"github.com/floatdrop/moq-go/pkg/moqt/msf"
 
-	"tlmst/internal/bridge"
+	"t/internal/bridge"
 )
 
 // catalogNicknameKey is the catalog-root extra field carrying the
 // publisher's display name. MSF has no nickname concept, and §5.1 lets
 // producers add their own root fields, so the participant's name rides
 // there rather than being forced into a track label.
-const catalogNicknameKey = "tlmstNickname"
+const catalogNicknameKey = "tNickname"
 
 // catalogVersionKey is the catalog-root extra field carrying the build the
 // publisher is running, on the same §5.1 producer-extension footing as the
@@ -27,7 +27,7 @@ const catalogNicknameKey = "tlmstNickname"
 // participant already reads about every other participant, and because it costs
 // nothing when absent: a peer on an older build simply omits the field, and the
 // roster shows no version for them rather than a wrong one.
-const catalogVersionKey = "tlmstVersion"
+const catalogVersionKey = "tVersion"
 
 // catalogOSKey is the catalog-root extra naming the operating system the
 // publisher is running on, as a §5.6.6 producer field beside the version.
@@ -38,7 +38,7 @@ const catalogVersionKey = "tlmstVersion"
 // platform someone is on is the other half of "is it just me?" — WebKit,
 // WebView2 and WebKitGTK are three different engines wearing one API, and a
 // fault that only appears on one of them is otherwise invisible from the room.
-const catalogOSKey = "tlmstOS"
+const catalogOSKey = "tOS"
 
 // PlatformName is the operating system this build runs on, in the spelling a
 // person would use. Taken from the build rather than asked of the WebView: the

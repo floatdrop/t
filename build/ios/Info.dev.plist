@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>tlmst</string>
+    <string>t</string>
     <key>CFBundleIdentifier</key>
-    <string>ru.yandex.tlmst.dev</string>
+    <string>ru.yandex.t.dev</string>
     <key>CFBundleName</key>
     <string>My Product (Dev)</string>
     <key>CFBundleDisplayName</key>

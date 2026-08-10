@@ -7,7 +7,7 @@ package main
 
 // Returns 1 when the delegate method was installed, 0 when it was already
 // present or the class could not be found.
-int tlmstGrantMediaCapture(void);
+int tGrantMediaCapture(void);
 */
 import "C"
 
@@ -35,7 +35,7 @@ import "log/slog"
 // either device without them, so the app has to run from its .app bundle
 // (`wails3 task run`), not as a bare binary.
 func grantWebViewMediaCapture(log *slog.Logger) {
-	if C.tlmstGrantMediaCapture() == 1 {
+	if C.tGrantMediaCapture() == 1 {
 		log.Debug("installed WebView media-capture permission handler")
 		return
 	}

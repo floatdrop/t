@@ -16,7 +16,7 @@
 // Point one participant at it and leave the others on the relay directly:
 //
 //	go run ./cmd/shaper -relay 51.250.12.228:4433 -rate 55000
-//	bin/tlmst.dev.app/Contents/MacOS/tlmst \
+//	bin/t.dev.app/Contents/MacOS/t \
 //	    -relay https://127.0.0.1:14433/moq -room demo -nickname bob -join -debug
 //
 // Rate is the whole experiment. Around half what the publisher offers is where

@@ -24,8 +24,8 @@ import (
 	"github.com/floatdrop/moq-go/pkg/moqt/session/quicconn"
 	"github.com/floatdrop/moq-go/pkg/relay"
 
-	"tlmst/internal/bridge"
-	"tlmst/internal/telemetry"
+	"t/internal/bridge"
+	"t/internal/telemetry"
 )
 
 // recorder is a conf.Sink that captures everything a Room delivers, so a
@@ -273,7 +273,7 @@ func selfSignedCert(t *testing.T) tls.Certificate {
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "tlmst-test"},
+		Subject:      pkix.Name{CommonName: "t-test"},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(time.Hour),
 		IPAddresses:  []net.IP{net.IPv4(127, 0, 0, 1)},

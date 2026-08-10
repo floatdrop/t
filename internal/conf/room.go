@@ -16,8 +16,8 @@ import (
 	"github.com/floatdrop/moq-go/pkg/moqt/session"
 	"github.com/floatdrop/moq-go/pkg/moqt/wire"
 
-	"tlmst/internal/bridge"
-	"tlmst/internal/telemetry"
+	"t/internal/bridge"
+	"t/internal/telemetry"
 )
 
 // Sink is where a Room delivers inbound media and control updates —

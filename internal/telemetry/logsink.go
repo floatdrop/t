@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"tlmst/internal/bridge"
+	"t/internal/bridge"
 )
 
 // logRingSize is how many recent records the sink keeps so a frontend

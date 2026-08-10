@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"tlmst/internal/bridge"
-	"tlmst/internal/telemetry"
+	"t/internal/bridge"
+	"t/internal/telemetry"
 )
 
 // retired reports whether the backend told the frontend to drop this handle.

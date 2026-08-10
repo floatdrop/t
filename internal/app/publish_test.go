@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"tlmst/internal/bridge"
+	"t/internal/bridge"
 )
 
 // The bridge's read goroutine must never wait on a publish.

@@ -1,4 +1,4 @@
-// Package version reports which build of tlmst is running.
+// Package version reports which build of t is running.
 //
 // The version lives in build/config.yml, which is what the packaging reads
 // when it stamps the macOS bundle and names the release archives. This package

@@ -21,7 +21,7 @@ static void grantCapture(id self, SEL _cmd, WKWebView *webView,
     decisionHandler(kPermissionDecisionGrant);
 }
 
-int tlmstGrantMediaCapture(void) {
+int tGrantMediaCapture(void) {
     // Wails names its WKUIDelegate class WebviewWindowDelegate. It is
     // compiled into this binary, so the runtime already knows it by the
     // time main runs.

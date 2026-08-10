@@ -15,8 +15,8 @@ import (
 	"github.com/floatdrop/moq-go/pkg/moqt/session"
 	"github.com/floatdrop/moq-go/pkg/moqt/wire"
 
-	"tlmst/internal/bridge"
-	"tlmst/internal/telemetry"
+	"t/internal/bridge"
+	"t/internal/telemetry"
 )
 
 // ErrNoPublication reports a frame for a track that was never published.

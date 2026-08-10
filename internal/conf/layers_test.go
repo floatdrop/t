@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"tlmst/internal/bridge"
+	"t/internal/bridge"
 )
 
 // A publisher that actually emits temporal layers.

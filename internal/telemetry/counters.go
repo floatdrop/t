@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tlmst/internal/bridge"
+	"t/internal/bridge"
 )
 
 // TrackCounter accumulates traffic for one MOQ track. Publishers and

@@ -3,7 +3,7 @@ package conf
 import (
 	"testing"
 
-	"tlmst/internal/bridge"
+	"t/internal/bridge"
 )
 
 // The version has to survive the round trip it actually makes — built into a

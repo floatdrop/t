@@ -111,8 +111,8 @@ jobs:
           # A hardened runtime and a timestamp are both prerequisites for
           # notarization, so they are applied whether or not it runs.
           codesign --force --deep --options runtime --timestamp \
-            --sign "$MACOS_SIGNING_IDENTITY" bin/tlmst.app
-          codesign --verify --deep --strict --verbose=2 bin/tlmst.app
+            --sign "$MACOS_SIGNING_IDENTITY" bin/t.app
+          codesign --verify --deep --strict --verbose=2 bin/t.app
 
       # Signing alone still leaves a first-run warning; only notarization
       # removes it. Separate from the step above so a repository can sign
@@ -128,7 +128,7 @@ jobs:
           MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
         run: |
           set -euo pipefail
-          ditto -c -k --keepParent bin/tlmst.app "$RUNNER_TEMP/notarize.zip"
+          ditto -c -k --keepParent bin/t.app "$RUNNER_TEMP/notarize.zip"
           xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
             --apple-id "$MACOS_NOTARY_APPLE_ID" \
             --password "$MACOS_NOTARY_PASSWORD" \
@@ -136,7 +136,7 @@ jobs:
             --wait
           # Staple so the bundle validates offline, on a machine that has
           # never asked Apple about it.
-          xcrun stapler staple bin/tlmst.app
+          xcrun stapler staple bin/t.app
 
       - name: Archive the macOS app bundle
         if: runner.os == 'macOS'
@@ -145,8 +145,8 @@ jobs:
           # ditto, not zip: it preserves the symlinks and extended attributes
           # a .app depends on — including the signature, which plain zip
           # mangles.
-          ditto -c -k --keepParent tlmst.app \
-            "tlmst-${{ steps.version.outputs.version }}-macos-universal.zip"
+          ditto -c -k --keepParent t.app \
+            "t-${{ steps.version.outputs.version }}-macos-universal.zip"
 
       # ---- Linux ------------------------------------------------------
       - name: Build the Linux binary
@@ -156,7 +156,7 @@ jobs:
       - name: Archive the Linux binary
         if: runner.os == 'Linux'
         working-directory: bin
-        run: tar -czf "tlmst-${{ steps.version.outputs.version }}-linux-amd64.tar.gz" tlmst
+        run: tar -czf "t-${{ steps.version.outputs.version }}-linux-amd64.tar.gz" t
 
       # ---- Windows ----------------------------------------------------
       - name: Build the Windows binary
@@ -180,7 +180,7 @@ jobs:
           # A timestamp keeps the signature valid past the certificate's own
           # expiry, which matters for anything users keep installed.
           wails3 tool sign \
-            --input bin/tlmst.exe \
+            --input bin/t.exe \
             --certificate "$pfx" \
             --password "$WINDOWS_CERTIFICATE_PASSWORD" \
             --timestamp http://timestamp.digicert.com
@@ -190,8 +190,8 @@ jobs:
         working-directory: bin
         shell: pwsh
         run: |
-          Compress-Archive -Path tlmst.exe `
-            -DestinationPath "tlmst-${{ steps.version.outputs.version }}-windows-amd64.zip"
+          Compress-Archive -Path t.exe `
+            -DestinationPath "t-${{ steps.version.outputs.version }}-windows-amd64.zip"
 
       # ---- checksums and upload ---------------------------------------
       #
@@ -215,7 +215,7 @@ jobs:
       - name: Upload the artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: tlmst-${{ matrix.name }}
+          name: t-${{ matrix.name }}
           if-no-files-found: error
           path: |
             bin/*.zip

@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * The tlmst mark.
+   * The mark.
    *
    * The same drawing as icon.svg, redrawn here against the design tokens
    * instead of hardcoded hex: that file has to stand alone as an app icon
@@ -21,7 +21,7 @@
   height={size}
   viewBox="0 0 64 64"
   role="img"
-  aria-label="tlmst"
+  aria-label="t"
   xmlns="http://www.w3.org/2000/svg"
 >
   <rect width="64" height="64" rx="15" fill="var(--bg-raised)" />

@@ -1,4 +1,4 @@
-name: Set up the tlmst build environment
+name: Set up the t build environment
 description: >-
   Installs Go, Node, the wails3 CLI, and any platform build dependencies, then
   builds the frontend so the Go embed resolves. The caller must have checked

@@ -20,9 +20,9 @@
   import { store } from '../lib/session.svelte';
   import Logo from './Logo.svelte';
 
-  const RELAY_KEY = 'tlmst.relay';
-  const NICK_KEY = 'tlmst.nickname';
-  const ROOM_KEY = 'tlmst.room';
+  const RELAY_KEY = 't.relay';
+  const NICK_KEY = 't.nickname';
+  const ROOM_KEY = 't.room';
 
   /** Where calls go unless told otherwise. */
   const DEFAULT_RELAY = 'https://t.tel.yandex.net/';
@@ -234,7 +234,7 @@
   >
     <div class="hero">
       <Logo size={72} />
-      <h1>tlmst</h1>
+      <h1>t</h1>
       <p>Teleconferencing over Media over QUIC</p>
       <!-- Under the mark rather than tucked in a corner: the first thing
            anyone is asked for when a call misbehaves is which build they are

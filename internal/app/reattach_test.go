@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"tlmst/internal/bridge"
-	"tlmst/internal/conf"
+	"t/internal/bridge"
+	"t/internal/conf"
 )
 
 // heldRoom is a Room that is never dereferenced: these tests are about whether

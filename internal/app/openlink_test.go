@@ -5,9 +5,9 @@ import (
 	"log/slog"
 	"testing"
 
-	"tlmst/internal/bridge"
-	"tlmst/internal/telemetry"
-	"tlmst/internal/update"
+	"t/internal/bridge"
+	"t/internal/telemetry"
+	"t/internal/update"
 )
 
 func newTestApp(t *testing.T) *App {

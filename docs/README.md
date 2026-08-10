@@ -1,4 +1,4 @@
-# tlmst internals
+# t internals
 
 The long-form companion to the [top-level README](../README.md): how the media
 is named, carried and kept in sync, what each decision cost before it was made,
@@ -398,7 +398,7 @@ build.
 
 The welcome screen shows it under the mark, and the debug drawer's **Session**
 card repeats it. Every participant's version also travels in their catalog, as a
-`tlmstVersion` root field beside the nickname — the same §5.1 producer extension,
+`tVersion` root field beside the nickname — the same §5.1 producer extension,
 for the same reason: it is the one thing every participant already reads about
 every other participant. The drawer's **Participants** table lists the room's
 builds side by side, ourselves first, which is the view that answers "is it just
@@ -518,7 +518,7 @@ that means registering the bundle once:
 ```
 
 Windows and Linux need their own registration — registry keys written by an
-installer, and `MimeType=x-scheme-handler/tlmst` in the `.desktop` file — neither
+installer, and `MimeType=x-scheme-handler/t` in the `.desktop` file — neither
 of which is wired up yet.
 
 ## Debug panels

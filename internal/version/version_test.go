@@ -28,7 +28,7 @@ func TestParse(t *testing.T) {
 	const doc = `version: '3'
 
 info:
-  productName: "tlmst"
+  productName: "t"
   version: "1.4.2" # The application version
 
 # ios:

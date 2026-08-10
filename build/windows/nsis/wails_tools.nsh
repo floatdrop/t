@@ -5,7 +5,7 @@
 !include "FileFunc.nsh"
 
 !ifndef INFO_PROJECTNAME
-    !define INFO_PROJECTNAME "tlmst"
+    !define INFO_PROJECTNAME "t"
 !endif
 !ifndef INFO_COMPANYNAME
     !define INFO_COMPANYNAME "Yandex LLC"

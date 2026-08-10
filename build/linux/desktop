@@ -1,13 +1,13 @@
 [Desktop Entry]
 Version=1.0
 Name=My Product
-Comment=A tlmst application
+Comment=A t application
 # The Exec line includes %u to pass the URL to the application
-Exec=/usr/local/bin/tlmst %u
+Exec=/usr/local/bin/t %u
 Terminal=false
 Type=Application
-Icon=tlmst
+Icon=t
 Categories=Utility;
-StartupWMClass=tlmst
+StartupWMClass=t
 
  

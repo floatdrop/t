@@ -234,6 +234,11 @@
   >
     <div class="hero">
       <Logo size={72} />
+      <!-- Not drawn: the mark is the wordmark, and a "t" under a logo that
+           already spells "t." is the same thing said twice. Kept in the
+           document because a page still needs a heading to navigate by, and
+           because the mark beside it is decorative — between them exactly one
+           thing announces the name. -->
       <h1>t</h1>
       <p>Teleconferencing over Media over QUIC</p>
       <!-- Under the mark rather than tucked in a corner: the first thing
@@ -487,10 +492,19 @@
     margin-bottom: 4px;
   }
 
+  /* Present for assistive technology and absent from the layout: clipped to
+     nothing rather than display:none, which would take it out of the
+     accessibility tree along with the pixels. */
   h1 {
-    margin: 0;
-    font-size: 22px;
-    letter-spacing: -0.01em;
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
   }
 
   .hero p {

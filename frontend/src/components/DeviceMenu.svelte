@@ -9,12 +9,11 @@
    * Switching rebuilds only the local capture pipeline — the MOQ publications
    * stay open — so a swap costs a keyframe, not a rejoin.
    */
-  // Imported one icon at a time rather than from the barrel, so only the seven
+  // Imported one icon at a time rather than from the barrel, so only the six
   // that are used reach the bundle.
   import Mic from '@lucide/svelte/icons/mic';
   import MicOff from '@lucide/svelte/icons/mic-off';
   import ScreenShare from '@lucide/svelte/icons/screen-share';
-  import ScreenShareOff from '@lucide/svelte/icons/screen-share-off';
   import Settings2 from '@lucide/svelte/icons/settings-2';
   import Video from '@lucide/svelte/icons/video';
   import VideoOff from '@lucide/svelte/icons/video-off';
@@ -170,19 +169,23 @@
   </button>
 
   <button
-    class="track"
-    class:off={!store.sharingScreen}
+    class="track share"
+    class:idle={!store.sharingScreen}
     aria-label="Share screen"
     aria-pressed={store.sharingScreen}
     disabled={busy}
     onclick={toggleScreen}
     title={store.sharingScreen ? 'Stop sharing the screen' : 'Share the screen'}
   >
-    {#if store.sharingScreen}
-      <ScreenShare size={ICON_SIZE} />
-    {:else}
-      <ScreenShareOff size={ICON_SIZE} />
-    {/if}
+    <!-- Always the sharing glyph, never the crossed-out one. Mic and camera
+         show their current state because "muted" is what you need to see at a
+         glance; this button is not sharing almost all the time, and drawing
+         that as a struck-through icon made the normal state look broken and
+         the control look unavailable. Whether it is active is carried by the
+         accent and by aria-pressed. A little larger than the others because
+         the glyph has more in it — a monitor and an arrow, against a
+         silhouette — and loses legibility first. -->
+    <ScreenShare size={ICON_SIZE + 2} />
   </button>
 
   <div class="wrap">
@@ -297,6 +300,28 @@
   .track,
   .devices {
     min-height: calc(1.5em + 16px);
+  }
+
+  /* And as wide as they are tall. The width used to come from the glyph plus
+     padding — 15px and 7px either side — while the height came from the line
+     box above, so every one of them was a rounded rectangle about six pixels
+     taller than it was wide, and the three of them in a row made that obvious.
+     Centring inside the square keeps a wider glyph from pushing the box out. */
+  .track {
+    min-width: calc(1.5em + 16px);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* Not sharing is the ordinary state of this control, not a switched-off one.
+     .off is for a microphone or camera that has been muted, which is something
+     the user wants to notice; wearing it here left the button permanently
+     faint, reading as unavailable rather than as ready. */
+  .track.idle {
+    border-color: var(--border-strong);
+    background: var(--bg-raised);
+    color: var(--text);
   }
 
   .track.off {

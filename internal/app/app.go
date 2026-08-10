@@ -238,12 +238,48 @@ type publishPump struct {
 
 	mu      sync.Mutex
 	lastLog time.Time
-	log     *slog.Logger
-	kind    string
+	// gapped means the backlog was shed and nothing may be published until a
+	// keyframe arrives to start a group the subscriber can decode. Only a
+	// coherent pump ever sets it.
+	gapped bool
+
+	log  *slog.Logger
+	kind string
+	// coherent marks a medium whose frames depend on one another, so shedding
+	// cannot simply take the oldest.
+	coherent bool
+	// onGap asks the local encoder for a keyframe, so resuming waits on the
+	// encoder rather than on the next scheduled one.
+	onGap func()
 }
 
-// offer queues a frame, discarding the oldest to make room rather than waiting.
+// offer queues a frame without waiting, shedding if it must.
+//
+// How it sheds is the whole of it. Audio packets stand alone, so the oldest is
+// simply worth least and goes. Video frames do not: dropping one out of the
+// middle of a group leaves every frame after it referencing something the
+// subscriber never received, and H.264 does not report that — it draws it,
+// as macroblock smear, until the next keyframe.
+//
+// So a video pump under pressure drops the whole backlog and resumes on a
+// keyframe, which it asks for immediately. That is a visible cut and then
+// clean video, against a continuous stream of frames that cannot be decoded.
+// It is the same choice the publisher makes when a base-layer write fails, and
+// the same one reassembly makes on the receive side: shed whole, never punch a
+// hole.
 func (p *publishPump) offer(f *bridge.MediaFrame) {
+	if !p.admit(f) {
+		p.dropped.Add(1)
+		return
+	}
+	if p.coherent {
+		select {
+		case p.frames <- f:
+		default:
+			p.shed()
+		}
+		return
+	}
 	for {
 		select {
 		case p.frames <- f:
@@ -252,17 +288,61 @@ func (p *publishPump) offer(f *bridge.MediaFrame) {
 		}
 		select {
 		case <-p.frames:
-			p.note()
+			p.dropped.Add(1)
+			p.warn()
 		default:
 		}
 	}
 }
 
-// note counts a discard and says so occasionally. Loss here is this client
-// failing to publish what its own camera produced, which no counter on the
-// receive side can distinguish from a quiet participant.
-func (p *publishPump) note() {
-	n := p.dropped.Add(1)
+// admit reports whether a frame may be queued, ending a gap when the keyframe
+// that can start a fresh group arrives.
+func (p *publishPump) admit(f *bridge.MediaFrame) bool {
+	if !p.coherent {
+		return true
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.gapped {
+		return true
+	}
+	if !f.KeyFrame {
+		return false
+	}
+	p.gapped = false
+	return true
+}
+
+// shed empties the queue and waits for a keyframe, counting everything it threw
+// away and asking the encoder to make the wait short.
+func (p *publishPump) shed() {
+drain:
+	for {
+		select {
+		case <-p.frames:
+			p.dropped.Add(1)
+		default:
+			break drain
+		}
+	}
+	// The frame that would not fit goes too: it belongs to the group just
+	// abandoned.
+	p.dropped.Add(1)
+
+	p.mu.Lock()
+	p.gapped = true
+	p.mu.Unlock()
+
+	p.warn()
+	if p.onGap != nil {
+		p.onGap()
+	}
+}
+
+// warn says occasionally that frames are being dropped. Loss here is this
+// client failing to publish what its own camera produced, which no counter on
+// the receive side can distinguish from a participant who went quiet.
+func (p *publishPump) warn() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if time.Since(p.lastLog) < publishDropInterval {
@@ -270,7 +350,7 @@ func (p *publishPump) note() {
 	}
 	p.lastLog = time.Now()
 	p.log.Warn("dropping frames on the way to the relay; the uplink is behind",
-		"kind", p.kind, "dropped", n)
+		"kind", p.kind, "dropped", p.dropped.Load())
 }
 
 // runPublishPump writes queued frames until ctx ends.
@@ -496,8 +576,8 @@ func (a *App) installRoom(ctx context.Context, room *conf.Room) {
 	// One set of pumps per room, on the same lifetime as the metrics sampler:
 	// a frame queued for a session that has ended is not worth carrying into
 	// the next one, which starts from a keyframe anyway.
-	video := newPublishPump(a.log, "video", publishVideoDepth)
-	audio := newPublishPump(a.log, "audio", publishAudioDepth)
+	video := newPublishPump(a.log, "video", publishVideoDepth, true, a.requestKeyFrame)
+	audio := newPublishPump(a.log, "audio", publishAudioDepth, false, nil)
 
 	a.mu.Lock()
 	previous := a.stopMet
@@ -515,11 +595,19 @@ func (a *App) installRoom(ctx context.Context, room *conf.Room) {
 	go a.runPublishPump(metCtx, room, audio)
 }
 
-func newPublishPump(log *slog.Logger, kind string, depth int) *publishPump {
+func newPublishPump(
+	log *slog.Logger,
+	kind string,
+	depth int,
+	coherent bool,
+	onGap func(),
+) *publishPump {
 	return &publishPump{
-		frames: make(chan *bridge.MediaFrame, depth),
-		log:    log,
-		kind:   kind,
+		frames:   make(chan *bridge.MediaFrame, depth),
+		log:      log,
+		kind:     kind,
+		coherent: coherent,
+		onGap:    onGap,
 	}
 }
 

@@ -292,7 +292,10 @@ type Participant struct {
 	Nickname string `json:"nickname"`
 	// Version is the build they are running, or empty from a peer old
 	// enough not to publish one.
-	Version  string `json:"version,omitempty"`
+	Version string `json:"version,omitempty"`
+	// OS is the operating system they are on — "macOS", "Windows", "Linux" —
+	// or empty from a peer old enough not to publish one.
+	OS       string `json:"os,omitempty"`
 	HasVideo bool   `json:"hasVideo"`
 	HasAudio bool   `json:"hasAudio"`
 	// VideoLevel is how much of their video this client is still taking:
@@ -412,6 +415,11 @@ type Endpoint struct {
 	// before any session exists, and this descriptor is already the first
 	// thing the frontend fetches.
 	Version string `json:"version,omitempty"`
+	// OS is the operating system this build runs on, for our own row in the
+	// roster. Every other row gets one from its publisher's catalog, and a
+	// table where the one machine we know for certain is the blank row would
+	// be a strange thing to ship.
+	OS string `json:"os,omitempty"`
 }
 
 func (e Endpoint) JSON() []byte {

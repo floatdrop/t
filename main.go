@@ -28,6 +28,7 @@ import (
 
 	"tlmst/internal/app"
 	"tlmst/internal/bridge"
+	"tlmst/internal/conf"
 	"tlmst/internal/telemetry"
 	"tlmst/internal/version"
 )
@@ -107,6 +108,7 @@ func main() {
 	// The frontend reads this before anything else, which makes it the
 	// earliest place the welcome screen can learn what build it is part of.
 	endpoint.Version = appVersion
+	endpoint.OS = conf.PlatformName()
 	logger.Info("bridge listening", "url", endpoint.URL)
 
 	// grantWebViewMediaCapture must run before any window exists: it

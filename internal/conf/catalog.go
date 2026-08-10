@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"strconv"
 	"time"
 
@@ -27,6 +28,34 @@ const catalogNicknameKey = "tlmstNickname"
 // nothing when absent: a peer on an older build simply omits the field, and the
 // roster shows no version for them rather than a wrong one.
 const catalogVersionKey = "tlmstVersion"
+
+// catalogOSKey is the catalog-root extra naming the operating system the
+// publisher is running on, as a §5.6.6 producer field beside the version.
+//
+// It rides with the version for the same reason and at the same cost: it is
+// something every participant already reads about every other participant, and
+// a peer that omits it simply shows nothing rather than showing a guess. Which
+// platform someone is on is the other half of "is it just me?" — WebKit,
+// WebView2 and WebKitGTK are three different engines wearing one API, and a
+// fault that only appears on one of them is otherwise invisible from the room.
+const catalogOSKey = "tlmstOS"
+
+// PlatformName is the operating system this build runs on, in the spelling a
+// person would use. Taken from the build rather than asked of the WebView: the
+// Go side knows for certain, where navigator's answer is a string the browser
+// chooses and has been steadily degrading for privacy.
+func PlatformName() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "macOS"
+	case "windows":
+		return "Windows"
+	case "linux":
+		return "Linux"
+	default:
+		return runtime.GOOS
+	}
+}
 
 // audioInitRef is the initDataList ID linking the audio track to its
 // codec configuration payload (§5.1.7).
@@ -97,6 +126,7 @@ func buildCatalog(nickname, version string, video, audio *bridge.TrackConfig) (m
 	if version != "" {
 		cat.Extras[catalogVersionKey] = version
 	}
+	cat.Extras[catalogOSKey] = PlatformName()
 
 	if err := cat.Validate(); err != nil {
 		return msf.Catalog{}, fmt.Errorf("conf: build catalog: %w", err)
@@ -121,8 +151,11 @@ type parsedCatalog struct {
 	// Version is the build the publisher is running, or empty from a peer
 	// old enough not to say.
 	Version string
-	Video   *bridge.TrackConfig
-	Audio   *bridge.TrackConfig
+	// OS is the operating system the publisher is on, empty from a peer old
+	// enough not to say.
+	OS    string
+	Video *bridge.TrackConfig
+	Audio *bridge.TrackConfig
 	// Complete reports the §11.3 terminator catalog — the publisher has
 	// ended the broadcast and every track is done.
 	Complete bool
@@ -144,6 +177,9 @@ func parseCatalog(payload []byte) (parsedCatalog, error) {
 	}
 	if v, ok := cat.Extras[catalogVersionKey].(string); ok {
 		out.Version = v
+	}
+	if v, ok := cat.Extras[catalogOSKey].(string); ok {
+		out.OS = v
 	}
 
 	// initDataList entries are referenced by ID from the tracks below.

@@ -82,6 +82,8 @@ export interface RemoteView {
   nickname: string;
   /** The build they are running, empty from a peer that does not publish one. */
   version: string;
+  /** Their operating system, empty from a peer that does not publish one. */
+  os: string;
   videoHandle: number | null;
   /** How much of their video we are taking — see Participant.videoLevel. */
   videoLevel: string;
@@ -184,6 +186,8 @@ class Store {
    * itself. Set from the status callback, which fires after the fetch.
    */
   version = $state('');
+  /** The operating system this build runs on, from the bridge descriptor. */
+  os = $state('');
 
   /** True while the local microphone is picking up speech. */
   speaking = $state(false);
@@ -212,6 +216,7 @@ class Store {
         id: p.id,
         nickname: p.nickname || video?.nickname || audio?.nickname || p.id,
         version: p.version ?? '',
+        os: p.os ?? '',
         videoHandle: video?.handle ?? null,
         videoLevel: p.videoLevel ?? 'full',
         audioHandle: audio?.handle ?? null,
@@ -227,18 +232,26 @@ class Store {
    * and an answer that omits the person asking is one subtraction away from
    * useless — comparing your own build against the room is the entire point.
    */
-  get roster(): { id: string; nickname: string; version: string; self: boolean }[] {
+  get roster(): {
+    id: string;
+    nickname: string;
+    version: string;
+    os: string;
+    self: boolean;
+  }[] {
     return [
       {
         id: this.session.id ?? '',
         nickname: this.session.nickname || 'me',
         version: this.version,
+        os: this.os,
         self: true,
       },
       ...this.remotes.map((r) => ({
         id: r.id,
         nickname: r.nickname,
         version: r.version,
+        os: r.os,
         self: false,
       })),
     ];
@@ -250,6 +263,7 @@ class Store {
       this.connected = connected;
       // The descriptor has been fetched by the time the socket is open.
       if (connected && bridge.version) this.version = bridge.version;
+      if (connected && bridge.os) this.os = bridge.os;
       if (!connected) {
         // The backend is gone: its session and every decoder that fed
         // from it are void.

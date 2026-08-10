@@ -177,6 +177,7 @@ type remote struct {
 	catalogAudio bool
 	nickname     string
 	version      string
+	os           string
 	video        *remoteTrack
 	audio        *remoteTrack
 	// level is how much of this participant's video is still being asked for,
@@ -568,6 +569,7 @@ func (r *remote) onCatalog(group uint64, payload []byte) {
 	if cat.Nickname != "" {
 		r.nickname = cat.Nickname
 		r.version = cat.Version
+		r.os = cat.OS
 	}
 	// §11.3 Complete means they have ended the broadcast, so it declares
 	// nothing whatever the track fields say.
@@ -1333,6 +1335,7 @@ func (r *remote) participant() bridge.Participant {
 		ID:       r.id,
 		Nickname: r.nickname,
 		Version:  r.version,
+		OS:       r.os,
 		HasVideo: r.catalogVideo,
 		HasAudio: r.catalogAudio,
 		// What we are actually taking, which HasVideo above deliberately does

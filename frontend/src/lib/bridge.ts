@@ -46,6 +46,7 @@ export class Bridge {
    * same answer whether or not a room was ever joined.
    */
   version = '';
+  os = '';
 
   /** Opens the connection and keeps it open until close(). */
   async start(): Promise<void> {
@@ -123,6 +124,7 @@ export class Bridge {
         // exists — the welcome screen shows the version without waiting for
         // a room.
         this.version = this.#endpoint.version ?? '';
+        this.os = this.#endpoint.os ?? '';
       }
       const url = `${this.#endpoint.url}?token=${encodeURIComponent(this.#endpoint.token)}`;
       const ws = new WebSocket(url);

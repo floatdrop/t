@@ -193,6 +193,8 @@ export interface Participant {
    * this tells them apart.
    */
   videoLevel?: string;
+  /** Their operating system, absent from a peer old enough not to say. */
+  os?: string;
 }
 
 /** A released version newer than the one running. */
@@ -307,6 +309,8 @@ export interface Endpoint {
   token: string;
   /** The build the backend — and so this frontend — was packaged as. */
   version?: string;
+  /** The operating system it runs on, for our own row in the roster. */
+  os?: string;
 }
 
 /**

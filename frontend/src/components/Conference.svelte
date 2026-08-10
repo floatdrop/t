@@ -64,6 +64,20 @@
    */
   const LOSS_DEGRADED_PERCENT = 2;
 
+  /**
+   * Round trip above which the link reads as degraded, whatever else is going
+   * well.
+   *
+   * Loss was the only thing this dot watched, and a session can be lossless and
+   * still be a poor call: latency is what makes people talk over each other,
+   * and nothing about the picture or the counters gives it away. G.114 puts the
+   * limit of comfortable conversation at 150 ms one way, which is 300 ms of
+   * round trip; this sits a little under that so the dot turns before the call
+   * becomes the thing being discussed rather than after. A cellular uplink
+   * clears it easily.
+   */
+  const RTT_DEGRADED_MS = 250;
+
   const health = $derived.by(() => {
     if (!store.connected) {
       return { level: 'down', label: 'Backend disconnected' };
@@ -82,7 +96,10 @@
     if (loss >= LOSS_DEGRADED_PERCENT) {
       return { level: 'degraded', label: `Connected · ${loss.toFixed(1)}% packet loss` };
     }
-    const rtt = store.metrics?.rttMs;
+    const rtt = store.metrics?.rttMs ?? 0;
+    if (rtt >= RTT_DEGRADED_MS) {
+      return { level: 'degraded', label: `Connected · ${rtt.toFixed(0)} ms round trip` };
+    }
     return {
       level: 'ok',
       label: rtt ? `Connected · ${rtt.toFixed(0)} ms round trip` : 'Connected',

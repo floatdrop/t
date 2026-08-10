@@ -6,7 +6,38 @@
    * carrying bytes while its decoder sits at 0 fps means the trouble is in
    * the WebView, not the network.
    */
+  import Command from '@lucide/svelte/icons/command';
+  import Grid2x2 from '@lucide/svelte/icons/grid-2x2';
+  import Monitor from '@lucide/svelte/icons/monitor';
+  import Terminal from '@lucide/svelte/icons/terminal';
+  import { ICON_SIZE } from '../../lib/icons';
   import { store } from '../../lib/session.svelte';
+
+  /**
+   * The mark for an operating system.
+   *
+   * lucide dropped its brand icons, so there is no Apple, Windows or Tux to
+   * reach for. These are the glyphs each platform is idiomatically drawn with
+   * instead — the command key, four panes, a terminal — and every one carries
+   * the name as its title, so the association never has to be guessed at and a
+   * screen reader gets the word rather than the picture.
+   *
+   * A peer that published no OS gets the neutral monitor and the word
+   * "unknown", which is the honest answer for a build from before this
+   * existed.
+   */
+  function osIcon(os: string) {
+    switch (os) {
+      case 'macOS':
+        return Command;
+      case 'Windows':
+        return Grid2x2;
+      case 'Linux':
+        return Terminal;
+      default:
+        return Monitor;
+    }
+  }
 
   const tracks = $derived(store.metrics?.tracks ?? []);
   const outbound = $derived(tracks.filter((t) => t.label.startsWith('out/')));
@@ -43,6 +74,7 @@
         <tr>
           <th scope="col">Participant</th>
           <th scope="col">ID</th>
+          <th scope="col" class="os">OS</th>
           <th scope="col" class="num">Version</th>
         </tr>
       </thead>
@@ -50,9 +82,13 @@
         <!-- Our own row keys on a name no participant can have: ids are hex,
              and ours is empty until a room is joined. -->
         {#each store.roster as peer (peer.self ? 'self' : peer.id)}
+          {@const OsIcon = osIcon(peer.os)}
           <tr class:self={peer.self}>
             <td>{peer.nickname}{peer.self ? ' (you)' : ''}</td>
             <td class="mono">{peer.id || '—'}</td>
+            <td class="os" title={peer.os || 'unknown'} aria-label={peer.os || 'unknown'}>
+              <OsIcon size={ICON_SIZE} />
+            </td>
             <!-- An em dash rather than a guess: a peer that publishes no
                  version is on a build from before this existed, which is
                  itself the answer. -->
@@ -112,7 +148,12 @@
   <section>
     <h3>Published tracks</h3>
     {#if outbound.length}
-      <table>
+      <div class="scroll-x">
+      <table class="fixed">
+        <colgroup>
+          <col style="width: 132px" /><col style="width: 56px" />
+          <col style="width: 68px" /><col style="width: 62px" />
+        </colgroup>
         <thead>
           <tr>
             <th scope="col">Track</th><th scope="col">kbps</th>
@@ -122,7 +163,7 @@
         <tbody>
           {#each outbound as t (t.label)}
             <tr>
-              <th scope="row">{t.label.slice(4)}</th>
+              <th scope="row" title={t.label}>{t.label.slice(4)}</th>
               <td>{Math.round(t.kbps)}</td>
               <td>{t.objects}</td>
               <td>{t.groups}</td>
@@ -130,6 +171,7 @@
           {/each}
         </tbody>
       </table>
+      </div>
     {:else}
       <p class="empty">Nothing published yet.</p>
     {/if}
@@ -138,7 +180,13 @@
   <section>
     <h3>Subscribed tracks</h3>
     {#if inbound.length}
-      <table>
+      <div class="scroll-x">
+      <table class="fixed">
+        <colgroup>
+          <col style="width: 132px" /><col style="width: 56px" />
+          <col style="width: 68px" /><col style="width: 62px" />
+          <col style="width: 78px" /><col style="width: 70px" />
+        </colgroup>
         <thead>
           <tr>
             <th scope="col">Track</th><th scope="col">kbps</th>
@@ -157,7 +205,7 @@
         <tbody>
           {#each inbound as t (t.label)}
             <tr>
-              <th scope="row">{t.label.slice(3)}</th>
+              <th scope="row" title={t.label}>{t.label.slice(3)}</th>
               <td>{Math.round(t.kbps)}</td>
               <td>{t.objects}</td>
               <td>{t.groups}</td>
@@ -190,6 +238,7 @@
           {/each}
         </tbody>
       </table>
+      </div>
     {:else}
       <p class="empty">No subscriptions.</p>
     {/if}
@@ -207,7 +256,7 @@
            read a trend off: the eye tracks a column that is holding still, not
            one that jumps a few pixels whenever a value gains a digit. -->
       <div class="scroll-x">
-        <table class="decoders">
+        <table class="decoders fixed">
           <colgroup>
             <col style="width: 96px" /><col style="width: 54px" />
             <col style="width: 110px" /><col style="width: 96px" />
@@ -372,24 +421,45 @@
     white-space: nowrap;
   }
 
-  /* The decoders table is the exception: its columns come from the colgroup
-     and stay there, because everything in it is a live number. Sizing to
-     content would mean the whole row shifting sideways whenever a value
-     crosses ten, or a participant's fps gains a digit — which is precisely
-     when someone is staring at it. */
-  .scroll-x table.decoders {
+  /* Tables of live numbers take their columns from their colgroup and keep
+     them, because sizing to content means the whole row shifting sideways
+     whenever a value crosses ten or a participant's fps gains a digit — which
+     is precisely when someone is staring at it.
+
+     The track tables need it for a second reason. Their first cell is a label
+     like "426336b3fa/video", and with the columns free to resize it was
+     re-wrapping at a different character several times a second as the numbers
+     beside it changed width, so the table changed height as well. Fixed
+     columns and a single line settle both. */
+  .scroll-x table.fixed {
     table-layout: fixed;
     width: max-content;
   }
 
-  .decoders th,
-  .decoders td {
+  .fixed th,
+  .fixed td {
     overflow: hidden;
     text-overflow: ellipsis;
+    /* Never mid-token: a label that has to be cut is cut at the end, where the
+       ellipsis says so, rather than folded onto a second line. */
+    white-space: nowrap;
+    word-break: normal;
   }
 
   .codec {
     text-align: left;
+  }
+
+  /* Centred in its own narrow column, and vertically aligned with the text
+     either side of it rather than sitting on the baseline. */
+  .os {
+    width: 28px;
+    text-align: center;
+  }
+
+  td.os {
+    color: var(--text-dim);
+    line-height: 0;
   }
 
   dd.on {

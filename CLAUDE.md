@@ -139,3 +139,11 @@ build version ride in the catalog as MSF §5.1 producer root fields.
   dev build once with `lsregister -f bin/t.dev.app`. One letter is a real
   collision risk — LaunchServices gives a scheme to whichever bundle registered
   it last — so an invite opening something else is the failure to expect.
+- **A bundle the machine has never granted camera and microphone to must be
+  launched once with `open`**, not by running the binary. macOS attributes a
+  directly executed binary's permission request to the *terminal*, so the prompt
+  never appears and the app hangs on "Connecting…" with nothing logged — it is
+  waiting on a dialog that was never shown. `open -n -a bin/t.app --args -relay
+  … -join` surfaces it; after granting once, the direct command above works
+  again on that machine. This bites after any change to `CFBundleIdentifier`,
+  which is a new application as far as TCC is concerned.

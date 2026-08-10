@@ -184,42 +184,83 @@ and worth stating plainly: nothing aligns the two timelines now, and the last
 time there was no synchronisation the picture led the sound by around two
 thirds of a second.
 
-The playback buffer is still bounded, for the reason it always was. Nothing
-drains a ring buffer — the reader takes exactly one sample per output sample —
-so any moment where the writer got ahead stays ahead for the rest of the call.
+The playback buffer is bounded, for the reason it always was. Nothing drains a
+ring buffer — the reader takes exactly one sample per output sample — so any
+moment where the writer got ahead stays ahead for the rest of the call.
 Measured on a five-way call, every buffer sat pinned at its two-second
-capacity: two full seconds between someone speaking and anyone hearing it. So
-`pcm-player` drops the oldest audio once more than 250 ms has queued, back to
-120 ms, and reports the count. A gap is audible once; permanent latency is
-audible for the whole call.
+capacity: two full seconds between someone speaking and anyone hearing it.
 
-The floor was the 60 ms preroll depth until a nine-minute call over a VPN to a
-remote relay was measured: doubling it took twenty-four trims across two
-participants down to seven.
+**How much it holds follows the link.** The fixed pair it used to have — a
+250 ms ceiling and a 120 ms floor — left 130 ms of headroom, and a cellular
+uplink to a remote relay was measured delivering audio in bursts of 160 to
+420 ms separated by holes of the same order. The buffer crossed its ceiling on
+almost every burst: one call logged 929 of them, which at 130 ms each is about
+two minutes of speech deleted in 929 separate cuts. The numbers were not badly
+chosen, they were chosen against a link that behaved differently, and nothing
+made them follow this one.
 
-The explanation first given for that was wrong, and it is worth recording as
-wrong because it was arithmetic mistaken for evidence. It read the trims as
-"grazing the ceiling", from a depth of 253 to 269 ms at every one, and concluded
-that a deeper cushion was absorbing bursts before they reached the ceiling. But
-`trim` runs after every push and a push is one 20 ms Opus packet, so the depth
-at a trim is confined to (250, 270] ms *whatever* caused it — a 640 ms burst and
-a one-packet creep produce identical numbers. The reasoning is also backwards:
-raising the floor with the ceiling fixed reduces the headroom between them,
-which on its own predicts more trims rather than fewer.
+So the target is the worst delivery gap seen in the last ten seconds plus a
+packet, and the ceiling is twice that. The two cover different things: the
+target is what the reader plays through a hole, while the headroom above it is
+where the burst on the other side of that hole lands — and on a stream
+delivered at 1× the burst is the same size as the hole, which a fixed margin
+cannot follow. A healthy call prerolls in 60 ms and stays there; only a path
+that actually stalls pays for the depth. The target is capped at 300 ms,
+because past that the buffer has stopped being jitter absorption and become the
+fault, and bounded latency is worth more than completeness on a link that
+cannot carry a conversation anyway.
 
-What the floor actually governs is the **underrun** below it. When the buffer
-runs dry the reader stops taking samples until the preroll has rebuilt, so
-nothing drains while the backlog lands — the stall converts into a burst, and
-the trim that follows is the second half of one event rather than a separate
-fault. The floor is therefore how long an upstream stall may last before that
-happens, and doubling it took a whole class of stalls out of the range that
-produces a trim at all. One uncontrolled path, so the size is not worth
-trusting; the direction held for both participants.
+**Which end is discarded changed too, and it matters more than the sizes.** The
+old policy dropped the oldest audio — the samples about to be played — on every
+push that crossed the ceiling, so during a burst the listener heard 30 ms of
+speech, lost 130 ms, heard 30 ms; the log caught six inside one second. The same
+quantity is lost either way, but one contiguous cut is intelligible and six
+interleaved ones are not. Arrivals are refused instead while the buffer is full,
+so what is queued plays through uninterrupted and the loss lands in one place.
+It cannot run away either: refusing at the ceiling bounds the depth by
+construction, which is what the trim was really for.
 
-A trim now reports the interval that led to it rather than the depth it reached
-— how much audio arrived against how much time passed, and how many underruns
-fell in between — because that is the pair that tells a burst from a stalled
-reader. Underruns are logged too, throttled: they were counted from the
+Driven through the measured delivery patterns, the two policies compare like
+this — events is discards plus underruns, silence is the share of the call the
+reader spent waiting to refill:
+
+| delivery | old: events | old: silent | new: events | new: silent |
+|---|---|---|---|---|
+| steady 20 ms | 0 | 0.1% | 0 | 0.1% |
+| bursts, 160 ms holes | 0 | 0.0% | 3 | 0.3% |
+| bursts, 320 ms holes | 375 | 44% | 11 | 0.3% |
+| bursts, 420 ms holes | 429 | 67% | 17 | 0.5% |
+
+A healthy path is unchanged, which is the point of making the target adaptive.
+The 160 ms row is slightly worse, and that is the target climbing from its floor
+during the first second. The rows below it are the difference between a call
+being intelligible and not.
+
+The preroll is the target as well, on the way in and after every underrun.
+Resuming on a fixed 60 ms after a stall put the reader three packets ahead of a
+path delivering eight at a time, which guaranteed the next starvation — the
+buffer spent the call falling over, refilling barely, and falling over again.
+
+An earlier explanation in this file was wrong and is worth recording as wrong,
+because it was arithmetic mistaken for evidence. It read the trims as "grazing
+the ceiling", from a depth of 253 to 269 ms at every one, and concluded a deeper
+cushion was absorbing bursts. But the trim ran after every push and a push is
+one 20 ms packet, so the depth at a trim was confined to (250, 270] ms *whatever*
+caused it — a 640 ms burst and a one-packet creep produced identical numbers.
+
+The first launch of a bundle a machine has not granted camera and microphone to
+must go through `open` rather than by running the binary. macOS attributes a
+directly executed binary's request to the terminal that started it, so the
+prompt is never shown and the app sits on "Connecting…" with nothing logged,
+waiting on a dialog nobody can see. Granting once fixes it for that machine.
+This is not a normal-user path — a downloaded `.app` is always launched by
+LaunchServices — but it catches development immediately after any change to
+`CFBundleIdentifier`, which is a new application as far as TCC is concerned.
+
+A discard reports the interval that led to it rather than the depth it reached
+— how much audio arrived against how much time passed, how many underruns fell
+in between, and what the target has settled on — because that is what tells a
+burst from a stalled reader. Underruns are logged too, throttled: they were counted from the
 beginning and never once said out loud, which is why every trim in the logs
 looked unexplained.
 

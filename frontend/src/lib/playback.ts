@@ -243,8 +243,8 @@ interface AudioSink {
   /** Rebuilds since the last frame came out. See the video sink. */
   restarts: number;
   rebuildTimer: ReturnType<typeof setTimeout> | null;
-  /** Trims seen so far, so only an increase is reported. */
-  trimmed: number;
+  /** Discards seen so far, so only an increase is reported. */
+  discards: number;
   /** When an underrun was last logged, so a run of them is not a run of logs. */
   lastUnderrunLogMs: number;
 }
@@ -433,7 +433,7 @@ export class Playback {
       dropped: 0,
       buffered: 0,
       underruns: 0,
-      trimmed: 0,
+      discards: 0,
       lastUnderrunLogMs: 0,
       restarts: 0,
       rebuildTimer: null,
@@ -460,21 +460,22 @@ export class Playback {
       // listener hears as a skip, but a stream of them means this participant's
       // audio is arriving faster than it can be played and something upstream
       // is wrong. Silence about it is what hid two seconds of delay.
-      if (ev.data.trimmed > sink.trimmed) {
-        sink.trimmed = ev.data.trimmed;
+      if (ev.data.discards > sink.discards) {
+        sink.discards = ev.data.discards;
         const arrived = Math.round(ev.data.arrivedMs);
-        const elapsed = Math.round(ev.data.sinceTrimMs);
-        bridge.report('WARN', 'trimmed the audio buffer to bound its latency', {
+        const elapsed = Math.round(ev.data.sinceDiscardMs);
+        bridge.report('WARN', 'refused audio to bound the buffer', {
           participant: track.participant,
-          trims: String(sink.trimmed),
-          // The interval that filled it, not the depth it reached. The depth is
-          // within one 20 ms packet of the ceiling every single time, so it
-          // said nothing; these two say whether a burst landed or the reader
-          // stalled, and how big the burst was.
+          discards: String(sink.discards),
+          // The interval that filled it, not the depth it reached: the depth is
+          // pinned to the ceiling every time, so it says nothing. These two say
+          // whether a burst landed or the reader stalled, and how big it was.
           arrivedMs: String(arrived),
           overMs: String(elapsed > 0 ? arrived - elapsed : 0),
-          sinceLastTrimMs: String(elapsed),
-          underrunsSince: String(ev.data.underrunsSinceTrim),
+          sinceLastMs: String(elapsed),
+          underrunsSince: String(ev.data.underrunsSinceDiscard),
+          // What the buffer has decided this link needs.
+          targetMs: String(Math.round(ev.data.targetMs)),
         });
       }
       // Counted since the beginning and never once said out loud, which is why

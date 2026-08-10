@@ -94,49 +94,53 @@ const PLAYER_SOURCE = `
 // enough that the buffer can never hide a real stall.
 const CAPACITY = 96000;
 
-// How much audio may queue before the buffer is trimmed back, and what it is
-// trimmed back to.
+// One 20 ms Opus packet, which is the unit everything here arrives in.
+const PACKET = 960;
+
+// The depth the buffer aims to hold, and how far above it audio may pile up
+// before arrivals are refused. Both follow the link rather than being fixed.
 //
-// Without this the buffer had no way back down. Nothing drains it: the reader
-// takes exactly one sample per output sample, so any moment where the writer
-// got ahead — a stall in the audio thread, a burst off the network, a decoder
-// backlog flushing — stayed ahead for the rest of the call. Measured on a
-// five-way call, every participant's buffer sat pinned at CAPACITY, which is
-// two full seconds of delay between someone speaking and anyone hearing it.
-// The overrun path in pushSamples does not help: by the time it engages the
-// latency is already the whole buffer, and dropping one sample per sample
-// written is exactly what holds it there.
+// A jitter buffer has to cover the longest hole the path produces: audio is
+// written at 1x and read at 1x, so the only thing that empties it is a gap in
+// delivery, and the only thing that overfills it is the burst that follows.
+// Measured on a cellular uplink to a remote relay, this path delivers in
+// bursts of 160 to 420 ms separated by holes of the same order.
 //
-// So the queue is bounded instead, on the same reasoning capture.ts drops
-// audio that is already late: a gap is audible once, and permanent latency is
-// audible for the rest of the call. The high-water mark is four times the
-// preroll, so ordinary jitter never reaches it.
+// The pair before this was fixed at a 250 ms ceiling and a 120 ms floor, which
+// left 130 ms of headroom — just under that burst size — so the buffer crossed
+// its ceiling on almost every burst. One nine-minute call logged 929 of them.
+// The numbers were not badly chosen; they were chosen against a link that
+// behaved differently, and nothing made them follow this one.
 //
-// The floor is not the preroll depth, though it started as it. Doubling it was
-// measured on a nine-minute call over a VPN to a remote relay: twenty-four
-// trims across two participants became seven.
+// So the target is the worst hole seen in the last GAP_WINDOW seconds, plus a
+// packet, and the ceiling is twice it. Those cover the two different things: the
+// target is what the reader plays through a hole, while the headroom above it is
+// what the burst on the other side of that hole lands in — and on a stream
+// delivered at 1x the burst is the same size as the hole, which a fixed margin
+// cannot follow. It starts at the floor, so a healthy call prerolls in 60 ms and
+// stays there, and only a path that actually stalls pays for the depth.
 //
-// The explanation first written here was wrong, and worth recording as wrong.
-// It read the trims as "grazing the ceiling" from a depth of 253 to 269 ms at
-// every one, and concluded the fill was episodic and a deeper cushion absorbed
-// bursts before they reached the ceiling. That range was not a measurement: trim
-// runs after every push and a push is one 20 ms packet, so the depth at a trim
-// is confined to (250, 270] ms whatever caused it. And the reasoning is
-// backwards — raising the floor with MAX_BUFFER fixed *reduces* the headroom
-// between them, which on its own predicts more trims, not fewer.
+// The target is capped well below what some links would ask for. Past 300 ms
+// the buffer stops being jitter absorption and becomes the fault: a link with
+// holes that long cannot carry a conversation whatever this does, and bounded
+// latency is worth more there than completeness.
+const MIN_TARGET = 3 * PACKET;  // 60 ms
+const MAX_TARGET = 15 * PACKET; // 300 ms — beyond this, latency is the fault
+const GAP_WINDOW = 10; // seconds of history the target is drawn from
+
+// What happens at the ceiling, which is the other half of it.
 //
-// What the floor actually governs is the underrun below it. On an underrun the
-// reader stops taking samples until the preroll has rebuilt, so nothing drains
-// while the backlog lands and the stall converts into a burst; a trim then
-// follows as the second half of one event. The floor is how long an upstream
-// stall may last before that happens, so doubling it took a whole class of
-// stalls out of the range that produces a trim at all. The cost is 120 ms of
-// standing latency after each trim, well inside what a conversation tolerates.
+// The old policy discarded the oldest audio — the samples about to be played —
+// and did it on every push that crossed the line. During a burst that fires
+// repeatedly: the listener hears 30 ms of speech, loses 130 ms, hears 30 ms.
+// The trim log caught six inside one second. The same quantity of audio is lost
+// either way, but one contiguous cut is intelligible and six interleaved ones
+// are not.
 //
-// One path, not controlled, so the size of the improvement is not to be
-// trusted; the direction held for both participants.
-const MAX_BUFFER = 12000; // 250 ms
-const TRIM_TO = 5760;     // 120 ms, twice the preroll
+// So arrivals are refused instead while the buffer is full. What is already
+// queued plays through uninterrupted and the loss lands in one place. It also
+// cannot run away: refusing at the ceiling bounds the depth by construction,
+// which is what the trim was really for.
 
 // How often to report buffer counters, in render quanta.
 //
@@ -157,35 +161,37 @@ class PCMPlayer extends AudioWorkletProcessor {
     this.write = 0;
     this.available = 0;
     this.underruns = 0;
-    // Counted rather than done quietly: a buffer that keeps needing trimming
-    // is a real fault, and silence about it is what let two seconds of delay
-    // go unnoticed in the first place.
-    this.trimmed = 0;
-    // What a trim is measured by: the interval leading up to it, not the depth
-    // at the moment of it.
+    // Counted rather than done quietly: a buffer that keeps refusing audio is
+    // a real fault, and silence about it is what let two seconds of delay go
+    // unnoticed in the first place.
+    this.discards = 0;
+
+    // What a discard is measured by: the interval leading up to it, not the
+    // depth at the moment of it.
     //
-    // The depth cannot say anything. trim() runs after every push and a push is
-    // one 20 ms Opus packet, so the depth is always within one packet of
-    // MAX_BUFFER when it fires — confined to (250, 270] ms by construction,
-    // whatever caused it. A measurement of "every trim fired between 253 and
-    // 269 ms" was once taken from that and read as a finding about the buffer;
-    // it was arithmetic. A 640 ms burst and a one-packet creep produce
-    // identical numbers.
+    // The depth cannot say anything, because it is pinned to the ceiling by
+    // construction whatever caused it. A measurement of "every trim fired
+    // between 253 and 269 ms" was once taken from the old policy and read as a
+    // finding about the buffer; it was arithmetic, and a 640 ms burst and a
+    // one-packet creep produced identical numbers.
     //
     // What discriminates is how much audio arrived against how much time
     // passed. Equal means the reader stalled; more arrived than elapsed means a
     // burst landed, and how much more is how big it was.
-    this.pushedSinceTrim = 0;
-    this.lastTrimFrame = 0;
-    this.underrunsAtTrim = 0;
-    // Reported at the last trim: ms of wall clock, ms of audio that arrived in
-    // it, and underruns within it.
-    this.sinceTrimMs = 0;
+    this.pushedSince = 0;
+    this.lastDiscardFrame = 0;
+    this.underrunsAtDiscard = 0;
+    this.sinceDiscardMs = 0;
     this.arrivedMs = 0;
-    this.underrunsSinceTrim = 0;
-    // Hold output until this much audio has queued, so playback does not
-    // start on the very first packet and then immediately starve.
-    this.prerollFrames = 2880; // 60 ms
+    this.underrunsSinceDiscard = 0;
+
+    // The adaptive target, and the history it is drawn from: one bucket per
+    // second of GAP_WINDOW, each holding the worst delivery gap seen in it.
+    this.target = MIN_TARGET;
+    this.lastPushFrame = -1;
+    this.gaps = new Float32Array(GAP_WINDOW);
+    this.gapBucket = -1;
+
     this.playing = false;
     this.quanta = 0;
     this.port.onmessage = (ev) => {
@@ -197,44 +203,79 @@ class PCMPlayer extends AudioWorkletProcessor {
     };
   }
 
+  ceiling() {
+    return this.target * 2;
+  }
+
   report() {
     this.port.postMessage({
       available: this.available,
       underruns: this.underruns,
-      trimmed: this.trimmed,
-      sinceTrimMs: this.sinceTrimMs,
+      discards: this.discards,
+      targetMs: (this.target / sampleRate) * 1000,
+      sinceDiscardMs: this.sinceDiscardMs,
       arrivedMs: this.arrivedMs,
-      underrunsSinceTrim: this.underrunsSinceTrim,
+      underrunsSinceDiscard: this.underrunsSinceDiscard,
     });
   }
 
-  push(samples) {
-    this.pushedSinceTrim += samples.length;
-    this.pushSamples(samples);
-    this.trim();
+  // trackGap sizes the target from the worst hole in delivery lately.
+  //
+  // The hole is what the buffer has to play through, so it is the thing worth
+  // measuring — not the jitter of individual arrivals, and not the depth the
+  // buffer happens to reach, which the ceiling censors. Bucketed by second so
+  // one bad moment ages out after GAP_WINDOW rather than holding the target up
+  // for the rest of the call.
+  trackGap() {
+    const now = currentFrame;
+    if (this.lastPushFrame >= 0) {
+      const bucket = Math.floor(now / sampleRate) % GAP_WINDOW;
+      if (bucket !== this.gapBucket) {
+        this.gapBucket = bucket;
+        this.gaps[bucket] = 0;
+      }
+      const gap = now - this.lastPushFrame;
+      if (gap > this.gaps[bucket]) this.gaps[bucket] = gap;
+
+      let worst = 0;
+      for (let i = 0; i < GAP_WINDOW; i++) {
+        if (this.gaps[i] > worst) worst = this.gaps[i];
+      }
+      const want = worst + PACKET;
+      this.target = Math.max(MIN_TARGET, Math.min(MAX_TARGET, want));
+    }
+    this.lastPushFrame = now;
   }
 
-  // Drops the oldest audio when too much has queued, which is the only thing
-  // that actually shortens the queue.
-  trim() {
-    if (this.available <= MAX_BUFFER) return;
-    const drop = this.available - TRIM_TO;
-    this.read = (this.read + drop) % CAPACITY;
-    this.available -= drop;
-    this.trimmed++;
+  push(samples) {
+    this.trackGap();
+    // Counted as arrived whether or not it is kept, since this is what the
+    // interval measurement is about.
+    this.pushedSince += samples.length;
+
+    if (this.available + samples.length > this.ceiling()) {
+      this.discard();
+      return;
+    }
+    this.pushSamples(samples);
+  }
+
+  // discard refuses an arrival and records what led to it.
+  discard() {
+    this.discards++;
 
     // currentFrame is the audio hardware's own sample counter, so this is real
     // elapsed time and not something the main thread can skew. Zero on the
-    // first trim, which has no interval behind it.
-    this.sinceTrimMs = this.lastTrimFrame > 0
-      ? ((currentFrame - this.lastTrimFrame) / sampleRate) * 1000
+    // first discard, which has no interval behind it.
+    this.sinceDiscardMs = this.lastDiscardFrame > 0
+      ? ((currentFrame - this.lastDiscardFrame) / sampleRate) * 1000
       : 0;
-    this.arrivedMs = (this.pushedSinceTrim / sampleRate) * 1000;
-    this.underrunsSinceTrim = this.underruns - this.underrunsAtTrim;
+    this.arrivedMs = (this.pushedSince / sampleRate) * 1000;
+    this.underrunsSinceDiscard = this.underruns - this.underrunsAtDiscard;
 
-    this.lastTrimFrame = currentFrame;
-    this.pushedSinceTrim = 0;
-    this.underrunsAtTrim = this.underruns;
+    this.lastDiscardFrame = currentFrame;
+    this.pushedSince = 0;
+    this.underrunsAtDiscard = this.underruns;
   }
 
   pushSamples(samples) {
@@ -244,8 +285,9 @@ class PCMPlayer extends AudioWorkletProcessor {
       if (this.available < CAPACITY) {
         this.available++;
       } else {
-        // Overrun: the reader is behind. Drop the oldest sample so the
-        // buffer tracks the live edge rather than accumulating delay.
+        // Unreachable while the ceiling holds, and kept as the backstop it is:
+        // the reader is behind, so the oldest sample goes rather than the ring
+        // wrapping over itself.
         this.read = (this.read + 1) % CAPACITY;
       }
     }
@@ -255,8 +297,15 @@ class PCMPlayer extends AudioWorkletProcessor {
     const out = outputs[0][0];
     if (!out) return true;
 
+    // Refill to the target, not to a fixed floor.
+    //
+    // This is the start-up preroll and the recovery from an underrun both, and
+    // they want the same depth for the same reason. Resuming on 60 ms after a
+    // stall put the reader three packets ahead of a path delivering in bursts
+    // of eight, which guaranteed the next starvation — the buffer spent the
+    // call falling over, refilling barely, and falling over again.
     if (!this.playing) {
-      if (this.available < this.prerollFrames) {
+      if (this.available < this.target) {
         out.fill(0);
         return true;
       }
@@ -265,6 +314,8 @@ class PCMPlayer extends AudioWorkletProcessor {
 
     if (this.available < out.length) {
       out.fill(0);
+      // One increment per starvation, not per quantum of it: this is the
+      // transition, and the branch above holds until the buffer has refilled.
       this.underruns++;
       this.playing = false;
       return true;
@@ -298,19 +349,23 @@ export interface PlayerReport {
   /** Samples still queued in the ring buffer. */
   available: number;
   underruns: number;
-  /** How many times the queue has been trimmed back to bound its latency. */
-  trimmed: number;
+  /** How many arrivals have been refused to bound the buffer's latency. */
+  discards: number;
+  /** The depth the buffer is currently aiming to hold, which follows the link. */
+  targetMs: number;
   /**
-   * The interval leading up to the last trim, which is what says why it fired.
+   * The interval leading up to the last discard, which is what says why it
+   * happened.
    *
-   * `arrivedMs` against `sinceTrimMs` is the discriminating comparison: audio
-   * arriving faster than time passes is a burst, and the difference is its
-   * size, while the two being equal means the reader stalled instead. The depth
-   * at the moment of a trim measures nothing — see the worklet.
+   * `arrivedMs` against `sinceDiscardMs` is the discriminating comparison:
+   * audio arriving faster than time passes is a burst, and the difference is
+   * its size, while the two being equal means the reader stalled instead. The
+   * depth at the moment of a discard measures nothing — it is pinned to the
+   * ceiling by construction.
    */
-  sinceTrimMs: number;
+  sinceDiscardMs: number;
   arrivedMs: number;
-  underrunsSinceTrim: number;
+  underrunsSinceDiscard: number;
 }
 
 /** What pcm-player expects on its port. */

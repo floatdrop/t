@@ -72,7 +72,7 @@ macOS terminates a bare binary that touches the camera, because the usage
 descriptions live in the bundle's `Info.plist`.
 
 Prebuilt archives are on the [releases
-page](https://github.com/floatdrop/tlmst/releases). They are not signed or
+page](https://github.com/floatdrop/t/releases). They are not signed or
 notarized, so macOS quarantines the download and Gatekeeper refuses it; [Running
 an unsigned build](docs/README.md#running-an-unsigned-build) covers the ways
 round that, of which building it yourself is the simplest.

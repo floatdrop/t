@@ -22,7 +22,7 @@ import (
 // Repo is where releases are published. Not configurable: an update prompt
 // that could be pointed somewhere else is a way to get someone to install
 // something they did not ask for.
-const Repo = "floatdrop/tlmst"
+const Repo = "floatdrop/t"
 
 // ReleasesURL is the page the update button opens. The user sees what they are
 // downloading and from whom, which is the whole reason this offers a page

@@ -30,7 +30,7 @@ func TestOpenLinkRefusesUnknownURLs(t *testing.T) {
 	for _, url := range []string{
 		"https://example.test/malware",
 		"file:///etc/passwd",
-		"https://github.com/someone-else/tlmst/releases",
+		"https://github.com/someone-else/t/releases",
 		// Close enough to look right, and still not ours.
 		update.ReleasesURL + ".evil.test",
 		"",
@@ -71,7 +71,7 @@ func TestOpenLinkAllowsTheOfferedRelease(t *testing.T) {
 		return nil
 	})
 
-	const offered = "https://github.com/floatdrop/tlmst/releases/tag/v0.4.0"
+	const offered = "https://github.com/floatdrop/t/releases/tag/v0.4.0"
 	if err := a.openLink(offered); err == nil {
 		t.Error("openLink accepted a release that was never offered")
 	}

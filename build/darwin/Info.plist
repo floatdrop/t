@@ -4,9 +4,9 @@
         <key>CFBundlePackageType</key>
             <string>APPL</string>
         <key>CFBundleName</key>
-            <string>tlmst</string>
+            <string>t</string>
         <key>CFBundleExecutable</key>
-            <string>tlmst</string>
+            <string>t</string>
         <key>CFBundleIdentifier</key>
             <string>ru.yandex.tlmst</string>
         <key>CFBundleVersion</key>
@@ -23,21 +23,21 @@
         <array>
             <dict>
                 <key>CFBundleURLName</key>
-                    <string>tlmst invite link</string>
+                    <string>t invite link</string>
                 <key>CFBundleTypeRole</key>
                     <string>Viewer</string>
                 <key>CFBundleURLSchemes</key>
                     <array>
-                        <string>tlmst</string>
+                        <string>t</string>
                     </array>
             </dict>
         </array>
         <key>NSHighResolutionCapable</key>
             <string>true</string>
         <key>NSCameraUsageDescription</key>
-            <string>tlmst publishes your camera to the other participants in the conference.</string>
+            <string>t publishes your camera to the other participants in the conference.</string>
         <key>NSMicrophoneUsageDescription</key>
-            <string>tlmst publishes your microphone to the other participants in the conference.</string>
+            <string>t publishes your microphone to the other participants in the conference.</string>
         <key>NSHumanReadableCopyright</key>
             <string>© 2026, Yandex LLC</string>
     </dict>

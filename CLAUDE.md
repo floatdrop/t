@@ -25,7 +25,7 @@ cd frontend && npm ci && npm run build
 
 **The macOS app must run from its `.app` bundle.** macOS kills a bare binary
 that touches the camera, because the usage descriptions live in the bundle's
-`Info.plist`. `wails3 task run` bundles and launches; running `bin/tlmst`
+`Info.plist`. `wails3 task run` bundles and launches; running `bin/t`
 directly does not work.
 
 ## Commands
@@ -35,7 +35,7 @@ Build orchestration is Wails Taskfiles; `wails3 task` runs them (the CLI is
 
 ```sh
 wails3 task build          # frontend + binary for the host platform
-wails3 task run            # bundle bin/tlmst.dev.app and launch it
+wails3 task run            # bundle bin/t.dev.app and launch it
 wails3 task package        # signed/packaged production build
 wails3 task dev            # Wails dev mode with Vite HMR
 
@@ -56,7 +56,7 @@ A relay is needed to run anything end to end:
 how two instances get started against it without clicking through twice:
 
 ```sh
-bin/tlmst.dev.app/Contents/MacOS/tlmst -relay localhost:4433 -room demo \
+bin/t.dev.app/Contents/MacOS/t -relay localhost:4433 -room demo \
     -nickname alice -join -debug
 ```
 
@@ -103,7 +103,7 @@ discovers the URL and per-run token from `/__bridge`, served by the asset
 handler in `main.go`.
 
 Naming and stream mapping (both packages document this at the top of
-`internal/conf/conf.go`): namespace tuple `("tlmst", <room>, <participant-id>)`
+`internal/conf/conf.go`): namespace tuple `("t", <room>, <participant-id>)`
 with `catalog` / `video` / `audio` tracks under it; video is one group per GOP
 opened by a keyframe, audio a fixed 25-object (500 ms) cadence. Nickname and
 build version ride in the catalog as MSF §5.1 producer root fields.
@@ -135,5 +135,7 @@ build version ride in the catalog as MSF §5.1 producer root fields.
 - moq-go has no tagged releases, so `go.mod` holds a pseudo-version that
   `go get -u` will not move. Bump it deliberately:
   `go get github.com/floatdrop/moq-go@<branch-or-commit>`.
-- The `tlmst://` scheme only resolves for a bundle the OS knows about; register
-  a dev build once with `lsregister -f bin/tlmst.dev.app`.
+- The `t://` scheme only resolves for a bundle the OS knows about; register a
+  dev build once with `lsregister -f bin/t.dev.app`. One letter is a real
+  collision risk — LaunchServices gives a scheme to whichever bundle registered
+  it last — so an invite opening something else is the failure to expect.

@@ -16,7 +16,7 @@ MOQT namespace discovery on a relay, and each publishes its own media directly.
 The process is split in two halves that talk over a loopback WebSocket.
 
 ```
-┌──────────────────────────── tlmst.app ────────────────────────────┐
+┌────────────────────────────── t.app ──────────────────────────────┐
 │  WKWebView (wails://localhost)            Go                      │
 │  ┌──────────────────────────────┐   ┌───────────────────────────┐ │
 │  │ Svelte UI                    │   │ bridge (internal/bridge)  │ │
@@ -59,7 +59,7 @@ Then, in this directory:
 
 ```sh
 wails3 task build     # builds the frontend and the binary
-wails3 task run       # bundles bin/tlmst.dev.app and launches it
+wails3 task run       # bundles bin/t.dev.app and launches it
 ```
 
 Enter the relay address, a room, and a nickname on the welcome screen; the
@@ -102,7 +102,7 @@ decision cost before it was made:
 | [Devices](docs/README.md#devices) | camera, microphone, the resolution ladder, and what Auto sizes against |
 | [Version and updates](docs/README.md#version-and-updates) | where the version comes from and how a newer release is offered |
 | [Losing the relay](docs/README.md#losing-the-relay) | reconnection, and migrating on GOAWAY |
-| [Invite links](docs/README.md#invite-links) | the `tlmst://` scheme |
+| [Invite links](docs/README.md#invite-links) | the `t://` scheme |
 | [Debug panels](docs/README.md#debug-panels) | transport plots, per-track counters, live logs |
 | [Icon](docs/README.md#icon) | the mark, and why it is not an Icon Composer bundle |
 | [Continuous integration](docs/README.md#continuous-integration) | the two workflows, signing, and running an unsigned build |

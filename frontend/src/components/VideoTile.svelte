@@ -72,6 +72,48 @@
 
   let canvas = $state<HTMLCanvasElement | null>(null);
   let video = $state<HTMLVideoElement | null>(null);
+  let root = $state<HTMLDivElement | null>(null);
+
+  /**
+   * Takes the tile to the whole screen, not merely the whole window.
+   *
+   * The control used to do the latter and was labelled as the former: it set a
+   * flag the grid reads, so the tile filled the window and the menu bar, the
+   * title bar and everything behind them stayed exactly where they were.
+   *
+   * The in-window expansion is still what happens first, and is still what is
+   * left if the request is refused — WebKit gates element fullscreen and can
+   * simply say no, which is not a reason to leave the button doing nothing. So
+   * the flag is set either way and the screen is asked for on top of it.
+   */
+  async function toggleExpand(): Promise<void> {
+    if (expanded) {
+      onExpand?.(false);
+      if (document.fullscreenElement) {
+        await document.exitFullscreen().catch(() => {});
+      }
+      return;
+    }
+    onExpand?.(true);
+    try {
+      await root?.requestFullscreen();
+    } catch {
+      // Refused, or unsupported. The tile still has the window.
+    }
+  }
+
+  /**
+   * Leaving fullscreen by any other route — Escape, the green button, a swipe —
+   * has to put the grid back, or the tile stays expanded inside a window that
+   * is no longer full and nothing looks like it is in a state anyone chose.
+   */
+  $effect(() => {
+    const onChange = () => {
+      if (!document.fullscreenElement && expanded) onExpand?.(false);
+    };
+    document.addEventListener('fullscreenchange', onChange);
+    return () => document.removeEventListener('fullscreenchange', onChange);
+  });
 
   // Bind the canvas to its decoder whenever either changes, and release it
   // on teardown so the decoder stops holding a detached element.
@@ -94,6 +136,7 @@
      scrolled out of view can stop being paid for. Absent on the local tile,
      which is drawn from the camera and was never subscribed to. -->
 <div
+  bind:this={root}
   class="tile"
   data-participant={label || undefined}
   class:local={isLocal}
@@ -126,10 +169,10 @@
          view has to be visible enough to get you back out. -->
     <button
       class="expand"
-      aria-label={expanded ? 'Restore the grid' : 'Expand to the whole window'}
+      aria-label={expanded ? 'Restore the grid' : 'Fill the screen'}
       aria-pressed={expanded}
-      title={expanded ? 'Restore the grid (Esc)' : 'Expand to the whole window'}
-      onclick={() => onExpand?.(!expanded)}
+      title={expanded ? 'Restore the grid (Esc)' : 'Fill the screen'}
+      onclick={toggleExpand}
     >
       {#if expanded}
         <Minimize size={ICON_SIZE} />
@@ -213,6 +256,22 @@
   .tile.expanded {
     aspect-ratio: auto;
     height: 100%;
+  }
+
+  /* Fullscreen gives the element the screen but not the shape: without this it
+     keeps the grid's rounded corners and its own background, so a black bar of
+     tile sits inside a black screen and the picture is still letterboxed by a
+     border nobody can see the point of. */
+  .tile:fullscreen {
+    width: 100vw;
+    height: 100vh;
+    border-radius: 0;
+    border: none;
+    aspect-ratio: auto;
+  }
+
+  .tile:fullscreen :is(video, canvas) {
+    object-fit: contain;
   }
 
   .tile.expanded :is(video, canvas) {

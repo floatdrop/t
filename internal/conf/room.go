@@ -456,7 +456,7 @@ func (r *Room) watchAnnouncements(sub *session.NamespaceSubscription) {
 // remote participants joining and leaving.
 //
 // The relay sends the namespace *suffix* relative to our subscribed
-// prefix, so with prefix ("tlmst", room) a one-field suffix is exactly
+// prefix, so with prefix ("t", room) a one-field suffix is exactly
 // the participant identifier.
 func (r *Room) readAnnouncements(sub *session.NamespaceSubscription) {
 	defer sub.Close()

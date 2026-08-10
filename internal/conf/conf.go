@@ -5,14 +5,14 @@
 // Every participant owns a namespace tuple and publishes three tracks
 // under it:
 //
-//	("tlmst", <room>, <participant-id>)
+//	("t", <room>, <participant-id>)
 //	    catalog   MSF catalog (§5) — JSON, declares the two media tracks
 //	    video     LOC-packaged video frames
 //	    audio     LOC-packaged audio frames
 //
 // Discovery falls out of that layout: a participant announces its own
 // namespace with PUBLISH_NAMESPACE and watches the room with
-// SUBSCRIBE_NAMESPACE on the prefix ("tlmst", <room>). The relay then
+// SUBSCRIBE_NAMESPACE on the prefix ("t", <room>). The relay then
 // reports every other participant as a NAMESPACE arrival and their
 // departure as NAMESPACE_DONE, so nobody needs a signalling server.
 //
@@ -44,8 +44,15 @@ import (
 	"github.com/floatdrop/moq-go/pkg/moqt/wire"
 )
 
-// NamespaceRoot is the first field of every tlmst namespace tuple.
-const NamespaceRoot = "tlmst"
+// NamespaceRoot is the first field of every namespace tuple this app uses.
+//
+// It is what separates this application's namespaces from anything else on a
+// shared relay, so changing it is a compatibility break: a client using a
+// different root is invisible to this one and this one is invisible to it, both
+// of them sitting in what looks like an empty room. It changed once, from
+// "tlmst" to "t" alongside the binary and the invite scheme, which is why
+// releases before 0.6.0 cannot see releases after it.
+const NamespaceRoot = "t"
 
 // Track names published under a participant's namespace. CatalogTrack
 // must be "catalog" — MSF §5 fixes that name.

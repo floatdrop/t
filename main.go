@@ -50,8 +50,13 @@ var buildConfig []byte
 const bridgeEndpointPath = "/__bridge"
 
 // inviteScheme is the URL scheme registered in build/darwin/Info.plist, which
-// makes tlmst://join?relay=…&room=… links clickable.
-const inviteScheme = "tlmst"
+// makes t://<relay>/<room> links clickable.
+//
+// One letter, matching the binary. A scheme this short is a real collision risk
+// with anything else that claims it — LaunchServices hands a scheme to whichever
+// bundle registered it most recently — so an invite opening the wrong
+// application is the failure to expect, not a malformed link.
+const inviteScheme = "t"
 
 func main() {
 	// Launch flags prefill (and optionally submit) the welcome form. They
@@ -117,7 +122,7 @@ func main() {
 	grantWebViewMediaCapture(logger)
 
 	wailsApp := application.New(application.Options{
-		Name:        "tlmst",
+		Name:        "t",
 		Description: "Teleconferencing over Media over QUIC",
 		Assets: application.AssetOptions{
 			Handler: assetHandler(endpoint),
@@ -153,8 +158,8 @@ func main() {
 
 	// Invite links. Wails already installs the macOS Apple Event handler for
 	// custom URL schemes and republishes it as this event, so registering
-	// "tlmst" in Info.plist (CFBundleURLTypes) is all it takes to make
-	// tlmst://join?relay=…&room=… clickable. Fires both when a link launches
+	// "t" in Info.plist (CFBundleURLTypes) is all it takes to make
+	// t://<relay>/<room> clickable. Fires both when a link launches
 	// the app and when one arrives while it is already running.
 	wailsApp.Event.OnApplicationEvent(events.Common.ApplicationLaunchedWithUrl,
 		func(event *application.ApplicationEvent) {
@@ -167,7 +172,7 @@ func main() {
 		})
 
 	wailsApp.Window.NewWithOptions(application.WebviewWindowOptions{
-		Title:  "tlmst",
+		Title:  "t",
 		Width:  1280,
 		Height: 860,
 		// No minimum. The grid is built to cope with being small — it drops to
@@ -199,6 +204,13 @@ func main() {
 		Mac: application.MacWindow{
 			InvisibleTitleBarHeight: 42,
 			TitleBar:                application.MacTitleBarHiddenInset,
+			// Without this the Fullscreen API is simply refused: WKWebView
+			// defaults elementFullscreenEnabled to false, and Wails only sets
+			// it when asked, so requestFullscreen on a tile rejects and the
+			// control silently does nothing but expand within the window.
+			WebviewPreferences: application.MacWebviewPreferences{
+				FullscreenEnabled: application.Enabled,
+			},
 		},
 	})
 

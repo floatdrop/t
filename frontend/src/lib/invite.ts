@@ -1,8 +1,8 @@
 /**
  * Invite links — the shareable form of "join me in this room".
  *
- * A link looks like `tlmst://localhost:4433/room-id`: the relay is the
- * authority and the room the path. `tlmst` is registered as a URL scheme (see
+ * A link looks like `t://localhost:4433/room-id`: the relay is the
+ * authority and the room the path. `t` is registered as a URL scheme (see
  * CFBundleURLTypes in build/darwin/Info.plist), so these are clickable — macOS
  * launches or focuses the app and hands it the URL. The welcome screen also
  * accepts one pasted into its relay or room field, which covers the case where
@@ -12,7 +12,7 @@
  * and a room have to travel together to be worth anything.
  */
 
-const SCHEME = 'tlmst:';
+const SCHEME = 't:';
 
 export interface Invite {
   relay: string;
@@ -22,7 +22,7 @@ export interface Invite {
 /**
  * Builds the link that Copy invite puts on the clipboard.
  *
- * The relay is the authority and the room the path — `tlmst://host:port/room`
+ * The relay is the authority and the room the path — `t://host:port/room`
  * — so the link reads as an address rather than a bag of parameters.
  *
  * A relay that is more than a bare `host:port` (a `moqt://` or `https://` URL,
@@ -61,7 +61,9 @@ function relayAuthority(relay: string): string {
  * rather than required to be the whole of it.
  */
 export function parseInviteLink(text: string): Invite | null {
-  const match = text.match(/tlmst:\/\/[^\s<>"']+/i);
+  // Word-boundary anchored: a one-letter scheme would otherwise match the tail
+  // of any word ending in "t" that happens to precede "://".
+  const match = text.match(/\bt:\/\/[^\s<>"']+/i);
   if (!match) return null;
   try {
     const url = new URL(match[0]);

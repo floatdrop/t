@@ -11,7 +11,7 @@ and the details of building, packaging and shipping the app.
 Each participant owns a namespace tuple and publishes three tracks under it:
 
 ```
-("tlmst", <room>, <participant-id>)
+("t", <room>, <participant-id>)
     catalog   MSF catalog (draft-ietf-moq-msf-01) — declares the media tracks
     video     LOC-packaged H.264 (Annex B)
     audio     LOC-packaged Opus
@@ -19,7 +19,7 @@ Each participant owns a namespace tuple and publishes three tracks under it:
 
 Discovery falls out of that layout. A participant announces itself with
 `PUBLISH_NAMESPACE` and watches the room with `SUBSCRIBE_NAMESPACE` on the
-prefix `("tlmst", <room>)`; the relay then reports arrivals as `NAMESPACE` and
+prefix `("t", <room>)`; the relay then reports arrivals as `NAMESPACE` and
 departures as `NAMESPACE_DONE`. Each peer's catalog is fetched with a Relative
 Joining FETCH so a late joiner sees a catalog that was published before it
 arrived.
@@ -309,7 +309,7 @@ The flags prefill (and optionally submit) the welcome form — handy for startin
 two instances against a relay without clicking through twice:
 
 ```sh
-bin/tlmst.dev.app/Contents/MacOS/tlmst \
+bin/t.dev.app/Contents/MacOS/t \
     -relay localhost:4433 -room demo -nickname alice -join -debug
 ```
 
@@ -483,11 +483,11 @@ just vanishes, and a full rejoin against a relay restarted on the same address.
 **Copy invite** in the call header puts a link like this on the clipboard:
 
 ```
-tlmst://localhost:4433/standup
+t://localhost:4433/standup
 ```
 
 The relay is the authority and the room is the path, so the link reads as an
-address. `tlmst` is registered as a URL scheme (`CFBundleURLTypes` in
+address. `t` is registered as a URL scheme (`CFBundleURLTypes` in
 `build/darwin/Info.plist`), which makes it clickable: macOS launches the app and
 joins, or — if a call is already in progress — offers to switch rather than
 yanking you out of the conversation you are in. Wails already installs the Apple
@@ -500,7 +500,7 @@ keep the readable authority and carry the exact value in a `relay` query
 parameter, which wins when present:
 
 ```
-tlmst://relay.example.com/r1?relay=https%3A%2F%2Frelay.example.com%2Flive
+t://relay.example.com/r1?relay=https%3A%2F%2Frelay.example.com%2Flive
 ```
 
 The welcome screen also accepts a link **pasted** into its relay or room field,
@@ -514,7 +514,7 @@ that means registering the bundle once:
 
 ```sh
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
-    -f bin/tlmst.dev.app
+    -f bin/t.dev.app
 ```
 
 Windows and Linux need their own registration — registry keys written by an
@@ -591,9 +591,9 @@ tab. It packages each platform, signs where credentials exist, writes a
 
 | Platform | Artifact |
 |---|---|
-| macOS | `tlmst-<version>-macos-universal.zip` — a universal (arm64 + amd64) `.app` |
-| Linux | `tlmst-<version>-linux-amd64.tar.gz` |
-| Windows | `tlmst-<version>-windows-amd64.zip` |
+| macOS | `t-<version>-macos-universal.zip` — a universal (arm64 + amd64) `.app` |
+| Linux | `t-<version>-linux-amd64.tar.gz` |
+| Windows | `t-<version>-windows-amd64.zip` |
 
 Both share `.github/actions/setup`, which installs Go, Node and the wails3 CLI
 and then builds the frontend — `main.go` embeds `frontend/dist`, so nothing in
@@ -633,7 +633,7 @@ Three ways round that, best first:
    rather than answering it:
 
    ```sh
-   xattr -dr com.apple.quarantine /Applications/tlmst.app
+   xattr -dr com.apple.quarantine /Applications/t.app
    ```
 
 Windows is less strict: an unsigned `.exe` runs after clicking through

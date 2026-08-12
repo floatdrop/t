@@ -8,7 +8,7 @@ require (
 	github.com/lmittmann/tint v1.2.0
 	github.com/quic-go/quic-go v0.61.0
 	github.com/quic-go/webtransport-go v0.12.0
-	github.com/wailsapp/wails/v3 v3.0.0-beta.6
+	github.com/wailsapp/wails/v3 v3.0.0-beta.8
 )
 
 require (

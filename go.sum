@@ -38,8 +38,8 @@ github.com/quic-go/webtransport-go v0.12.0 h1:CpnKNwZvdV0LD73xoHO8QaR0NI3llqpWRw
 github.com/quic-go/webtransport-go v0.12.0/go.mod h1:GHne8aRFJ24h73pAMrcywXtuaz/ShBXCLXLvG/NPFdU=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
-github.com/wailsapp/wails/v3 v3.0.0-beta.6 h1:k9FHF/T39EyTZNCHweRrLt1c6dwV3R3A+r1oCNiPB8I=
-github.com/wailsapp/wails/v3 v3.0.0-beta.6/go.mod h1:A/OaL1mXOnwWynTJv4rZU89Wbk5q3rtq3C3qkx4rRN0=
+github.com/wailsapp/wails/v3 v3.0.0-beta.8 h1:r5d+5ERZ6TYI/OPJnqq91Ugux+TkfplCURUi/+6vA/Q=
+github.com/wailsapp/wails/v3 v3.0.0-beta.8/go.mod h1:A/OaL1mXOnwWynTJv4rZU89Wbk5q3rtq3C3qkx4rRN0=
 go.uber.org/mock v0.5.2 h1:LbtPTcP8A5k9WPXj54PPPbjcI4Y6lhyOZXn+VS7wNko=
 go.uber.org/mock v0.5.2/go.mod h1:wLlUxC2vVTPTaE3UD51E0BGOAElKrILxhVSDYQLld5o=
 golang.org/x/crypto v0.54.0 h1:YLIA59K4fiNzHzjnZt2tUJQjQtUWfWbeHBqKtk3eScw=

@@ -344,6 +344,63 @@ flickers on every inter-word pause is worse than none. Remote rings come from
 the AudioLevel property described above, latched with a short timeout so a gap
 in delivery does not read as silence.
 
+## The bridge
+
+The two halves talk over a loopback WebSocket rather than Wails bindings,
+because bindings marshal through JSON and every media frame would pay base64
+for it. `internal/bridge/protocol.go` documents the wire format; what follows is
+why the transport underneath it has stayed a hand-written socket.
+
+### Why not Wails streams
+
+Wails v3.0.0-beta.8 added `HandleStream` / `WailsSocket`, which present the
+WebSocket programming model without binding a port — an obvious candidate to
+replace this, since the port is the one thing the current design has to
+apologise for.
+
+On the desktop it is not a socket. A WebSocket cannot be spoken over a custom
+URL scheme, so the transport is a held long poll for Go→JS and one POST per
+send for JS→Go, both riding the asset server (`pkg/application/stream_transport.go`).
+The real socket exists only in `-tags server` builds. That matters here because
+every request is a scheme-handler round trip, which Wails' own comments put at
+about eleven cgo calls on macOS.
+
+Measured against the current socket on macOS 26.5.1 / arm64, under this app's
+real media shape — 720p30 at 1.5 Mbps with one-second keyframes plus Opus at
+32 kbps in 20 ms frames, one participant's worth published upstream and *n*
+participants' worth arriving downstream — over 20-second runs, with CPU as a
+share of one core across both the app process and the WebContent process the
+window spawns:
+
+| remotes | down | ws p50 / p99 | stream p50 / p99 | ws cpu | stream cpu |
+|--------:|-----:|-------------:|-----------------:|-------:|-----------:|
+| 0  | —         | 632µs / 1.82ms | 1.15ms / 4.13ms | 3%  | 16% |
+| 1  | 0.20 MB/s | 516µs / 2.67ms | 999µs / 4.90ms  | 5%  | 22% |
+| 6  | 1.18 MB/s | 570µs / 1.92ms | 1.25ms / 3.61ms | 8%  | 28% |
+| 12 | 2.36 MB/s | 653µs / 2.98ms | 1.10ms / 3.20ms | 13% | 28% |
+| 24 | 4.66 MB/s | 664µs / 2.60ms | 1.19ms / 3.72ms | 17% | 32% |
+
+Streams carry the load: nothing was dropped on either transport at any size, up
+to 24 participants and some 2000 frames a second. The added latency is real and
+does not matter — one to four milliseconds against a path that spends tens of
+them in encode, decode and paint.
+
+The cost is CPU, and the shape of it is what decided this. Streams start high
+and stay flat while the socket's cost climbs to meet them, which is the
+signature of a per-round-trip cost rather than a per-byte one: the ratio is
+better at 24 participants only because the socket got worse, not because streams
+got better. A two-person call — which is most calls, on a laptop — pays about
+22% of a core against the socket's 5%.
+
+Splitting the directions at six remotes gives 21% for downstream alone and 16%
+for upstream alone against 28% together, so neither dominates and batching the
+frontend's sends would not recover it. The held poll is expensive on its own.
+
+Worth revisiting if the `server` build's real-socket transport ever reaches the
+desktop, since that is the same `HandleStream` API over a real socket. Until
+then the loopback listener stays, and the token in `Server.Endpoint` is what
+guards it.
+
 ## Launch flags
 
 The flags prefill (and optionally submit) the welcome form — handy for starting

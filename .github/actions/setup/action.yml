@@ -8,7 +8,7 @@ runs:
   using: composite
   steps:
     - name: Install Go
-      uses: actions/setup-go@v5
+      uses: actions/setup-go@v7
       with:
         # Read from go.mod so the toolchain never drifts from what the module
         # requires.
@@ -16,7 +16,7 @@ runs:
         cache-dependency-path: go.sum
 
     - name: Install Node
-      uses: actions/setup-node@v4
+      uses: actions/setup-node@v7
       with:
         node-version: 22
         cache: npm

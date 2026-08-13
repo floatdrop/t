@@ -14,8 +14,8 @@ func TestWithDefaultPort(t *testing.T) {
 	}{{
 		// The reported failure: the default relay, exactly as it is written.
 		name: "https with no port gains 443",
-		raw:  "https://t.tel.yandex.net/",
-		want: "https://t.tel.yandex.net:443/",
+		raw:  "https://moq.tel.yandex.net/",
+		want: "https://moq.tel.yandex.net:443/",
 	}, {
 		name: "no trailing slash",
 		raw:  "https://relay.example",

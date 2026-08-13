@@ -25,7 +25,7 @@
   const ROOM_KEY = 't.room';
 
   /** Where calls go unless told otherwise. */
-  const DEFAULT_RELAY = 'https://t.tel.yandex.net/';
+  const DEFAULT_RELAY = 'https://moq.tel.yandex.net/';
 
   /**
    * Query parameters prefill the form, so a room can be shared as a link

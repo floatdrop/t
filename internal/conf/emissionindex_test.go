@@ -240,9 +240,15 @@ func readObservations(s *session.IncomingSubgroupStream, seen chan<- observation
 
 // rawSubscriber opens a plain MOQT session against the test relay, below the
 // Room API, so a test can look at what is actually on the wire.
+//
+// Built the same way dial() builds the app's — quic.DialAddr wrapped in
+// quicconn.New — rather than through any newer helper, because go.work makes
+// the local moq-go checkout available here while CI compiles against the
+// pseudo-version in go.mod. A test that reaches past the pinned API builds on
+// this machine and nowhere else.
 func rawSubscriber(t *testing.T, ctx context.Context, addr string) *session.Session {
 	t.Helper()
-	conn, err := quicconn.Dial(ctx, addr,
+	qconn, err := quic.DialAddr(ctx, addr,
 		&tls.Config{
 			NextProtos: []string{alpnDraft19},
 			//nolint:gosec // G402: the test relay's certificate is self-signed and generated per run.
@@ -252,7 +258,7 @@ func rawSubscriber(t *testing.T, ctx context.Context, addr string) *session.Sess
 	if err != nil {
 		t.Fatalf("dial relay: %v", err)
 	}
-	sess, err := session.Client(ctx, conn, session.WithImplementation("t-test/0.1"))
+	sess, err := session.Client(ctx, quicconn.New(qconn), session.WithImplementation("t-test/0.1"))
 	if err != nil {
 		t.Fatalf("MOQT setup: %v", err)
 	}

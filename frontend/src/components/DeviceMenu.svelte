@@ -251,6 +251,25 @@
           </select>
         </div>
 
+        <!-- Gated on useVideo rather than cameraLive, unlike the resolution
+             above it: a screen has its own size and ignores that control, but it
+             goes through the same encoder and takes this choice, so greying this
+             out while it governs what is being published would be a lie. -->
+        <label class="toggle">
+          <input
+            type="checkbox"
+            bind:checked={store.media.variableBitrate}
+            onchange={apply}
+            disabled={!store.media.useVideo || busy}
+          />
+          Variable bitrate
+        </label>
+        <p class="note">
+          Lets the encoder spend above the bitrate on movement. Sharper when the
+          link has room, and the first thing to turn off if the picture breaks
+          up.
+        </p>
+
         <label class="toggle">
           <input
             type="checkbox"

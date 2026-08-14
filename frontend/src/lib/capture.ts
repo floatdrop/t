@@ -138,6 +138,26 @@ export interface VideoSettings {
   height: number;
   framerate: number;
   bitrate: number;
+  /**
+   * Let the encoder spend above `bitrate` on complex frames, rather than
+   * holding to it.
+   *
+   * WebCodecs defaults `bitrateMode` to `"variable"`, and this app never set it
+   * — so the number in the settings was a target the encoder was free to
+   * exceed, and did. Measured on the local capture row: 50 kbps on a still face
+   * against 3500 kbps on movement, for a 1500 kbps setting. A conference has
+   * nowhere to put an overshoot of that size. There is no rate adaptation
+   * anywhere in this app, so the link cannot answer it by asking for less; what
+   * answers it instead is the relay shedding the enhancement layer, or timing a
+   * subgroup out, or giving up on the subscription — a picture that breaks up
+   * because the encoder spent four times its budget on one second of movement.
+   *
+   * So off by default: `"constant"` is what a live call over a link with no
+   * headroom wants, and holding the rate is worth more than the sharpest
+   * possible frame. On for a link with room to spare, where the quality VBR
+   * buys on movement is real and costs nothing anyone will see.
+   */
+  variableBitrate: boolean;
 }
 
 export interface AudioSettings {
@@ -153,6 +173,7 @@ export const defaultVideoSettings: VideoSettings = {
   height: 720,
   framerate: 30,
   bitrate: 1_500_000,
+  variableBitrate: false,
 };
 
 export const defaultAudioSettings: AudioSettings = {
@@ -248,7 +269,11 @@ function sameVideoSettings(want: VideoSettings, have: VideoSettings | null): boo
     have.width === want.width &&
     have.height === want.height &&
     have.framerate === want.framerate &&
-    have.bitrate === want.bitrate
+    have.bitrate === want.bitrate &&
+    // Rebuilds like every other encoder setting. bitrateMode is fixed at
+    // configure time, so there is nothing to change in place even if this file
+    // had a path for it.
+    have.variableBitrate === want.variableBitrate
   );
 }
 
@@ -868,6 +893,10 @@ export class Capture {
       height,
       bitrate: primaryBitrate,
       framerate,
+      // Said explicitly, because the default is not what a call wants: leaving
+      // it out means "variable", and the setting then buys a target the encoder
+      // may exceed several times over on movement. See VideoSettings.
+      bitrateMode: settings.variableBitrate ? 'variable' : 'constant',
       latencyMode: 'realtime',
       // Two temporal layers, so the picture has a step down that costs neither
       // a keyframe nor a re-subscribe. Nothing references the top layer, so
@@ -904,6 +933,7 @@ export class Capture {
       granted: `${grantedWidth}x${grantedHeight}`,
       framerate: String(Math.round(framerate)),
       bitrate: String(primaryBitrate),
+      bitrateMode: settings.variableBitrate ? 'variable' : 'constant',
       selected: String(settings.bitrate),
       state: encoder.state,
     });

@@ -72,6 +72,11 @@ export interface MediaSettings {
   /** "WIDTHxHEIGHT", one of the rungs in VIDEO_LADDER. */
   resolution: string;
   videoBitrate: number;
+  /**
+   * Whether the encoder may spend above videoBitrate on complex frames. Off by
+   * default — see VideoSettings.variableBitrate for what leaving it on cost.
+   */
+  variableBitrate: boolean;
   audioBitrate: number;
   denoise: boolean;
 }
@@ -154,6 +159,7 @@ class Store {
     videoSource: 'camera',
     resolution: DEFAULT_RESOLUTION,
     videoBitrate: defaultVideoSettings.bitrate,
+    variableBitrate: defaultVideoSettings.variableBitrate,
     audioBitrate: defaultAudioSettings.bitrate,
     denoise: defaultAudioSettings.denoise,
   });
@@ -459,6 +465,12 @@ class Store {
         height: screenVideoSettings.height,
         framerate: screenVideoSettings.framerate,
         bitrate: screenVideoSettings.bitrate,
+        // The same choice as the camera's. A desktop is mostly still and then
+        // changes all at once, which is the shape variable rate flatters most —
+        // but it is one link either way, and a setting that applied to only
+        // half of what this app publishes would be the harder thing to reason
+        // about when the picture breaks up.
+        variableBitrate: this.media.variableBitrate,
       };
     }
 
@@ -470,6 +482,7 @@ class Store {
       height,
       framerate: defaultVideoSettings.framerate,
       bitrate: this.media.videoBitrate,
+      variableBitrate: this.media.variableBitrate,
     };
   }
 

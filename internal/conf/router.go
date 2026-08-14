@@ -58,8 +58,22 @@ func newRouter(log *slog.Logger) *router {
 
 // HandleSubgroups routes streams bearing alias to h, each on its own
 // goroutine, and delivers any stream already parked under that alias.
-func (r *router) HandleSubgroups(alias uint64, h func(*session.IncomingSubgroupStream)) {
-	r.demux.HandleTrack(alias, func(s *session.IncomingSubgroupStream) { go h(s) })
+//
+// arrived, when non-nil, runs before the handler is spawned — on the accept
+// loop for a live stream, and in park order for one that was waiting. That is
+// the only place the order the transport delivered streams in still exists:
+// once h is running on its own goroutine, which of several groups gets to its
+// first object first is up to the scheduler. See groupOrderer.Open, which is
+// what needs it. Keep it short; it runs on the accept loop, which everything
+// else on the session is queued behind.
+func (r *router) HandleSubgroups(alias uint64, arrived, h func(*session.IncomingSubgroupStream)) {
+	dispatch := func(s *session.IncomingSubgroupStream) {
+		if arrived != nil {
+			arrived(s)
+		}
+		go h(s)
+	}
+	r.demux.HandleTrack(alias, dispatch)
 
 	r.mu.Lock()
 	parked := r.subgroups[alias]
@@ -68,7 +82,7 @@ func (r *router) HandleSubgroups(alias uint64, h func(*session.IncomingSubgroupS
 
 	for _, s := range parked {
 		r.log.Debug("delivering parked subgroup stream", "alias", alias)
-		go h(s)
+		dispatch(s)
 	}
 }
 

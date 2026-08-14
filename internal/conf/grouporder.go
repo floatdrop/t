@@ -1,0 +1,245 @@
+package conf
+
+import "sync"
+
+// Ordering whole groups of one track against each other, which is the level
+// above reorder.go.
+//
+// A reassembler covers one group. Groups are their own streams — a group's
+// subgroups and the next group's are all separate QUIC streams, and §11.4.2
+// orders objects only within a stream — so nothing stops a group's tail
+// arriving behind the next group's head, and nothing in a per-group reassembler
+// can see that it has. Measured on a loopback relay: over a burst, whole groups
+// swap.
+//
+// Both media are hurt by it and neither can undo it downstream. Every video
+// group opens on a keyframe, a keyframe is an IDR, and an IDR empties the
+// decoded picture buffer — so a frame from the group before it references
+// pictures that are gone and decodes to macroblocks or to nothing, one flash per
+// boundary it happens on. Audio has no such coupling, but the ring buffer in the
+// player worklet is contiguous by construction, so a packet handed to it late is
+// simply played in the wrong place.
+//
+// So groups are held rather than dropped: an object of a group ahead of one
+// still in flight waits for it. Waiting costs nothing in the case that is every
+// call, because a group's stream has ended well before the next group's first
+// object arrives — measured at both the frame rate and the audio cadence, where
+// nothing is ever held.
+//
+// **A group's turn is claimed and released by the base layer alone.** Two things
+// hang on that. The claim (Open) happens on the accept loop, in the order the
+// transport delivered the streams, which is the only place that order still
+// exists — once the reader is on its own goroutine per stream, which group
+// reaches its first object first is up to the scheduler, and a mark taken there
+// puts whole groups below the line. The release (Finish) is the stream *ending*,
+// which happens whether it was closed or reset, so nothing waits on a message
+// that has to be sent.
+//
+// And nothing ever waits on the enhancement layer. It is the one a relay delays
+// by half a second and sheds outright, so a group that waited for it would hand
+// that delay to the next group's keyframe — the disposable layer holding up the
+// one that cannot be dropped, which is the priority design backwards. The cost
+// is that an enhancement object arriving after its group's base stream has ended
+// is dropped, which a burst does produce; that is the layer built to be
+// disposable, and losing frames of it is what a burst has always been allowed to
+// cost.
+//
+// What this must never do is wait for something that is not coming. That failure
+// is already in this project's history — a group that waited for a layer the
+// catalog said to expect sat held until the group was retired, four seconds of
+// frozen tile then four seconds at once, because a relay shedding a layer never
+// opens its stream at all. Nothing is waited for here until its stream has
+// actually arrived, and the backlog is bounded on top of that, so a stream that
+// opens and then stalls costs the bound and no more.
+
+// maxHeldAcrossGroups bounds how many objects may wait for an earlier group.
+//
+// One audio group's worth, which is 500 ms at the 20 ms cadence and most of a
+// GOP at the frame rate. That is the whole cost of a stream that opens and then
+// stalls: the objects behind it wait, the bound fills, and the orderer gives up
+// on it and moves to the oldest thing it actually holds. Sized to a group rather
+// than larger because this is latency added to a live conversation, and a second
+// of it is worse than the seam it would smooth.
+const maxHeldAcrossGroups = audioGroupObjects
+
+// heldGroupObject is one object waiting for an earlier group, with whatever the
+// caller needs to emit it. Ordered by group first and then by the publisher's
+// emission index, which together are the publisher's order exactly.
+type heldGroupObject struct {
+	group uint64
+	index uint64
+	emit  func()
+}
+
+// before reports whether a sorts ahead of b in the publisher's order.
+func (a heldGroupObject) before(b heldGroupObject) bool {
+	if a.group != b.group {
+		return a.group < b.group
+	}
+	return a.index < b.index
+}
+
+// groupOrderer delivers a track's groups in ascending order.
+//
+// Safe for concurrent use: one goroutine per subgroup stream calls Push and
+// Finish, and whichever of them unblocks a run performs the emits for it, in
+// order, before returning. Emitting under the lock is what keeps two goroutines
+// from interleaving their emits and undoing the ordering.
+type groupOrderer struct {
+	mu sync.Mutex
+	// next is the oldest group not yet done with. Objects of it go straight
+	// out; objects of anything later wait.
+	next    uint64
+	started bool
+	// finished holds groups whose stream has ended while an earlier group was
+	// still open, so their turn can be taken as soon as it comes round.
+	finished map[uint64]bool
+	// held is objects waiting for an earlier group, in publisher order.
+	held []heldGroupObject
+	// emitted records that something has gone out, after which the mark can no
+	// longer be lowered: a stream opening late for an earlier group cannot undo
+	// what the frontend has already been handed.
+	emitted bool
+	// passed and abandoned count what ordering cost: objects dropped for
+	// arriving after their group's turn had been given up on, and the number of
+	// times that happened.
+	passed    uint64
+	abandoned uint64
+}
+
+func newGroupOrderer() *groupOrderer {
+	return &groupOrderer{finished: make(map[uint64]bool)}
+}
+
+// Open records that a stream carrying one group has arrived, which is what
+// establishes where the order starts.
+//
+// The first *object* cannot establish it. A burst puts several groups in flight
+// at once and their streams are read on separate goroutines, so the first object
+// to be decoded is not the first group — and a mark taken from it drops every
+// group below it as already passed, which on the audio cadence is whole seconds
+// of sound. Taking it from the stream instead moves the race from "which group
+// was decoded first" to "which goroutine started first", and those goroutines
+// start before any of them has read anything.
+//
+// Only downwards, and only before anything has gone out. A stream that opens for
+// an earlier group after the frontend has already been handed a later one is
+// genuinely late, and there is nothing to be done about it from here.
+func (o *groupOrderer) Open(group uint64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if !o.started {
+		o.next, o.started = group, true
+		return
+	}
+	if group < o.next && !o.emitted {
+		o.next = group
+	}
+}
+
+// Push takes one object and emits whatever that makes due, in order.
+//
+// Setting the mark here is the fallback for an object whose stream never
+// announced itself; Open is what normally does it. Either way it starts at the
+// group seen rather than at zero, because a subscriber joins a call in progress
+// and lands wherever the publisher has got to — waiting for every group before
+// that would be waiting for groups nobody will ever send.
+func (o *groupOrderer) Push(group, index uint64, emit func()) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if !o.started {
+		o.next, o.started = group, true
+	}
+	switch {
+	case group < o.next:
+		// Its turn has been and gone, which takes a group given up on under the
+		// bound — a stream that ends cannot produce more. Emitting it now would
+		// be the inversion this exists to prevent, so it is the one thing here
+		// that is dropped.
+		o.passed++
+		return
+	case group == o.next:
+		o.emitted = true
+		emit()
+		return
+	}
+
+	o.insertLocked(heldGroupObject{group: group, index: index, emit: emit})
+	if len(o.held) > maxHeldAcrossGroups {
+		// The group being waited for is not coming: its stream was never opened,
+		// or was opened and never delivered. Give up on it and take the oldest
+		// thing actually in hand, rather than holding the call open for it.
+		o.abandoned++
+		o.next = o.held[0].group
+	}
+	o.drainLocked()
+}
+
+// Finish records that a group's stream has ended, which is the ordinary way a
+// group's turn is over.
+//
+// The stream ending is the signal rather than an object count, because the
+// count is not knowable and the ending is: a subgroup stream ends when the
+// publisher closes it or when a relay resets it, and either way nothing more
+// can arrive for that group on it. Audio publishes one subgroup per group, so
+// one ending is the whole group.
+func (o *groupOrderer) Finish(group uint64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if !o.started || group < o.next {
+		return
+	}
+	o.finished[group] = true
+	o.drainLocked()
+}
+
+// drainLocked advances past every group that is done and emits what that makes
+// due, in order. The caller holds mu.
+func (o *groupOrderer) drainLocked() {
+	for {
+		for len(o.held) > 0 && o.held[0].group <= o.next {
+			obj := o.held[0]
+			o.held = o.held[1:]
+			o.emitted = true
+			obj.emit()
+		}
+		if !o.finished[o.next] {
+			return
+		}
+		delete(o.finished, o.next)
+		o.next++
+	}
+}
+
+// insertLocked places obj in held, keeping it in publisher order. The scan runs
+// from the back because objects arrive in near-order: the common insert is at
+// or near the end. The caller holds mu.
+func (o *groupOrderer) insertLocked(obj heldGroupObject) {
+	i := len(o.held)
+	for i > 0 && obj.before(o.held[i-1]) {
+		i--
+	}
+	o.held = append(o.held, heldGroupObject{})
+	copy(o.held[i+1:], o.held[i:])
+	o.held[i] = obj
+}
+
+// Drop forgets everything waiting, for a track that is going away. Nothing is
+// emitted on the way out: the decoder these would go to is being retired in the
+// next breath.
+func (o *groupOrderer) Drop() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.held = nil
+	clear(o.finished)
+}
+
+// backlog is how many objects are waiting, for tests that pin the bound.
+func (o *groupOrderer) backlog() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return len(o.held)
+}

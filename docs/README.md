@@ -62,10 +62,13 @@ bring it back to one stream per subgroup.
 
 That leaves the object ID saying nothing about where a frame belongs relative to
 another subgroup's, so every object carries its position in the group's
-**emission order** as a producer-defined Object Property (type `0x8002`, above
-the mandatory-track-property range so nothing can mistake its scope). Ascending
-index is decode order exactly. Reassembly is needed at all because the layers
-arrive on concurrent streams read on separate goroutines:
+**emission order** as a producer-defined Object Property (type `0x3802`, in the
+range §2.5 reserves for application-specific use, which IANA will never allocate
+and a relay must forward unchanged). It rode on `0x8002` until 0.6.3 — that is
+registrable space it had no claim to — and both are written for now so a call
+can span the move. Ascending index is decode order exactly. Reassembly is needed
+at all because the layers arrive on concurrent streams read on separate
+goroutines:
 `internal/conf/reorder.go` orders a group's streams before anything reaches a
 decoder, with no timers. A publisher that stamps no index falls back to the
 object ID, which is right for the only kind that does not: one subgroup per
@@ -105,6 +108,50 @@ to expect, and a relay shedding the enhancement layer never opens that stream:
 base-layer frames sat held until the group was retired, four seconds of frozen
 tile then four seconds of video at once. A bound on waiting was right; a group
 that waits for the base layer, or gives up on it, was not.
+
+A reassembler covers one group, which leaves **the group boundary** — the second
+place decode order can be lost, and the one that was still open. A group's
+subgroups are separate QUIC streams and so are the next group's, and §11.4.2
+orders objects only within a stream, so nothing stops a group's tail arriving
+behind the next group's head. Nothing compared the two, because neither group's
+reassembler can see the other — and `remoteTrack` deliberately keeps a group's
+reassembler alive for a whole group after the publisher has moved on, so a
+straggler is placed and then emitted.
+
+Emitted into a decoder that has already taken the next keyframe. A keyframe is
+an IDR and an IDR empties the decoded picture buffer, so a frame from the group
+before it references pictures that are gone: one flash of macroblocks per
+boundary it happens on, which on a one-second GOP is once a second. That is the
+artifact this went looking for. Audio has no such coupling — every Opus packet
+stands on its own — but the ring buffer in the player worklet is contiguous by
+construction, so a packet handed to it late is simply played in the wrong place.
+
+`internal/conf/grouporder.go` holds the groups in publisher order instead, for
+both media. **A group's turn is claimed and released by the base layer alone**,
+and two things hang on that. The claim happens on the router's accept loop, in
+the order the transport delivered the streams, which is the only place that
+order still exists: once the reader is on its own goroutine per stream, which
+group reaches its first object first is up to the scheduler, and a mark taken
+there puts whole groups below the line. The release is the stream *ending*,
+which happens whether it was closed or reset, so nothing waits on a message that
+has to be sent.
+
+Nothing ever waits on the enhancement layer. It is the one a relay delays by
+half a second and sheds outright, so a group that waited for it would hand that
+delay to the next group's keyframe — the disposable layer holding up the one
+that cannot be dropped. The cost is that an enhancement object arriving after
+its group's base stream has ended is dropped, which a burst does produce; that
+is the layer built to be disposable, and losing frames of it is what a burst has
+always been allowed to cost.
+
+Waiting is free in the case that is every call. Measured at the frame rate and
+at the audio cadence, nothing is ever held: a group's stream has ended well
+before the next group's first object arrives. It is only a burst — a backfilled
+group, or a publisher catching up after a stall — that puts several groups in
+flight at once, and there the ordering is the whole point. The backlog is
+bounded at one group's worth on top of the release rule, so a stream that opens
+and then stalls costs the bound and no more, rather than repeating the frozen
+tile above.
 
 The enhancement layer is also marked **disposable**, by a §8 object delivery
 timeout stamped on the first object of its subgroup: half a second, against the

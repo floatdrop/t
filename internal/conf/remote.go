@@ -245,6 +245,10 @@ type remoteTrack struct {
 	// be put back together — see reorder.go.
 	groupsMu sync.Mutex
 	groups   map[uint64]*groupReassembler
+
+	// order holds this track's groups in the order the publisher wrote them,
+	// which a per-group reassembler cannot: see grouporder.go.
+	order *groupOrderer
 }
 
 // reassemblerFor returns the reassembler for one group, creating it on the
@@ -300,6 +304,7 @@ func (t *remoteTrack) dropGroups() {
 	t.groupsMu.Lock()
 	t.groups = nil
 	t.groupsMu.Unlock()
+	t.order.Drop()
 }
 
 // newRemote subscribes to a newly discovered participant's catalog. The
@@ -356,7 +361,7 @@ func (r *remote) subscribeCatalog() error {
 	}
 	r.log.Info("subscribed to catalog", "alias", sub.TrackAlias())
 
-	r.room.router.HandleSubgroups(sub.TrackAlias(), r.readCatalogStream)
+	r.room.router.HandleSubgroups(sub.TrackAlias(), nil, r.readCatalogStream)
 	go r.watchLiveness(sub)
 
 	fetchMsg := &message.Fetch{
@@ -859,6 +864,7 @@ func (r *remote) subscribeTrack(
 		sub:    sub,
 		label:  label,
 	}
+	track.order = newGroupOrderer()
 
 	r.mu.Lock()
 	if r.closed {
@@ -871,9 +877,20 @@ func (r *remote) subscribeTrack(
 	r.mu.Unlock()
 
 	counter := r.room.counters.Track(label)
-	r.room.router.HandleSubgroups(sub.TrackAlias(), func(s *session.IncomingSubgroupStream) {
-		r.readMedia(s, track, counter)
-	})
+	// The arrival hook claims each group's turn in the order the transport
+	// delivered its stream, which is the order the publisher opened them in.
+	// Doing it inside readMedia instead would claim them in whatever order the
+	// scheduler ran the goroutines, and a burst then reads as the later group
+	// having come first — see groupOrderer.Open.
+	arrived := func(s *session.IncomingSubgroupStream) {
+		if s.Header.SubgroupID == baseSubgroup {
+			track.order.Open(s.Header.GroupID)
+		}
+	}
+	r.room.router.HandleSubgroups(sub.TrackAlias(), arrived,
+		func(s *session.IncomingSubgroupStream) {
+			r.readMedia(s, track, counter)
+		})
 
 	// Announce the handle before any frame carrying it can arrive, so the
 	// frontend always has a configured decoder waiting.
@@ -938,6 +955,21 @@ func (r *remote) readMedia(
 	// there is nothing left to read by then.
 	defer r.checkLagForStream(track, counter)
 
+	// The end of this stream is the end of its group's turn, however it ended —
+	// closed by the publisher or reset by a relay. Deferred so a read that fails
+	// part-way releases the groups waiting behind it rather than stranding them.
+	// The group's turn was claimed on the accept loop, where the arrival order
+	// still exists; this is the other end of it. Deferred so a read that fails
+	// part-way releases the groups waiting behind it rather than stranding them.
+	// The base layer alone, matching the Open above: nothing may ever wait on
+	// the enhancement layer. It is the one a relay delays by half a second and
+	// sheds outright, so a group that waited for it would hand that delay to the
+	// next group's keyframe — the disposable layer holding up the one that
+	// cannot be dropped, which is the priority design backwards.
+	if s.Header.SubgroupID == baseSubgroup {
+		defer track.order.Finish(s.Header.GroupID)
+	}
+
 	// One group can arrive on several subgroup streams at once — one per
 	// temporal layer — each on its own goroutine. Objects go through the
 	// group's reassembler rather than straight to the frontend so the decoder
@@ -994,8 +1026,13 @@ func (r *remote) readMedia(
 		// Keyed on the publisher's emission index, not the object ID: each
 		// subgroup numbers its objects from its own base, so an ID orders a
 		// stream against itself and nothing else. See reorder.go.
-		reassembler.Push(subgroup, emissionIndex(obj.ObjectID, decoded.Properties), func() {
-			r.room.sink.SendMedia(&frame)
+		// Two gates, and they answer different questions. The reassembler puts
+		// this group's subgroups back into decode order; deliver holds that
+		// order across the group boundary, where there is no reassembler to do
+		// it. See deliver.
+		index := emissionIndex(obj.ObjectID, decoded.Properties)
+		reassembler.Push(subgroup, index, func() {
+			track.order.Push(group, index, func() { r.room.sink.SendMedia(&frame) })
 		})
 	}
 }

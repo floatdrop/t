@@ -1,6 +1,9 @@
 package conf
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // Ordering whole groups of one track against each other, which is the level
 // above reorder.go.
@@ -51,6 +54,27 @@ import "sync"
 // opens its stream at all. Nothing is waited for here until its stream has
 // actually arrived, and the backlog is bounded on top of that, so a stream that
 // opens and then stalls costs the bound and no more.
+
+// settleWindow is how long the mark may still be lowered after the first stream
+// of a track arrives, before anything is delivered.
+//
+// Open runs on the accept loop, so the streams are announced in the order the
+// transport delivered them — but the readers run on their own goroutines, and a
+// reader can push its first object before the accept loop has announced a stream
+// that arrived just behind it. The mark cannot be lowered once something has
+// gone out, because a group delivered behind one already played is the inversion
+// all of this exists to prevent, so that race costs the earlier group entirely:
+// measured at one run in eight over a three-group burst, silently dropping
+// twenty-five of seventy-five objects.
+//
+// Nothing structural distinguishes "an earlier group is still being announced"
+// from "there is no earlier group", so this is the one place that spends time to
+// answer it. It is a settle at the start of a track and not a jitter buffer: it
+// runs once, it holds only until it expires, and once the mark is set every
+// later group is ordered against it with no waiting at all. Fifty milliseconds
+// is far longer than an accept loop takes to drain what is already readable, and
+// short enough to disappear into the wait for a first keyframe.
+const settleWindow = 50 * time.Millisecond
 
 // maxHeldAcrossGroups bounds how many objects may wait for an earlier group.
 //
@@ -115,6 +139,11 @@ type groupOrderer struct {
 	// longer be lowered: a stream opening late for an earlier group cannot undo
 	// what the frontend has already been handed.
 	emitted bool
+	// settling is true from the first stream of the track until settleWindow has
+	// passed. Everything is held meanwhile, which is what keeps emitted false and
+	// so keeps the mark free to move down to whatever else is still arriving.
+	settling    bool
+	settleTimer *time.Timer
 	// passed and abandoned count what ordering cost: objects dropped for
 	// arriving after their group's turn had been given up on, and the number of
 	// times that happened.
@@ -145,12 +174,25 @@ func (o *groupOrderer) Open(group uint64) {
 	defer o.mu.Unlock()
 
 	if !o.started {
-		o.next, o.started = group, true
+		o.next, o.started, o.settling = group, true, true
+		o.settleTimer = time.AfterFunc(settleWindow, o.settleNow)
 		return
 	}
-	if group < o.next && !o.emitted {
+	if group < o.next && (o.settling || !o.emitted) {
 		o.next = group
 	}
+}
+
+// settleNow ends the settle window and releases what it held, in order. Called
+// by the timer Open starts, and directly by the tests that pin the ordering.
+func (o *groupOrderer) settleNow() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if !o.settling {
+		return
+	}
+	o.settling = false
+	o.drainLocked()
 }
 
 // Push takes one object and emits whatever that makes due, in order.
@@ -165,7 +207,19 @@ func (o *groupOrderer) Push(group, index uint64, emit func()) {
 	defer o.mu.Unlock()
 
 	if !o.started {
+		// No stream announced this one, so there is no settle to wait for: the
+		// mark is whatever arrived.
 		o.next, o.started = group, true
+	}
+	if o.settling {
+		// Held rather than placed, and the mark follows anything older that
+		// turns up. Nothing may go out until the window closes, because going
+		// out is exactly what would freeze the mark too high.
+		if group < o.next {
+			o.next = group
+		}
+		o.insertLocked(heldGroupObject{group: group, index: index, emit: emit})
+		return
 	}
 	switch {
 	case group < o.next:
@@ -208,6 +262,11 @@ func (o *groupOrderer) Finish(group uint64) {
 		return
 	}
 	o.finished[group] = true
+	if o.settling {
+		// Recorded, and acted on when the window closes: draining now would
+		// deliver, and the window exists so that nothing does.
+		return
+	}
 	o.drainLocked()
 }
 
@@ -248,6 +307,13 @@ func (o *groupOrderer) insertLocked(obj heldGroupObject) {
 func (o *groupOrderer) Drop() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.settleTimer != nil {
+		// Else the settle fires against a track that is gone and emits into a
+		// decoder being retired.
+		o.settleTimer.Stop()
+		o.settleTimer = nil
+	}
+	o.settling = false
 	o.held = nil
 	clear(o.finished)
 }

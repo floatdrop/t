@@ -150,6 +150,18 @@ before the next group's first object arrives. It is only a burst — a backfille
 group, or a publisher catching up after a stall — that puts several groups in
 flight at once, and there the ordering is the whole point.
 
+One thing there is bought with time rather than structure: a **settle window**
+at the start of a track. Open runs on the accept loop, so streams are announced
+in delivery order, but the readers run on their own goroutines — and a reader can
+push its first object before the accept loop has announced a stream that arrived
+just behind it. The mark cannot be lowered once anything has gone out, so that
+race cost the earlier group entirely, one run in eight over a three-group burst,
+silently. Nothing structural tells "an earlier group is still being announced"
+apart from "there is no earlier group", so for fifty milliseconds after the first
+stream of a track nothing is delivered and the mark is free to move down to
+whatever else turns up. It runs once per track; after it, every later group is
+ordered with no waiting at all.
+
 The backlog is bounded on top of the release rule, as a backstop rather than a
 working limit: every group waited for has had its stream arrive, and an open
 stream ends — by FIN, by reset, or by the session going away — so what the bound

@@ -3,6 +3,7 @@ package conf
 import (
 	"sync"
 	"testing"
+	"time"
 )
 
 // key is one object's place in the publisher's order, flattened so a test can
@@ -64,6 +65,7 @@ func TestOrdererEmitsOneGroupOnArrival(t *testing.T) {
 	var c orderCollector
 
 	o.Open(7)
+	o.settleNow()
 	for i := range uint64(5) {
 		push(o, &c, 7, i)
 		if got := c.order(); len(got) != int(i)+1 {
@@ -86,6 +88,7 @@ func TestOrdererHoldsAGroupAheadOfOneStillOpen(t *testing.T) {
 	// looks like.
 	o.Open(1)
 	o.Open(2)
+	o.settleNow()
 
 	// Group 2 runs ahead.
 	for i := range uint64(3) {
@@ -131,6 +134,7 @@ func TestOrdererGivesUpOnAGroupThatNeverArrives(t *testing.T) {
 	// Group 1 is announced and never delivers a thing.
 	o.Open(1)
 	o.Open(2)
+	o.settleNow()
 
 	for i := range uint64(maxHeldAcrossGroups + 1) {
 		push(o, &c, 2, i)
@@ -158,6 +162,7 @@ func TestOrdererDropsAGroupWhoseTurnHasPassed(t *testing.T) {
 	var c orderCollector
 
 	o.Open(1)
+	o.settleNow()
 	push(o, &c, 1, 0)
 	o.Finish(1)
 	o.Open(2)
@@ -183,9 +188,12 @@ func TestOrdererTakesTheLowestGroupOpened(t *testing.T) {
 	o := newGroupOrderer()
 	var c orderCollector
 
-	// The later stream is announced first, which is the race.
+	// The later stream is announced first, which is the race the settle window
+	// exists for: both are announced before the window closes, so the mark ends
+	// up on the earlier one however they arrived.
 	o.Open(9)
 	o.Open(8)
+	o.settleNow()
 
 	push(o, &c, 9, 0)
 	if got := c.order(); len(got) != 0 {
@@ -209,6 +217,7 @@ func TestOrdererWillNotRewindAfterEmitting(t *testing.T) {
 	var c orderCollector
 
 	o.Open(5)
+	o.settleNow()
 	push(o, &c, 5, 0)
 
 	o.Open(4) // late, and after group 5 has already gone out
@@ -232,6 +241,7 @@ func TestOrdererConcurrentStreamsStayOrdered(t *testing.T) {
 
 		o.Open(1)
 		o.Open(2)
+		o.settleNow()
 
 		var wg sync.WaitGroup
 		for _, group := range []uint64{1, 2} {
@@ -265,6 +275,7 @@ func TestOrdererDropForgetsTheBacklog(t *testing.T) {
 
 	o.Open(1)
 	o.Open(2)
+	o.settleNow()
 	push(o, &c, 2, 0)
 	if o.backlog() != 1 {
 		t.Fatalf("backlog holds %d, want 1", o.backlog())
@@ -299,6 +310,7 @@ func TestOrdererKeepsAGroupWhoseReaderIsSlow(t *testing.T) {
 	o.Open(0)
 	o.Open(1)
 	o.Open(2)
+	o.settleNow()
 
 	const perGroup = audioGroupObjects
 	for _, group := range []uint64{1, 2} {
@@ -331,5 +343,89 @@ func TestOrdererKeepsAGroupWhoseReaderIsSlow(t *testing.T) {
 	}
 	if o.abandoned != 0 {
 		t.Errorf("gave up on %d groups, want none", o.abandoned)
+	}
+}
+
+// TestOrdererSettlesBeforeTheFirstDelivery is the race the settle window exists
+// for, and it cost a whole group in the released build.
+//
+// Open runs on the accept loop, in the order the transport delivered the
+// streams, but the readers run on their own goroutines — so a reader can push
+// its first object before the accept loop has announced a stream that arrived
+// just behind it. Once anything has gone out the mark cannot be lowered, because
+// a group delivered behind one already played is the inversion all of this
+// exists to prevent, and the earlier group is dropped entirely. Measured at one
+// run in eight over a three-group burst, silently losing a third of the audio.
+//
+// Nothing may go out until the window closes, which is what keeps the mark free
+// to move down to the group that turns up a moment later.
+func TestOrdererSettlesBeforeTheFirstDelivery(t *testing.T) {
+	o := newGroupOrderer()
+	var c orderCollector
+
+	// The later stream is accepted first and its reader gets there before the
+	// earlier stream has been announced at all.
+	o.Open(1)
+	push(o, &c, 1, 0)
+	push(o, &c, 1, 1)
+	if got := c.order(); len(got) != 0 {
+		t.Fatalf("delivered %v before the settle window closed; the mark is not "+
+			"final yet and delivering is what would freeze it", got)
+	}
+
+	// Group 0's stream lands inside the window, which is the whole point.
+	o.Open(0)
+	push(o, &c, 0, 0)
+	o.Finish(0)
+	o.settleNow()
+
+	want := []key{{0, 0}, {1, 0}, {1, 1}}
+	got := c.order()
+	if len(got) != len(want) {
+		t.Fatalf("delivered %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("delivered %v, want %v", got, want)
+		}
+	}
+	if o.passed != 0 {
+		t.Errorf("dropped %d objects as already passed, want none", o.passed)
+	}
+}
+
+// TestOrdererSettleWindowExpiresOnItsOwn. The tests above close the window by
+// hand to stay deterministic, which would hide a settle that never ends — and a
+// settle that never ends is a track that never delivers anything at all.
+func TestOrdererSettleWindowExpiresOnItsOwn(t *testing.T) {
+	o := newGroupOrderer()
+	var c orderCollector
+
+	o.Open(4)
+	push(o, &c, 4, 0)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for len(c.order()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := c.order(); len(got) != 1 || got[0] != (key{4, 0}) {
+		t.Fatalf("delivered %v after the settle window should have expired, want "+
+			"the one object pushed into it", got)
+	}
+}
+
+// TestOrdererDropStopsTheSettle. A settle firing against a track that has gone
+// emits into a decoder being retired, and holds the sink alive to do it.
+func TestOrdererDropStopsTheSettle(t *testing.T) {
+	o := newGroupOrderer()
+	var c orderCollector
+
+	o.Open(2)
+	push(o, &c, 2, 0)
+	o.Drop()
+
+	time.Sleep(2 * settleWindow)
+	if got := c.order(); len(got) != 0 {
+		t.Errorf("delivered %v after Drop; nothing should go out on the way down", got)
 	}
 }

@@ -85,12 +85,39 @@ const enhancementObjectTimeout = 500 * time.Millisecond
 // layered call. A counter the publisher already has costs a few bytes and says
 // exactly the thing.
 //
-// Even, so it carries a varint (§1.4.3), and above the [0x4000, 0x7FFF]
-// Mandatory Track Property range (§2.5.1) so it cannot be read as one of those —
-// an endpoint that met an unknown mandatory property would have to drop the
-// track. Everything else in that space is producer-defined and passes through a
-// relay verbatim.
-const propEmissionIndex message.PropertyType = 0x8002
+// Even, so it carries a varint (§1.4.3), and inside [0x3800, 0x3FFF] — the
+// two-byte range §2.5 reserves for application-specific use, which IANA will
+// never allocate and which a relay that does not understand the application
+// format MUST forward unchanged. It is also outside the [0x4000, 0x7FFF]
+// Mandatory Track Property range (§2.5.1), so no endpoint is obliged to
+// understand it; one that met an unknown *mandatory* property would have to
+// drop the track. 0x3802 is not a GREASE value either (§14's 0x7F*N + 0x9D
+// first lands on 0x382D), so no peer may discard it as one.
+const propEmissionIndex message.PropertyType = 0x3802
+
+// propEmissionIndexLegacy is the code point this property rode on before
+// 0.6.3, kept only so that a call can span the move.
+//
+// It was picked for sitting above the mandatory range, which it does — but
+// 0x8000 and above is *registrable* (Expert Review, per the §15.8 MOQ
+// Properties registry), not reserved for applications. A registration landing
+// on 0x8002 would give the code point defined semantics and relay processing
+// rules, and a relay implementing it would then act on these objects'
+// properties. That is worse here than it sounds: reassembly keys on this
+// value, so an interfering relay would not merely confuse a reader, it would
+// reorder video.
+//
+// Written alongside [propEmissionIndex] and accepted on read, so that builds
+// on either side of the move interoperate in both directions. The cost of not
+// doing that is specific — see emissionIndex in remote.go, where a peer
+// finding neither property falls back to the Object ID, which for layered
+// video is strided by [layerObjectStride] and orders nothing. That is exactly
+// the macroblock garbage reorder.go exists to prevent, so a careless move
+// would have manufactured the fault it is meant to keep out.
+//
+// Remove this, and the second KV pair in writeObject, once no build older than
+// 0.6.3 can still join a call.
+const propEmissionIndexLegacy message.PropertyType = 0x8002
 
 // layerObjectStride is how far apart two temporal layers' object-ID ranges sit
 // inside one group.
@@ -658,10 +685,15 @@ func (t *trackPublisher) writeObject(f *bridge.MediaFrame) error {
 
 	// Where this object falls in the group's emission order, which is decode
 	// order. Every object carries it; it is what reassembly keys on.
-	props.Extras = append(props.Extras, wire.KVPair{
-		Type:   propEmissionIndex,
-		IntVal: t.emitted,
-	})
+	//
+	// Stamped twice while the code point moves, so a peer on either side of
+	// 0.6.3 finds the one it looks for — see propEmissionIndexLegacy, which
+	// also says when the second pair goes away. Append order is irrelevant:
+	// wire.Writer.KVPairs sorts by type before delta-encoding them.
+	props.Extras = append(props.Extras,
+		wire.KVPair{Type: propEmissionIndex, IntVal: t.emitted},
+		wire.KVPair{Type: propEmissionIndexLegacy, IntVal: t.emitted},
+	)
 
 	// Marks the enhancement layer disposable, on the first object of its
 	// subgroup — which is where §8 says a per-subgroup override lives, the Track

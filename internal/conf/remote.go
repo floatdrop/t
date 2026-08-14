@@ -1002,15 +1002,31 @@ func (r *remote) readMedia(
 
 // emissionIndex reads the object's position in its group's emission order.
 //
-// Falls back to the Object ID for a publisher that stamps none, which is right
-// for the only kind there is: one subgroup per group, where the IDs count from
-// zero without gaps and are the emission order. A layered publisher always
-// stamps it — the layout it uses is what makes the ID unusable.
+// Both code points are accepted while the property moves off 0x8002: a build
+// from before 0.6.3 stamps only the legacy one, and reading it is what lets a
+// call span the move. See propEmissionIndexLegacy for why it moved and when
+// this half goes away. The current code point wins when both are present,
+// which is what a peer new enough to stamp both sends.
+//
+// Falls back to the Object ID for a publisher that stamps neither, which is
+// right for the only kind there is: one subgroup per group, where the IDs
+// count from zero without gaps and are the emission order. A layered publisher
+// always stamps it — the layout it uses is what makes the ID unusable, so the
+// fallback is not a safety net for layered video and must not be reached by
+// one.
 func emissionIndex(objectID uint64, props loc.Properties) uint64 {
+	var legacy uint64
+	var haveLegacy bool
 	for _, kv := range props.Extras {
-		if kv.Type == propEmissionIndex {
+		switch kv.Type {
+		case propEmissionIndex:
 			return kv.IntVal
+		case propEmissionIndexLegacy:
+			legacy, haveLegacy = kv.IntVal, true
 		}
+	}
+	if haveLegacy {
+		return legacy
 	}
 	return objectID
 }

@@ -148,10 +148,17 @@ Waiting is free in the case that is every call. Measured at the frame rate and
 at the audio cadence, nothing is ever held: a group's stream has ended well
 before the next group's first object arrives. It is only a burst — a backfilled
 group, or a publisher catching up after a stall — that puts several groups in
-flight at once, and there the ordering is the whole point. The backlog is
-bounded at one group's worth on top of the release rule, so a stream that opens
-and then stalls costs the bound and no more, rather than repeating the frozen
-tile above.
+flight at once, and there the ordering is the whole point.
+
+The backlog is bounded on top of the release rule, as a backstop rather than a
+working limit: every group waited for has had its stream arrive, and an open
+stream ends — by FIN, by reset, or by the session going away — so what the bound
+covers is a relay that opens a stream, stops sending on it and never resets it.
+Sizing it as one group's worth was a bug, and cost a group on every burst: three
+groups written back to back reached the bound while the first group's reader
+goroutine had not yet been scheduled, and every object of it was then dropped as
+already passed. A backstop has to sit above any backlog the transport
+legitimately produces, which a burst of several groups is.
 
 The enhancement layer is also marked **disposable**, by a §8 object delivery
 timeout stamped on the first object of its subgroup: half a second, against the

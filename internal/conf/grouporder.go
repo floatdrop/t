@@ -54,13 +54,28 @@ import "sync"
 
 // maxHeldAcrossGroups bounds how many objects may wait for an earlier group.
 //
-// One audio group's worth, which is 500 ms at the 20 ms cadence and most of a
-// GOP at the frame rate. That is the whole cost of a stream that opens and then
-// stalls: the objects behind it wait, the bound fills, and the orderer gives up
-// on it and moves to the oldest thing it actually holds. Sized to a group rather
-// than larger because this is latency added to a live conversation, and a second
-// of it is worse than the seam it would smooth.
-const maxHeldAcrossGroups = audioGroupObjects
+// It is a backstop, not a working limit, and sizing it as one was a bug. Every
+// group waited for here has had its stream arrive — Open is what set the mark —
+// and an open stream ends, by FIN, by reset, or by the session going away, so in
+// the ordinary course nothing needs giving up on at all. What this covers is the
+// one case that does not end: a relay that opens a stream, stops sending on it
+// and never resets it, where without a ceiling the track would hold everything
+// behind it for the rest of the call.
+//
+// So it has to sit above any backlog the transport legitimately produces. A
+// burst puts several groups in flight at once and the reader takes each on its
+// own goroutine, so a group is behind by however long its goroutine waits to be
+// scheduled — nothing to do with the data, and on a loaded machine long enough
+// for two later groups to arrive whole. At one group's worth that is exactly
+// what happened: three groups of audio written back to back, the bound reached
+// while the first group's reader had not run, and all twenty-five of its objects
+// dropped as passed when they landed. Every burst cost a group.
+//
+// A hundred and twenty-eight is above any burst this stack produces — media
+// subscribes at the live edge, so a backfill is a couple of groups — and still a
+// ceiling. The pathological case pays for it in latency rather than silence:
+// what is held is emitted when the bound trips, not discarded.
+const maxHeldAcrossGroups = 128
 
 // heldGroupObject is one object waiting for an earlier group, with whatever the
 // caller needs to emit it. Ordered by group first and then by the publisher's

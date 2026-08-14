@@ -278,3 +278,58 @@ func TestOrdererDropForgetsTheBacklog(t *testing.T) {
 		t.Errorf("Drop emitted %v; nothing should go out on the way down", got)
 	}
 }
+
+// TestOrdererKeepsAGroupWhoseReaderIsSlow is the case that got past a bound
+// sized at one group's worth, and cost a whole group every time a burst landed.
+//
+// A burst puts several groups in flight and each is read on its own goroutine,
+// so a group can be behind by however long its goroutine waits to be scheduled —
+// nothing to do with the data, and on a loaded machine long enough for two later
+// groups to arrive whole. Giving up then throws away a group that was about to
+// be delivered intact, which is worse than the inversion the orderer exists to
+// prevent: the frames were on the wire and the app discarded them.
+//
+// Two later groups is what CI produced; the bound has to sit above that and
+// above anything else the transport legitimately does.
+func TestOrdererKeepsAGroupWhoseReaderIsSlow(t *testing.T) {
+	o := newGroupOrderer()
+	var c orderCollector
+
+	// All three streams arrive; only the first one's reader has not run yet.
+	o.Open(0)
+	o.Open(1)
+	o.Open(2)
+
+	const perGroup = audioGroupObjects
+	for _, group := range []uint64{1, 2} {
+		for i := range uint64(perGroup) {
+			push(o, &c, group, i)
+		}
+		o.Finish(group)
+	}
+	if got := c.order(); len(got) != 0 {
+		t.Fatalf("emitted %d objects while group 0 was still open; they belong "+
+			"behind it", len(got))
+	}
+
+	// Group 0's reader finally runs.
+	for i := range uint64(perGroup) {
+		push(o, &c, 0, i)
+	}
+	o.Finish(0)
+
+	got := c.order()
+	if len(got) != 3*perGroup {
+		t.Fatalf("emitted %d of %d objects; a group whose reader was merely late "+
+			"must not be given up on", len(got), 3*perGroup)
+	}
+	if at := ascendingKeys(got); at != -1 {
+		t.Errorf("object %d broke publisher order: %v", at, got[:at+1])
+	}
+	if o.passed != 0 {
+		t.Errorf("dropped %d objects as already passed, want none", o.passed)
+	}
+	if o.abandoned != 0 {
+		t.Errorf("gave up on %d groups, want none", o.abandoned)
+	}
+}

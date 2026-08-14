@@ -421,6 +421,7 @@
           <div class="field">
             <label for="vbr">Video bitrate</label>
             <select id="vbr" bind:value={store.media.videoBitrate} disabled={!store.media.useVideo}>
+              <option value={'adaptive'}>Adaptive</option>
               <option value={500_000}>500 kbps</option>
               <option value={1_000_000}>1 Mbps</option>
               <option value={1_500_000}>1.5 Mbps</option>

@@ -139,25 +139,26 @@ export interface VideoSettings {
   framerate: number;
   bitrate: number;
   /**
-   * Let the encoder spend above `bitrate` on complex frames, rather than
-   * holding to it.
+   * Let the link choose the rate, with `bitrate` as its ceiling.
    *
    * WebCodecs defaults `bitrateMode` to `"variable"`, and this app never set it
-   * — so the number in the settings was a target the encoder was free to
-   * exceed, and did. Measured on the local capture row: 50 kbps on a still face
-   * against 3500 kbps on movement, for a 1500 kbps setting. A conference has
-   * nowhere to put an overshoot of that size. There is no rate adaptation
-   * anywhere in this app, so the link cannot answer it by asking for less; what
-   * answers it instead is the relay shedding the enhancement layer, or timing a
-   * subgroup out, or giving up on the subscription — a picture that breaks up
-   * because the encoder spent four times its budget on one second of movement.
+   * — so the number here was a target the encoder was free to exceed, and did:
+   * 50 kbps on a still face against 3500 kbps on movement, for a 1500 kbps
+   * setting. The mode is pinned to `"constant"` now, which stops the overshoot
+   * and leaves the harder question, which is what the number should be.
    *
-   * So off by default: `"constant"` is what a live call over a link with no
-   * headroom wants, and holding the rate is worth more than the sharpest
-   * possible frame. On for a link with room to spare, where the quality VBR
-   * buys on movement is real and costs nothing anyone will see.
+   * Nothing answered that either. The encoder was configured once and changed
+   * only when a setting did, so a link that could not carry the picture was sent
+   * it anyway, and what answered *that* was the relay — shedding the enhancement
+   * layer, timing a subgroup out, giving up on the subscription. Right last
+   * resorts, wrong first one.
+   *
+   * So the rate follows the uplink instead, between a floor and this ceiling.
+   * See bitrate.ts for how it is chosen; the ceiling is what this source would
+   * have sent anyway, so adaptation only ever spends less than the setting, and
+   * a link that was carrying it keeps carrying it.
    */
-  variableBitrate: boolean;
+  adaptive: boolean;
 }
 
 export interface AudioSettings {
@@ -173,7 +174,7 @@ export const defaultVideoSettings: VideoSettings = {
   height: 720,
   framerate: 30,
   bitrate: 1_500_000,
-  variableBitrate: false,
+  adaptive: true,
 };
 
 export const defaultAudioSettings: AudioSettings = {
@@ -270,10 +271,11 @@ function sameVideoSettings(want: VideoSettings, have: VideoSettings | null): boo
     have.height === want.height &&
     have.framerate === want.framerate &&
     have.bitrate === want.bitrate &&
-    // Rebuilds like every other encoder setting. bitrateMode is fixed at
-    // configure time, so there is nothing to change in place even if this file
-    // had a path for it.
-    have.variableBitrate === want.variableBitrate
+    // Compared even though the ceiling above already differs whenever the pick
+    // does: switching off adaptation onto a fixed rate equal to the ceiling
+    // changes neither number, and the encoder may be several rungs below it by
+    // then. Without this that switch would do nothing at all.
+    have.adaptive === want.adaptive
   );
 }
 
@@ -290,6 +292,13 @@ function sameAudioSettings(want: AudioSettings, have: AudioSettings | null): boo
 export interface CaptureStats {
   videoFps: number;
   videoKbps: number;
+  /**
+   * What the encoder is currently asked for, against videoKbps, which is what
+   * came out. Reported because an adaptive rate is otherwise invisible: a
+   * picture that has quietly stepped down to the floor and one that never
+   * needed to look identical in every other number here.
+   */
+  videoBitrateTarget: number;
   encodeQueue: number;
   audioFps: number;
   audioKbps: number;
@@ -528,6 +537,15 @@ export class Capture {
 
   #video: HTMLVideoElement | null = null;
   #videoEncoder: VideoEncoder | null = null;
+  /**
+   * What the live encoder was configured with, so setVideoBitrate can hand back
+   * the same thing with one number changed. Held rather than rebuilt from the
+   * settings because the settings say what was asked for and this says what was
+   * granted — the size especially, which the camera gets a vote on.
+   */
+  #videoConfig: VideoEncoderConfig | null = null;
+  /** Latched once a reconfigure has failed, so it is tried once and reported once. */
+  #bitrateFixed = false;
   #audioEncoder: AudioEncoder | null = null;
   #audioCtx: AudioContext | null = null;
   #tap: AudioWorkletNode | null = null;
@@ -615,7 +633,7 @@ export class Capture {
   #svcLayers: Record<number, number> = {};
   #lastSample = 0;
   #stats: CaptureStats = {
-    videoFps: 0, videoKbps: 0, encodeQueue: 0,
+    videoFps: 0, videoKbps: 0, videoBitrateTarget: 0, encodeQueue: 0,
     audioFps: 0, audioKbps: 0, audioEncodeQueue: 0, keyFrames: 0, dropped: 0,
     echoCancellation: false, noiseSuppression: false, autoGainControl: false,
     denoiseActive: false,
@@ -887,16 +905,18 @@ export class Capture {
           bitrate: String(settings.bitrate),
         }),
     });
-    encoder.configure({
+    const videoConfig: VideoEncoderConfig = {
       codec,
       width,
       height,
       bitrate: primaryBitrate,
       framerate,
       // Said explicitly, because the default is not what a call wants: leaving
-      // it out means "variable", and the setting then buys a target the encoder
-      // may exceed several times over on movement. See VideoSettings.
-      bitrateMode: settings.variableBitrate ? 'variable' : 'constant',
+      // it out means "variable", and the rate then becomes a target the encoder
+      // may exceed several times over on movement — which is the opposite of
+      // what an adaptive rate is for, since it would overshoot the very number
+      // the controller just chose. See VideoSettings.
+      bitrateMode: 'constant',
       latencyMode: 'realtime',
       // Two temporal layers, so the picture has a step down that costs neither
       // a keyframe nor a re-subscribe. Nothing references the top layer, so
@@ -914,8 +934,11 @@ export class Capture {
       // a subscriber can start decoding from any group without an
       // out-of-band description.
       avc: { format: 'annexb' },
-    });
+    };
+    encoder.configure(videoConfig);
     this.#videoEncoder = encoder;
+    this.#videoConfig = videoConfig;
+    this.#bitrateFixed = false;
     // A fresh encoder is a fresh answer: scalabilityMode is configured here,
     // and whether this one honours it is not something the last one settled.
     this.#svcSampled = 0;
@@ -933,7 +956,7 @@ export class Capture {
       granted: `${grantedWidth}x${grantedHeight}`,
       framerate: String(Math.round(framerate)),
       bitrate: String(primaryBitrate),
-      bitrateMode: settings.variableBitrate ? 'variable' : 'constant',
+      adaptive: String(settings.adaptive),
       selected: String(settings.bitrate),
       state: encoder.state,
     });
@@ -1794,6 +1817,50 @@ export class Capture {
   onRecovered: (() => void) | null = null;
 
   /** Samples the counters into per-second rates for the debug panel. */
+  /**
+   * Changes what the running encoder is asked for, without rebuilding anything.
+   *
+   * The ordinary path for a bitrate change is a settings change, and that
+   * rebuilds the whole pipeline: a new encoder, a re-declared track, a
+   * republished catalog and a decoder reconfigure for every subscriber. That is
+   * the right cost for someone picking a different rate and far too much to pay
+   * every time a link moves, which is what makes this a second path rather than
+   * a reuse of the first.
+   *
+   * A reconfigure is not free either — expect a keyframe out of it — but a group
+   * already opens on one every second, so an extra one costs a fraction of a
+   * GOP. bitrate.ts is what keeps them rare.
+   *
+   * Tried once. If the platform will not reconfigure a live encoder the answer
+   * will not change on the next sample, and retrying every quarter second would
+   * bury the line that said so; the rate then stays where it is, which is the
+   * behaviour this app had before there was a controller at all.
+   */
+  setVideoBitrate(bitrate: number): void {
+    const encoder = this.#videoEncoder;
+    const current = this.#videoConfig;
+    if (!encoder || !current || this.#bitrateFixed) return;
+    if (encoder.state !== 'configured' || current.bitrate === bitrate) return;
+
+    const next: VideoEncoderConfig = { ...current, bitrate };
+    try {
+      encoder.configure(next);
+    } catch (err) {
+      this.#bitrateFixed = true;
+      bridge.report('WARN', 'the encoder will not change bitrate; leaving it fixed', {
+        from: String(current.bitrate),
+        to: String(bitrate),
+        err: String(err),
+      });
+      return;
+    }
+    this.#videoConfig = next;
+    bridge.report('INFO', 'video bitrate changed', {
+      from: String(current.bitrate),
+      to: String(bitrate),
+    });
+  }
+
   sampleStats(): CaptureStats {
     const now = performance.now();
     const elapsed = this.#lastSample ? (now - this.#lastSample) / 1000 : 0;
@@ -1802,6 +1869,7 @@ export class Capture {
       this.#stats = {
         videoFps: this.#videoFrames / elapsed,
         videoKbps: (this.#videoBytes * 8) / 1000 / elapsed,
+        videoBitrateTarget: this.#videoConfig?.bitrate ?? 0,
         encodeQueue: this.#videoEncoder?.encodeQueueSize ?? 0,
         audioFps: this.#audioFrames / elapsed,
         audioKbps: (this.#audioBytes * 8) / 1000 / elapsed,

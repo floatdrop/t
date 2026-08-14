@@ -196,6 +196,45 @@ never will — and the two places that used to, a five-minute ceiling here and a
 allowance of five decoder rebuilds in the frontend, were both indistinguishable
 from having given up while looking like ordinary operation.
 
+Everything above is the *subscriber's* half. The publisher had none: the encoder
+was configured once and changed only when a setting did, so a link that could not
+carry the picture was sent it anyway, and the shedding, the timeouts and the
+give-up above were what answered a problem this side could have avoided by
+sending less. Worse, the rate was not even the rate — WebCodecs defaults
+`bitrateMode` to `"variable"` and the app never set it, so the number in the
+settings was a target the encoder was free to exceed. Measured on the local
+capture row: 50 kbps on a still face against 3500 kbps on movement, for a 1500
+kbps setting.
+
+So the mode is pinned to `"constant"` and the number follows the uplink.
+`frontend/src/lib/bitrate.ts` steps between rungs on loss and on queueing delay —
+the smoothed RTT standing above its own minimum, which is the part of the delay
+we are causing and the only warning a deep buffer gives before it overflows.
+Either signal is enough to step down; climbing needs ten seconds with neither,
+and the two directions have separate thresholds, which is the whole of the
+hysteresis: a rate that is too high is being paid for in frames right now, while
+one that is too low costs only sharpness.
+
+Rungs rather than a continuous rate, because every change costs an encoder
+reconfigure and a keyframe with it — cheap against a GOP that opens on one every
+second, and not cheap several times a second. `Capture.setVideoBitrate` is a
+second path deliberately: the ordinary way to change bitrate is a settings
+change, and that rebuilds the pipeline, re-declares the track, republishes the
+catalog and costs every subscriber a decoder reconfigure. Right for someone
+picking a different rate, far too much for a link that moved.
+
+The ceiling is what the source would have sent anyway — the camera's setting, the
+screen share's own 3 Mbps — so adaptation only ever spends *less*, and a link that
+was carrying the old fixed rate keeps carrying it. It starts at that ceiling for
+the same reason. Only the uplink to the relay drives it: one encoder serves every
+subscriber, so there is no per-subscriber rate to choose, and what is downstream
+of the relay is the relay's to manage with the layer built to be shed. Resolution
+is untouched, deliberately — see the ladder above for why changing it mid-call was
+removed.
+
+Adaptive is the default in the picker; the fixed rungs remain, for a known link or
+for reproducing a fault on purpose.
+
 **Audio** has no keyframes, so it uses a fixed cadence — a new group every 25
 frames, which is 500 ms at the 20 ms framing WebCodecs produces. Opus's
 `OpusHead` is carried in the catalog's `initDataList`, and also stamped on the

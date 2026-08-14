@@ -7,6 +7,7 @@
  */
 
 import { bridge } from './bridge';
+import { BitrateController } from './bitrate';
 import {
   capture,
   DEFAULT_RESOLUTION,
@@ -71,12 +72,13 @@ export interface MediaSettings {
   videoSource: VideoSource;
   /** "WIDTHxHEIGHT", one of the rungs in VIDEO_LADDER. */
   resolution: string;
-  videoBitrate: number;
   /**
-   * Whether the encoder may spend above videoBitrate on complex frames. Off by
-   * default — see VideoSettings.variableBitrate for what leaving it on cost.
+   * A fixed rate in bits per second, or 'adaptive' to let the uplink choose one
+   * — see bitrate.ts. Adaptive is the default and never spends above what the
+   * source would have sent anyway, so the fixed rungs are a way to pin the rate
+   * for a known link or to reproduce a fault, not the ordinary path.
    */
-  variableBitrate: boolean;
+  videoBitrate: number | 'adaptive';
   audioBitrate: number;
   denoise: boolean;
 }
@@ -120,7 +122,7 @@ class Store {
   errors = $state<string[]>([]);
 
   captureStats = $state<CaptureStats>({
-    videoFps: 0, videoKbps: 0, encodeQueue: 0,
+    videoFps: 0, videoKbps: 0, videoBitrateTarget: 0, encodeQueue: 0,
     audioFps: 0, audioKbps: 0, audioEncodeQueue: 0, keyFrames: 0, dropped: 0,
     echoCancellation: false, noiseSuppression: false, autoGainControl: false,
     denoiseActive: false,
@@ -158,8 +160,7 @@ class Store {
     useAudio: true,
     videoSource: 'camera',
     resolution: DEFAULT_RESOLUTION,
-    videoBitrate: defaultVideoSettings.bitrate,
-    variableBitrate: defaultVideoSettings.variableBitrate,
+    videoBitrate: 'adaptive',
     audioBitrate: defaultAudioSettings.bitrate,
     denoise: defaultAudioSettings.denoise,
   });
@@ -333,6 +334,7 @@ class Store {
         case 'metrics':
           this.metrics = msg.metrics;
           this.history = appendCapped(this.history, msg.metrics, HISTORY_LENGTH);
+          this.#adaptBitrate(msg.metrics);
           break;
 
         case 'invite':
@@ -443,6 +445,44 @@ class Store {
     );
   }
 
+  /**
+   * Chooses a video bitrate from the uplink, once per metrics sample.
+   *
+   * Here rather than in the Go half only because the metrics already arrive
+   * here: they are sampled for the debug panel four times a second and carry
+   * everything the decision needs, so a controller on this side costs no
+   * protocol and sits next to the encoder it drives.
+   *
+   * Rebuilt whenever the pipeline is, so a new encoder starts at its ceiling
+   * rather than inheriting a rung chosen for a link, a camera or a resolution
+   * that is no longer the one running.
+   */
+  #bitrate: BitrateController | null = null;
+
+  #adaptBitrate(m: Metrics): void {
+    const settings = this.videoSettings;
+    if (!settings?.adaptive) {
+      // A fixed pick, or no video at all. Dropped rather than kept paused, so
+      // turning adaptation back on starts from the ceiling and not from
+      // whatever a link was doing minutes ago.
+      this.#bitrate = null;
+      return;
+    }
+    if (!this.#bitrate || this.#bitrateCeiling !== settings.bitrate) {
+      this.#bitrateCeiling = settings.bitrate;
+      this.#bitrate = new BitrateController(settings.bitrate);
+    }
+    const next = this.#bitrate.step({
+      lossPercent: m.lossPercent,
+      rttMs: m.rttMs,
+      minRttMs: m.minRttMs,
+    });
+    if (next !== null) capture.setVideoBitrate(next);
+  }
+
+  /** The ceiling the live controller was built for; a change rebuilds it. */
+  #bitrateCeiling = 0;
+
   /** The current selection as the capture layer's video settings, or null. */
   get videoSettings(): VideoSettings | null {
     if (!this.media.useVideo) return null;
@@ -470,19 +510,28 @@ class Store {
         // but it is one link either way, and a setting that applied to only
         // half of what this app publishes would be the harder thing to reason
         // about when the picture breaks up.
-        variableBitrate: this.media.variableBitrate,
+        // A share is adapted like the camera, against its own higher ceiling:
+        // "never above what this source would have sent" is the rule, and a
+        // screen's own number is 3 Mbps.
+        adaptive: this.media.videoBitrate === 'adaptive',
       };
     }
 
     const [width, height] = this.media.resolution.split('x').map(Number);
+    // Adaptive carries the default as its ceiling: that is what this app sent
+    // before there was a controller, so a link that was carrying it keeps
+    // carrying it and adaptation only ever spends less.
+    const adaptive = this.media.videoBitrate === 'adaptive';
     return {
       source: 'camera',
       deviceId: this.media.cameraId || undefined,
       width,
       height,
       framerate: defaultVideoSettings.framerate,
-      bitrate: this.media.videoBitrate,
-      variableBitrate: this.media.variableBitrate,
+      bitrate: this.media.videoBitrate === 'adaptive'
+        ? defaultVideoSettings.bitrate
+        : this.media.videoBitrate,
+      adaptive,
     };
   }
 

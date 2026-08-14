@@ -103,7 +103,19 @@
     <h3>Local capture</h3>
     <dl>
       <div><dt>Video encode</dt><dd>{cap.videoFps.toFixed(1)} fps</dd></div>
-      <div><dt>Video bitrate</dt><dd>{Math.round(cap.videoKbps)} kbps</dd></div>
+      <div>
+        <dt>Video bitrate</dt>
+        <!-- What came out, against what was asked for. An adaptive rate is
+             otherwise invisible: a picture that has quietly stepped down to the
+             floor and one that never needed to look identical in every other
+             number in this panel. -->
+        <dd>
+          {Math.round(cap.videoKbps)} kbps
+          {#if cap.videoBitrateTarget > 0}
+            <span class="target">/ {Math.round(cap.videoBitrateTarget / 1000)} target</span>
+          {/if}
+        </dd>
+      </div>
       <div><dt>Encoder queue</dt><dd>{cap.encodeQueue}</dd></div>
       <div><dt>Audio encode</dt><dd>{cap.audioFps.toFixed(1)} fps</dd></div>
       <div><dt>Audio bitrate</dt><dd>{Math.round(cap.audioKbps)} kbps</dd></div>
@@ -347,6 +359,10 @@
 </div>
 
 <style>
+  .target {
+    opacity: 0.6;
+  }
+
   .panel {
     padding: 12px;
     overflow-y: auto;

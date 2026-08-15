@@ -7,7 +7,7 @@
  */
 
 import { bridge } from './bridge';
-import { BitrateController } from './bitrate';
+import { BitrateController, floorFor } from './bitrate';
 import {
   capture,
   DEFAULT_RESOLUTION,
@@ -468,12 +468,15 @@ class Store {
       this.#bitrate = null;
       return;
     }
-    if (!this.#bitrate || this.#bitrateCeiling !== settings.bitrate) {
+    const floor = floorFor(settings.height);
+    if (!this.#bitrate || this.#bitrateCeiling !== settings.bitrate || this.#bitrateFloor !== floor) {
       this.#bitrateCeiling = settings.bitrate;
-      this.#bitrate = new BitrateController(settings.bitrate);
+      this.#bitrateFloor = floor;
+      this.#bitrate = new BitrateController(settings.bitrate, floor);
     }
     const next = this.#bitrate.step({
-      lossPercent: m.lossPercent,
+      packetsSent: m.packetsSent,
+      packetsLost: m.packetsLost,
       rttMs: m.rttMs,
       minRttMs: m.minRttMs,
     });
@@ -482,6 +485,13 @@ class Store {
 
   /** The ceiling the live controller was built for; a change rebuilds it. */
   #bitrateCeiling = 0;
+
+  /**
+   * The floor it was built for, which follows the resolution rather than the
+   * setting — so picking a different size rebuilds the controller even when the
+   * ceiling did not move.
+   */
+  #bitrateFloor = 0;
 
   /** The current selection as the capture layer's video settings, or null. */
   get videoSettings(): VideoSettings | null {

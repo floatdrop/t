@@ -43,6 +43,17 @@ import { addTapModule, watchAudioContext, type TapBlock } from './worklets';
 const KEYFRAME_INTERVAL_SEC = 1;
 
 /**
+ * How many samples the reported video bitrate is averaged over.
+ *
+ * One second at the panel's 250 ms cadence, which is exactly one GOP: the
+ * average then covers the same one keyframe however the window happens to land,
+ * and the number stops alternating between the rate with a keyframe in it and
+ * the rate without. Kept to a second so it still follows a real change — an
+ * adaptive step shows up within a second of being taken.
+ */
+const VIDEO_KBPS_WINDOW = 4;
+
+/**
  * The SVC mode the primary video encoding is configured with.
  *
  * One spatial layer, two temporal ones: frames alternate between a base layer
@@ -291,6 +302,16 @@ function sameAudioSettings(want: AudioSettings, have: AudioSettings | null): boo
 /** Live counters for the debug panel. */
 export interface CaptureStats {
   videoFps: number;
+  /**
+   * What came out of the encoder, averaged over VIDEO_KBPS_WINDOW samples.
+   *
+   * Averaged because a keyframe is several times the size of a delta frame and
+   * a group opens on one every second, so a rate taken over a single 250 ms
+   * sample reports the GOP structure rather than the bitrate: one window in
+   * four holds the keyframe and reads high, the other three read low. Measured
+   * swinging between 400 and 1500 kbps, four times a second, on an encoder that
+   * had not changed its target once.
+   */
   videoKbps: number;
   /**
    * What the encoder is currently asked for, against videoKbps, which is what
@@ -623,6 +644,8 @@ export class Capture {
 
   #videoFrames = 0;
   #videoBytes = 0;
+  /** The last VIDEO_KBPS_WINDOW samples of encoder output, oldest first. */
+  #videoRate: Array<{ bytes: number; seconds: number }> = [];
   #audioFrames = 0;
   #audioBytes = 0;
   #keyFrames = 0;
@@ -1866,9 +1889,17 @@ export class Capture {
     const elapsed = this.#lastSample ? (now - this.#lastSample) / 1000 : 0;
     this.#lastSample = now;
     if (elapsed > 0) {
+      this.#videoRate.push({ bytes: this.#videoBytes, seconds: elapsed });
+      if (this.#videoRate.length > VIDEO_KBPS_WINDOW) this.#videoRate.shift();
+      let windowBytes = 0;
+      let windowSeconds = 0;
+      for (const s of this.#videoRate) {
+        windowBytes += s.bytes;
+        windowSeconds += s.seconds;
+      }
       this.#stats = {
         videoFps: this.#videoFrames / elapsed,
-        videoKbps: (this.#videoBytes * 8) / 1000 / elapsed,
+        videoKbps: (windowBytes * 8) / 1000 / windowSeconds,
         videoBitrateTarget: this.#videoConfig?.bitrate ?? 0,
         encodeQueue: this.#videoEncoder?.encodeQueueSize ?? 0,
         audioFps: this.#audioFrames / elapsed,

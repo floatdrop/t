@@ -223,6 +223,30 @@ change, and that rebuilds the pipeline, re-declares the track, republishes the
 catalog and costs every subscriber a decoder reconfigure. Right for someone
 picking a different rate, far too much for a link that moved.
 
+The first version of that read each signal off the sample it arrived in, and a
+sample is a quarter of a second. That is not enough packets to have a loss
+*rate*: at 1500 kbps the interval carries around forty of them, so one lost
+packet reads as 2.5 per cent — over the threshold for stepping down, and over
+the threshold for being clean too, which left no band between them and made
+every sample either perfect or congested. QUIC loses a packet occasionally by
+design, so the rate walked to the floor on links that were fine, and could not
+come back: the same single packet reset the run of clean samples the climb
+needed. Both halves of that are now sized to what is actually being measured.
+Loss is taken over four seconds of packet counts, and only when the window holds
+enough packets for a ratio to mean anything; a standing queue has to be seen in
+two consecutive samples, because one spike is a Wi-Fi retransmit and not a full
+buffer; and a congested sample costs the clean run a second of progress instead
+of all of it. Ten *consecutive* perfect seconds was a condition an ordinary link
+never met.
+
+The bottom of the ladder follows the resolution rather than being one number.
+300 kbps is a watchable 360p and a blocky 720p, and the ladder ran to it
+whichever was being sent, so a link that tightened enough took the picture
+somewhere not worth sending. Below the floor for a size the honest move is fewer
+pixels, and this app does not change resolution mid-call on purpose — so that is
+where adaptation stops, and a link that cannot carry even that is left to the
+relay and the layer built to be shed.
+
 The ceiling is what the source would have sent anyway — the camera's setting, the
 screen share's own 3 Mbps — so adaptation only ever spends *less*, and a link that
 was carrying the old fixed rate keeps carrying it. It starts at that ceiling for
@@ -742,7 +766,14 @@ Drag its top edge to resize. Three tabs:
   the WebView's encoder and decoder counters (codec, decoded resolution, fps,
   queue depth, dropped frames, audio buffer depth, A/V offset). Reading them side
   by side is what localises a fault: a track carrying bytes while its decoder
-  sits at 0 fps means the problem is in the WebView, not the network. The **A/V**
+  sits at 0 fps means the problem is in the WebView, not the network. The local
+  capture bitrate there is averaged over a second, which is one GOP: a keyframe
+  is several times the size of a delta frame, so a rate taken over a single
+  250 ms sample reports where the keyframes fell rather than what the encoder is
+  spending — it was measured swinging between 400 and 1500 kbps, four times a
+  second, on an encoder whose target had not moved at all. That target sits next
+  to it, because a picture that has quietly stepped down and one that never
+  needed to look alike in every other number here. The **A/V**
   column is how far ahead of the audio clock the last presented frame was, plus
   how many frames are held waiting for their turn — the only place a sync
   regression is visible, and the column that revealed a 660 ms one. It reads

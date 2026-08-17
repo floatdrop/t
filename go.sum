@@ -10,6 +10,8 @@ github.com/floatdrop/moq-go v0.0.0-20260809102001-36184f36364e h1:WkbHXKopw3m7/q
 github.com/floatdrop/moq-go v0.0.0-20260809102001-36184f36364e/go.mod h1:/zHcdFlORz9sUlYdKxdvTdeTvXLS1wRTUm3gVIe5qZM=
 github.com/floatdrop/moq-go v0.0.0-20260817075557-2ae0bc926cd5 h1:3DORZCIcUaaxIFc+aUXouuCCoxM0TYYfOhaD42ol8EA=
 github.com/floatdrop/moq-go v0.0.0-20260817075557-2ae0bc926cd5/go.mod h1:uJwj0HXgBgovx8eT4EEAwe2jIrdU8LSRoRNM1rsruDI=
+github.com/floatdrop/moq-go v0.0.0-20260817080028-93560b0e17e2 h1:nPYuBToh7hAVDA306QjPhqRNKzpwxYkv0Zg2h0Otga0=
+github.com/floatdrop/moq-go v0.0.0-20260817080028-93560b0e17e2/go.mod h1:uJwj0HXgBgovx8eT4EEAwe2jIrdU8LSRoRNM1rsruDI=
 github.com/go-json-experiment/json v0.0.0-20251027170946-4849db3c2f7e h1:Lf/gRkoycfOBPa42vU2bbgPurFong6zXeFtPoxholzU=
 github.com/go-json-experiment/json v0.0.0-20251027170946-4849db3c2f7e/go.mod h1:uNVvRXArCGbZ508SxYYTC5v1JWoz2voff5pm25jU1Ok=
 github.com/go-ole/go-ole v1.3.0 h1:Dt6ye7+vXGIKZ7Xtk4s6/xVdGDQynvom7xCFEdWr6uE=

@@ -56,7 +56,7 @@ func ascending(got []uint64) int {
 // already ordered by the transport. Nothing may be held, because holding here
 // would add latency to every frame of every call.
 func TestReassemblerEmitsTheBaseLayerOnArrival(t *testing.T) {
-	g := newGroupReassembler()
+	g := newGroupReassembler(nil)
 	var c collector
 
 	for i := range uint64(5) {
@@ -76,7 +76,7 @@ func TestReassemblerEmitsTheBaseLayerOnArrival(t *testing.T) {
 // emitted in the right one. Subgroup 0 carries the even indices and subgroup 1
 // the odd ones — the L1T2 layout — and here subgroup 1 runs ahead.
 func TestReassemblerPlacesTheEnhancementLayer(t *testing.T) {
-	g := newGroupReassembler()
+	g := newGroupReassembler(nil)
 	var c collector
 
 	// The enhancement layer arrives first, and must wait: the frame at 1 cannot
@@ -107,7 +107,7 @@ func TestReassemblerPlacesTheEnhancementLayer(t *testing.T) {
 // odd indices showed four seconds of frozen tile followed by four seconds of
 // video at once, on any link that made the relay shed.
 func TestReassemblerNeverHoldsTheBaseLayer(t *testing.T) {
-	g := newGroupReassembler()
+	g := newGroupReassembler(nil)
 	var c collector
 
 	for _, index := range []uint64{0, 2, 4, 6} {
@@ -137,7 +137,7 @@ func TestReassemblerNeverHoldsTheBaseLayer(t *testing.T) {
 // network had delivered.
 func TestReassemblerKeepsTheBaseLayerWholeUnderAnyBacklog(t *testing.T) {
 	const frames = maxHeldEnhancement * 4
-	g := newGroupReassembler()
+	g := newGroupReassembler(nil)
 	g.graceWindow = 0 // pure-drop semantics; the grace window is tested separately
 	var c collector
 
@@ -173,7 +173,7 @@ func TestReassemblerKeepsTheBaseLayerWholeUnderAnyBacklog(t *testing.T) {
 // backlog buys, and why it is not simply zero.
 func TestReassemblerPlacesALayerDeliveredWhole(t *testing.T) {
 	const frames = maxHeldEnhancement
-	g := newGroupReassembler()
+	g := newGroupReassembler(nil)
 	var c collector
 
 	for i := range uint64(frames) {
@@ -200,7 +200,7 @@ func TestReassemblerPlacesALayerDeliveredWhole(t *testing.T) {
 // nothing references it, so it costs exactly itself, where holding the base
 // layer for it would cost the picture.
 func TestReassemblerDropsAnOvertakenEnhancementFrame(t *testing.T) {
-	g := newGroupReassembler()
+	g := newGroupReassembler(nil)
 	var c collector
 
 	g.Push(baseSubgroup, 0, c.emitter(0))
@@ -217,7 +217,7 @@ func TestReassemblerDropsAnOvertakenEnhancementFrame(t *testing.T) {
 // TestReassemblerDropsLateAndDuplicateFrames covers the §9.5
 // redundant-publisher case, where the same object can reach us twice.
 func TestReassemblerDropsLateAndDuplicateFrames(t *testing.T) {
-	g := newGroupReassembler()
+	g := newGroupReassembler(nil)
 	var c collector
 
 	g.Push(baseSubgroup, 0, c.emitter(0))
@@ -234,7 +234,7 @@ func TestReassemblerDropsLateAndDuplicateFrames(t *testing.T) {
 // layer that has stalled: its stream stays open owing an object, and everything
 // above piles up behind it.
 func TestReassemblerBoundsTheEnhancementBacklog(t *testing.T) {
-	g := newGroupReassembler()
+	g := newGroupReassembler(nil)
 	var c collector
 
 	// The frame at 1 is the next index due, so it goes out; from 3 on the base
@@ -257,7 +257,7 @@ func TestReassemblerBoundsTheEnhancementBacklog(t *testing.T) {
 // arriving in step, in emission order. Each object is the next index due when it
 // lands, so none of the reordering machinery engages and nothing waits.
 func TestReassemblerHoldsNothingInTheSteadyState(t *testing.T) {
-	g := newGroupReassembler()
+	g := newGroupReassembler(nil)
 	var c collector
 
 	for i := range uint64(30) {
@@ -283,7 +283,7 @@ func TestReassemblerHoldsNothingInTheSteadyState(t *testing.T) {
 // group of deltas with no keyframe to start on. Nothing is conceded now, so
 // there is no state for the two readers to race on.
 func TestReassemblerNeedsNoKeyFrameForItsOwnSake(t *testing.T) {
-	g := newGroupReassembler()
+	g := newGroupReassembler(nil)
 	var c collector
 
 	g.Push(1, 1, c.emitter(1))
@@ -303,7 +303,7 @@ func TestReassemblerNeedsNoKeyFrameForItsOwnSake(t *testing.T) {
 // keyframe, so what it does with undecodable frames is settled there and does
 // not need a second answer here.
 func TestReassemblerRunsAGroupJoinedPartWayThrough(t *testing.T) {
-	g := newGroupReassembler()
+	g := newGroupReassembler(nil)
 	var c collector
 
 	for _, index := range []uint64{4, 6, 8} {
@@ -311,6 +311,50 @@ func TestReassemblerRunsAGroupJoinedPartWayThrough(t *testing.T) {
 	}
 	if got, want := c.order(), []uint64{4, 6, 8}; !equal(got, want) {
 		t.Fatalf("order = %v, want %v", got, want)
+	}
+}
+
+// TestReassemblerEmitsUnderTheLock is the regression test for emitting after
+// releasing it, which is a one-line slip that no single run reliably catches.
+//
+// Releasing the lock before emit() lets two subgroup goroutines both sit
+// between the unlock and the emit. The enhancement goroutine advances next and
+// unlocks; the base goroutine takes the lock, advances, unlocks, and emits —
+// and the two emits reach the decoder in the wrong order, which is precisely
+// the inversion this file exists to prevent. It needs no burst and no grace
+// window: the plain L1T2 interleave produces it.
+//
+// Rare per run and certain across enough of them. Measured against the
+// unlocked version it showed up within the first dozen rounds; the count here
+// is well past that, and the whole test is under a second when it holds.
+func TestReassemblerEmitsUnderTheLock(t *testing.T) {
+	const (
+		rounds = 200
+		frames = 200
+	)
+	for round := range rounds {
+		g := newGroupReassembler(nil)
+		var c collector
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for layer := range uint64(2) {
+			wg.Go(func() {
+				<-start
+				for index := layer; index < frames; index += 2 {
+					g.Push(layer, index, c.emitter(index))
+				}
+			})
+		}
+		close(start) // both goroutines released together, to interleave them
+		wg.Wait()
+
+		got := c.order()
+		if at := ascending(got); at >= 0 {
+			t.Fatalf("round %d: emitted out of order at %d: %v — two subgroup "+
+				"goroutines interleaved their emits, which means one of them "+
+				"emitted outside the lock", round, at, got[max(0, at-4):at+1])
+		}
 	}
 }
 
@@ -324,7 +368,7 @@ func TestReassemblerRunsAGroupJoinedPartWayThrough(t *testing.T) {
 // is the scheduler's business, and dropping them is the design.
 func TestReassemblerConcurrentPushesStayOrdered(t *testing.T) {
 	const perLayer = maxHeldEnhancement * 2
-	g := newGroupReassembler()
+	g := newGroupReassembler(nil)
 	g.graceWindow = 0 // pure-drop semantics; the grace window is tested separately
 	var c collector
 
@@ -362,7 +406,7 @@ func TestReassemblerConcurrentPushesStayOrdered(t *testing.T) {
 // test so a change to the layout trips something rather than silently
 // reordering video.
 func TestReassemblerOrdersOnEmissionIndex(t *testing.T) {
-	g := newGroupReassembler()
+	g := newGroupReassembler(nil)
 	var c collector
 
 	// L1T2 emission: T0, T1, T0, T1... indexed 0,1,2,3 in that order, split
@@ -452,7 +496,7 @@ func TestGroupsAreNotReusedAfterARestart(t *testing.T) {
 // The grace window holds the base frame briefly, and the enhancement frame
 // arrives within that window, so both go out in order.
 func TestReassemblerGraceWindowWaitsForLateEnhancement(t *testing.T) {
-	g := newGroupReassembler()
+	g := newGroupReassembler(nil)
 	g.graceWindow = 50 * time.Millisecond // generous for a goroutine to wake
 	var c collector
 
@@ -503,7 +547,7 @@ func TestReassemblerGraceWindowWaitsForLateEnhancement(t *testing.T) {
 // the window only helps when the frame is actually coming, and when it is
 // not, the behavior is unchanged.
 func TestReassemblerGraceWindowExpiresAndDrops(t *testing.T) {
-	g := newGroupReassembler()
+	g := newGroupReassembler(nil)
 	g.graceWindow = 5 * time.Millisecond
 	var c collector
 
@@ -543,7 +587,7 @@ func TestReassemblerGraceWindowExpiresAndDrops(t *testing.T) {
 // so the grace window never engages, and TestReassemblerNeverHoldsTheBaseLayer
 // holds.
 func TestReassemblerGraceWindowDoesNotEngageForShedLayer(t *testing.T) {
-	g := newGroupReassembler()
+	g := newGroupReassembler(nil)
 	g.graceWindow = 5 * time.Second // would be catastrophic if it engaged
 	var c collector
 

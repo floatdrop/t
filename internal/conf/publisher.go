@@ -65,11 +65,21 @@ const videoSubgroupTimeout = 10 * time.Second
 //
 // Half of what the base layer gets, which is the ordering that matters: the
 // disposable layer must always be given up on first, or shedding it buys
-// nothing that the group being dropped would not have taken anyway. Above a
-// keyframe's own transmission time on the slowest link the ladder tolerates —
-// eight kilobytes at half a megabit is an eighth of a second, and the
-// enhancement layer queues behind every one of them — so a link that is merely
-// slow does not lose its top layer for coping.
+// nothing that the group being dropped would not have taken anyway.
+//
+// The floor is a keyframe's own transmission time on the slowest link the
+// ladder tolerates — eight kilobytes at half a megabit is an eighth of a
+// second, and the enhancement layer queues behind every one of them — so a link
+// that is merely slow does not lose its top layer for coping. That argues for
+// a few hundred milliseconds and no more; what sets it this much higher is the
+// half of the pair, since it has to stay well under videoSubgroupTimeout to be
+// given up on first, and that one is sized against the GOP.
+//
+// Which means this is generous rather than tuned, and generous in the direction
+// that costs: an enhancement frame worth delivering half a second late is not
+// worth delivering five seconds late, and the link spends the difference on a
+// frame whose moment has gone. Worth revisiting against a measurement of what
+// the shedding path actually needs, rather than against the keyframe interval.
 const enhancementObjectTimeout = 5 * time.Second
 
 // propEmissionIndex is a producer-defined Object Property carrying an object's
@@ -208,13 +218,14 @@ func newPublisher(
 	}
 
 	var err error
-	if p.catalog, err = p.publish(ctx, msf.CatalogTrackName); err != nil {
+	if p.catalog, err = p.publish(ctx, msf.CatalogTrackName, nil, nil); err != nil {
 		return nil, err
 	}
-	if p.video, err = p.newTrack(ctx, VideoTrack, videoSubgroupTimeout); err != nil {
+	if p.video, err = p.newTrack(ctx, VideoTrack, videoSubgroupTimeout,
+		dynamicGroupsProperty, cfg.OnKeyFrameRequest); err != nil {
 		return nil, err
 	}
-	if p.audio, err = p.newTrack(ctx, AudioTrack, 0); err != nil {
+	if p.audio, err = p.newTrack(ctx, AudioTrack, 0, nil, nil); err != nil {
 		return nil, err
 	}
 
@@ -232,14 +243,36 @@ func newPublisher(
 	return p, nil
 }
 
+// dynamicGroupsProperty advertises DYNAMIC_GROUPS=1 (§12.6) — this track's
+// groups are cut on demand, not on a schedule a subscriber could predict.
+//
+// It is the precondition for NEW_GROUP_REQUEST (§10.2.13): a relay declines to
+// forward one upstream unless the track says this, so without it a joining
+// subscriber's request is dropped at the relay and nothing reaches the encoder.
+//
+// Video only, and true of video specifically: a group opens on a keyframe, and
+// the encoder can be asked for one at any moment. Audio's groups are a fixed
+// 25-object cadence with nothing to ask for.
+var dynamicGroupsProperty = message.AppendTrackProperties([]wire.KVPair{
+	{Type: message.PropertyDynamicGroups, IntVal: 1},
+})
+
 // publish opens one PUBLISH request stream and starts its broker, which
 // answers subscriber REQUEST_UPDATEs with the REQUEST_OK §10.9 mandates
 // and serializes those replies against a later Done.
-func (p *publisher) publish(ctx context.Context, name string) (*session.Publication, error) {
+//
+// onNewGroup, when non-nil, is called for a REQUEST_UPDATE carrying
+// NEW_GROUP_REQUEST (§10.2.13) — a subscriber asking this publisher to start a
+// group. The broker sends the REQUEST_OK either way; this is what makes the
+// answer more than polite.
+func (p *publisher) publish(
+	ctx context.Context, name string, properties []byte, onNewGroup func(),
+) (*session.Publication, error) {
 	pub, err := p.sess.Publish(ctx, &message.Publish{
-		Namespace:  p.ns,
-		Name:       []byte(name),
-		TrackAlias: p.sess.AllocOutboundTrackAlias(),
+		Namespace:       p.ns,
+		Name:            []byte(name),
+		TrackAlias:      p.sess.AllocOutboundTrackAlias(),
+		TrackProperties: properties,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("conf: PUBLISH %s: %w", name, err)
@@ -249,6 +282,21 @@ func (p *publisher) publish(ctx context.Context, name string) (*session.Publicat
 	go func() {
 		err := pub.Broker().Serve(ctx, func(m message.Message) bool {
 			p.log.Debug("publish stream message", "track", name, "type", m.Type().String())
+			upd, ok := m.(*message.RequestUpdate)
+			if !ok || onNewGroup == nil {
+				return true
+			}
+			// The value is the group being asked for. Nothing here acts on it:
+			// the relay has already applied §10.2.13's rules — it forwards a
+			// request only above the current largest group and only when none
+			// of equal or greater value is outstanding — so a room joining at
+			// once arrives as one request, and the answer to any of them is the
+			// same single keyframe.
+			if req, ok := upd.Parameters.Find(message.ParamNewGroupRequest); ok {
+				p.log.Debug("subscriber asked for a new group",
+					"track", name, "group", req.Varint)
+				onNewGroup()
+			}
 			return true
 		})
 		if err != nil && ctx.Err() == nil {
@@ -262,8 +310,10 @@ func (p *publisher) newTrack(
 	ctx context.Context,
 	name string,
 	subgroupTimeout time.Duration, // zero disables it — see videoSubgroupTimeout
+	properties []byte,
+	onNewGroup func(),
 ) (*trackPublisher, error) {
-	pub, err := p.publish(ctx, name)
+	pub, err := p.publish(ctx, name, properties, onNewGroup)
 	if err != nil {
 		return nil, err
 	}

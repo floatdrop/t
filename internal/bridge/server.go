@@ -45,9 +45,18 @@ const maxFrameBytes = 4 << 20
 // a frame this old is not worth sending, because the frontend paints the newest
 // of what it is given and throws the rest away.
 const (
-	// Two keyframe intervals, so what survives always contains a keyframe and a
+	// Two keyframe intervals, so what survives contains a keyframe and a
 	// frontend coming back from a stall resumes on one instead of decoding
 	// deltas against references it never received.
+	//
+	// Only where the slot backstop below is not the thing that decides, which is
+	// the part worth knowing: the slots are shared across every participant, so
+	// at four people at 30 fps each gets about 128 of the 512 — four seconds,
+	// which is under one five-second GOP, and the keyframe can be evicted after
+	// all. The guarantee holds to three participants and degrades from there
+	// into "recover at the next keyframe", which is what it was before any of
+	// this existed. Raising the depth is the fix if it ever matters; it costs
+	// memory in the calls that never stall, so it has not been paid yet.
 	videoMaxAge = 10 * time.Second
 	// Under the player's own 250 ms ceiling, so the bridge gives up on stale
 	// sound before the ring buffer has to trim it. Both are audible; this one

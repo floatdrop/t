@@ -378,6 +378,12 @@ func (a *App) runPublishPump(ctx context.Context, room *conf.Room, p *publishPum
 // for every subscriber. The reconnect path has always asked for one; the write
 // path, which reaches the same state for a different reason, never did.
 //
+// A remote subscriber can reach this too, through NEW_GROUP_REQUEST (§10.2.13)
+// on our video publication — see conf.Config.OnKeyFrameRequest. That one is not
+// about reopening a stalled group: it is a peer that has just subscribed and
+// would otherwise see nothing until our next scheduled keyframe. Same remedy,
+// so the same rate limit, and the same one place that asks the encoder.
+//
 // Rate limited because the trigger repeats at the frame rate: without it a
 // stalled publisher would ask thirty times a second for something that takes
 // one encode to deliver.
@@ -521,6 +527,12 @@ func (a *App) join(ctx context.Context, req *bridge.JoinRequest) error {
 		// has no UI for trusting one. Revisit before any deployment
 		// where the relay identity matters.
 		Insecure: true,
+		// A peer subscribing to our video asks for a group so it does not have
+		// to wait out the encoder's keyframe schedule. Same rate-limited path
+		// the local triggers use, so a room joining at once — which the relay
+		// has already collapsed to one request — cannot turn into a keyframe
+		// per joiner.
+		OnKeyFrameRequest: a.requestKeyFrame,
 	}
 
 	a.counters.Reset()

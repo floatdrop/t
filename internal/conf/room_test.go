@@ -294,6 +294,15 @@ func selfSignedCert(t *testing.T) tls.Certificate {
 // quickly rather than being papered over.
 func joinRoom(t *testing.T, addr, room, nickname string) (*Room, *recorder) {
 	t.Helper()
+	return joinRoomWithKeyFrameHook(t, addr, room, nickname, nil)
+}
+
+// joinRoomWithKeyFrameHook is joinRoom for a participant whose response to a
+// subscriber's NEW_GROUP_REQUEST is what the test is about.
+func joinRoomWithKeyFrameHook(
+	t *testing.T, addr, room, nickname string, onKeyFrame func(),
+) (*Room, *recorder) {
+	t.Helper()
 	rec := newRecorder()
 
 	const attempts = 3
@@ -301,10 +310,11 @@ func joinRoom(t *testing.T, addr, room, nickname string) (*Room, *recorder) {
 	for attempt := 1; attempt <= attempts; attempt++ {
 		var r *Room
 		r, err = Join(t.Context(), testLogger(t), rec, telemetry.NewRegistry(), Config{
-			Relay:    addr,
-			Room:     room,
-			Nickname: nickname,
-			Insecure: true,
+			Relay:             addr,
+			Room:              room,
+			Nickname:          nickname,
+			Insecure:          true,
+			OnKeyFrameRequest: onKeyFrame,
 		})
 		if err == nil {
 			t.Cleanup(r.Close)
@@ -314,6 +324,22 @@ func joinRoom(t *testing.T, addr, room, nickname string) (*Room, *recorder) {
 	}
 	t.Fatalf("join as %s: %v", nickname, err)
 	return nil, nil
+}
+
+// declareBothTracks gives a participant the audio and video configs a
+// subscriber needs before it will subscribe to anything.
+func declareBothTracks(t *testing.T, r *Room) {
+	t.Helper()
+	if err := r.DeclareTrack(&bridge.TrackConfig{
+		Kind: "audio", Codec: "opus", SampleRate: 48000, Channels: 1,
+	}); err != nil {
+		t.Fatalf("declare audio: %v", err)
+	}
+	if err := r.DeclareTrack(&bridge.TrackConfig{
+		Kind: "video", Codec: "avc1.42e01f", Width: 640, Height: 360,
+	}); err != nil {
+		t.Fatalf("declare video: %v", err)
+	}
 }
 
 // waitFor polls until cond holds or the deadline passes. Discovery and

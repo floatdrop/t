@@ -26,26 +26,22 @@ import { addTapModule, watchAudioContext, type TapBlock } from './worklets';
 /**
  * Seconds between forced keyframes — also the video group length.
  *
- * It is what a subscriber waits before its first picture, because a decoder
- * cannot start on a delta frame. That used to be covered by a FETCH replaying
- * the group in progress; the FETCH is gone, so this is the wait, and five
- * seconds is a tile that appears rather than one that is missing.
+ * This is no longer what a subscriber waits before its first picture, and that
+ * is the thing to know about it. A joining subscriber backfills the group in
+ * progress from its keyframe and asks this encoder for a fresh one besides, so
+ * the interval sets neither of those waits any more. The backend does both —
+ * see `backfillGroup` and `requestNewGroup` in `internal/conf/remote.go`, and
+ * the keyframe it asks for arrives here as `requestKeyFrame`.
  *
- * It is also how much a lost group costs, which is the other half of the
- * argument: a group is all-or-nothing to a decoder, so a longer group
- * raises the cost of losing one.
+ * So what is left is a straight bitrate-against-loss trade. A longer group
+ * spends less on keyframes — at 30 fps, moving from a one-second interval to
+ * five takes them from roughly six per cent of the bitrate to about one — and a
+ * group is all-or-nothing to a decoder, so a longer one costs more when it is
+ * lost. Five seconds takes the bitrate and accepts the loss cost, because
+ * losing a whole group is rare where a blank tile on every join was certain.
  *
- * The price is keyframes being a smaller share of the stream — at 30 fps and
- * roughly four delta frames to a keyframe, about one per cent of the bitrate
- * moves from deltas to keyframes. That is the cheaper side of this trade for
- * a call, where a blank tile is noticed and a slightly softer picture is not.
- *
- * Five seconds rather than one: the shorter interval was chosen when the FETCH
- * still set the join latency, and the interval was the only thing that did.
- * The grace window in the reassembler now covers the inter-layer skew that
- * was the original reason for the short interval, so the longer group is safe
- * and the bitrate savings and reduced keyframe overhead are worth the longer
- * join wait.
+ * Changing it is cheap now in a way it was not before: nothing about the join
+ * path is sized against this number.
  */
 const KEYFRAME_INTERVAL_SEC = 5;
 

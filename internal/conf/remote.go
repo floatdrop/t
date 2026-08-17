@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/floatdrop/moq-go/pkg/moqt"
 	"github.com/floatdrop/moq-go/pkg/moqt/loc"
 	"github.com/floatdrop/moq-go/pkg/moqt/message"
 	"github.com/floatdrop/moq-go/pkg/moqt/msf"
@@ -75,6 +76,21 @@ const maxLag = 1500 * time.Millisecond
 // backfilled group; doing it every second would spend more of the link on
 // recovering than on media.
 const resyncCooldown = 15 * time.Second
+
+// videoBackfillTimeout is the ceiling on how long live video waits behind a
+// joining FETCH that has not finished.
+//
+// The backfill goes in front of live because that is the order a decoder needs
+// them in, and the price of that ordering is that a backfill which stalls holds
+// the picture it was supposed to produce. So the wait is bounded, and the bound
+// is what the backfill costs when the relay is not answering rather than what
+// it costs when it is: a base-layer GOP is a couple of hundred kilobytes and
+// arrives in well under a second on any link this app stays joined on.
+//
+// Three seconds because the fallback is not silence — it is the next keyframe,
+// which the new-group request has already been sent for. Waiting past the point
+// where that would have arrived buys nothing.
+const videoBackfillTimeout = 3 * time.Second
 
 // audioRebuildCooldown is the shortest gap between rebuilding audio after the
 // relay has refused it. Audio is never demoted — there is nothing smaller and
@@ -234,6 +250,22 @@ type remoteTrack struct {
 	sub    *session.Subscription
 	label  string
 
+	// backfilled is the group the joining FETCH replays, and hasBackfill says
+	// there is one. Set before any stream can arrive and never written again,
+	// so both are read without a lock.
+	//
+	// It is also the boundary the live path ignores below. A largest-object
+	// subscription starts after the largest object in that group, which with
+	// per-layer ID ranges (see layerObjectStride) is always an *enhancement*
+	// object — so what live delivers for this group is enhancement frames whose
+	// base frames the same filter withheld. Undecodable by construction, and the
+	// backfill is the authority on this group instead.
+	backfilled  uint64
+	hasBackfill bool
+	// fetch is the joining FETCH backfilling that group. Written and read under
+	// the remote's lock, so a track dropped mid-setup cannot leave it open.
+	fetch *session.FetchRequest
+
 	// groupsMu guards groups, which holds one reassembler per group currently
 	// in flight — keyed by Group ID, entered by every subgroup stream of that
 	// group and retired once the publisher has moved two groups past it.
@@ -249,6 +281,13 @@ type remoteTrack struct {
 	// order holds this track's groups in the order the publisher wrote them,
 	// which a per-group reassembler cannot: see grouporder.go.
 	order *groupOrderer
+
+	// onDrop, when non-nil, reports an object the reassembler gave up on. Held
+	// on the track rather than assigned to each reassembler after the fact:
+	// every subgroup stream of a group reaches the same reassembler on its own
+	// goroutine, so a field set by whichever arrived first races the Push that
+	// reads it. Wired once in subscribeTrack, which has the logger.
+	onDrop func(group, subgroup, index uint64, reason dropReason)
 }
 
 // reassemblerFor returns the reassembler for one group, creating it on the
@@ -261,7 +300,13 @@ func (t *remoteTrack) reassemblerFor(group uint64) *groupReassembler {
 	}
 	g, ok := t.groups[group]
 	if !ok {
-		g = newGroupReassembler()
+		var onDrop func(subgroup, index uint64, reason dropReason)
+		if t.onDrop != nil {
+			onDrop = func(subgroup, index uint64, reason dropReason) {
+				t.onDrop(group, subgroup, index, reason)
+			}
+		}
+		g = newGroupReassembler(onDrop)
 		t.groups[group] = g
 		t.retireSupersededLocked(group)
 	}
@@ -865,6 +910,24 @@ func (r *remote) subscribeTrack(
 		label:  label,
 	}
 	track.order = newGroupOrderer()
+	// §10.2.16: the publisher MUST send LARGEST_OBJECT in SUBSCRIBE_OK once
+	// anything has been published on the track. Its absence therefore means an
+	// empty track — the subscription starts at the beginning, there is no group
+	// in progress, and there is nothing to backfill.
+	if largest, ok := sub.OK.Parameters.Find(message.ParamLargestObject); ok {
+		track.backfilled, track.hasBackfill = largest.Group, true
+	}
+	if kind == bridge.KindVideo {
+		// Video only: audio has no layers, so its reassembler never holds
+		// anything and never has anything to give up on. Set before any stream
+		// can reach reassemblerFor, which is what keeps it off the racy path
+		// the reassembler used to take it on.
+		track.onDrop = func(group, subgroup, index uint64, reason dropReason) {
+			r.log.Warn("reassembler dropped frame",
+				"handle", handle, "group", group, "subgroup", subgroup,
+				"index", index, "reason", reason)
+		}
+	}
 
 	r.mu.Lock()
 	if r.closed {
@@ -906,18 +969,259 @@ func (r *remote) subscribeTrack(
 	r.log.Info("subscribed to track",
 		"track", name, "alias", sub.TrackAlias(), "handle", handle, "codec", cfg.Codec)
 
+	if kind == bridge.KindVideo && track.hasBackfill {
+		// Claimed here, before the FETCH is even sent, so the mark starts at the
+		// group being backfilled rather than at the first group live delivers.
+		// groupOrderer.Open normally runs off the accept loop where the arrival
+		// order still exists; there is no stream to hang it on here, and the
+		// order is not in doubt — the backfilled group precedes every group the
+		// subscription can carry. Released by backfillGroup, however it ends.
+		track.order.Open(track.backfilled)
+
+		// On its own goroutine: it is a FETCH round trip, and nothing here needs
+		// its result — the objects it brings are forwarded from the handler it
+		// registers. Done inline it sat in front of everything behind this
+		// subscribe, holding `applying` across the trip: the participant's audio
+		// waited for it, so did any catalog arriving meanwhile, and against a
+		// track with nothing published yet the wait was long enough to time
+		// tests out. A congested link is exactly where that trip is slowest and
+		// where audio can least afford to queue behind a picture.
+		go r.backfillGroup(subMsg.RequestID, track, counter)
+	}
 	if kind == bridge.KindVideo {
-		// On its own goroutine: it is a FETCH round trip with no deadline, and
-		// nothing here needs its result — the objects it brings are forwarded
-		// from the handler it registers. Done inline it sat in front of
-		// everything behind this subscribe, holding `applying` across the trip:
-		// the participant's audio waited for it, so did any catalog arriving
-		// meanwhile, and against a track with nothing published yet the wait
-		// was long enough to time tests out. A congested link is exactly where
-		// that trip is slowest and where audio can least afford to queue behind
-		// a picture.
+		// Independent of the backfill and useful even when there was nothing to
+		// backfill: ask the publisher to cut a new group, which for video is a
+		// keyframe. Also on its own goroutine — it is a REQUEST_UPDATE round
+		// trip through the relay.
+		go r.requestNewGroup(track)
 	}
 	return nil
+}
+
+// backfillGroup replays the group already in progress, so a fresh video
+// subscription has a picture now rather than at the publisher's next keyframe.
+//
+// A SUBSCRIBE with the largest-object filter starts at the first object *after*
+// whatever exists, which for video is the middle of a GOP — undecodable, since
+// playback discards inbound frames until it sees a keyframe. So a new
+// subscription showed nothing at all until the next keyframe, up to the whole
+// keyframe interval away. Every layer change, every demotion, every lag resync
+// and every tile scrolled back into view paid it.
+//
+// The Relative Joining FETCH (§10.12.2) with JoiningStart=0 resolves to
+// {largest.Group, 0} through {largest.Group, largest.Object + 1} — the current
+// group from its keyframe up to exactly where the subscription begins. The two
+// ranges are adjacent: no object arrives twice and none is skipped. It is the
+// same pairing the catalog subscription has always used.
+//
+// # Why this one can win where the last one could not
+//
+// There was a backfill here before and it was removed, because it *raced* live
+// video and lost: it delivered into the same handle behind a high-water mark on
+// what had already been shown, and every backfilled frame is older than every
+// live frame by construction, so the first live object to land made the whole
+// replay stale — after a round trip and a group of bytes. It paid the entire
+// cost of the thing it existed to avoid.
+//
+// The ranges were never racing, though. They are adjacent and disjoint, which
+// makes them a concatenation: backfill, then live. So the backfill claims its
+// group's turn in the track's groupOrderer (see subscribeTrack) and live waits
+// behind it, through the same mechanism that already orders any group against
+// any later one. There is still exactly one path from the wire to the decoder —
+// which is what removing the last backfill was really for — and this feeds into
+// it rather than running alongside.
+//
+// # Why it is affordable
+//
+// SUBGROUP_FILTER (§5.1.3) narrows it to the base layer. That is the reference
+// chain and nothing else: every base frame back to the keyframe is needed to
+// decode the next one, and no enhancement frame in the past is referenced by
+// anything at all. Roughly halves the bytes, and every byte left is load-bearing.
+//
+// It is also what lets the response stream. A FETCH answers in ascending Object
+// ID, and the layers own disjoint ID ranges (see layerObjectStride), so an
+// unfiltered backfill arrives as the whole base layer followed by the whole
+// enhancement layer — decode order for neither, so it has to be buffered whole
+// and sorted before any of it can go out. Filtered to one subgroup, ascending
+// Object ID *is* decode order, and each frame goes to the decoder as it lands.
+// The old backfill buffered; that is most of why it was always last.
+//
+// Video only. The same backfill on audio would deliver up to half a second of
+// sound that has already been and gone, into a player whose whole job is
+// staying near the live edge.
+func (r *remote) backfillGroup(
+	subscribeID uint64,
+	track *remoteTrack,
+	counter *telemetry.TrackCounter,
+) {
+	// The group's turn is claimed before the FETCH is sent and has to be given
+	// back however this ends — refused, reset, drained, or timed out. Left
+	// unreleased, every live group would sit behind a group that is never
+	// coming until the cross-group backlog gave up on it, which is seconds of
+	// video held for nothing.
+	var once sync.Once
+	finish := func() { once.Do(func() { track.order.Finish(track.backfilled) }) }
+	// The FETCH itself has no deadline, and the objects arrive on a stream that
+	// can simply stall. This is the ceiling on how long live video waits for a
+	// picture that would have been nicer to have first.
+	timer := time.AfterFunc(videoBackfillTimeout, func() {
+		r.log.Debug("video backfill timed out", "handle", track.handle,
+			"group", track.backfilled)
+		finish()
+	})
+	defer timer.Stop()
+
+	fetchMsg := &message.Fetch{
+		FetchType: message.FetchTypeRelativeJoining,
+		Joining: &message.JoiningFetch{
+			JoiningRequestID: subscribeID,
+			JoiningStart:     0,
+		},
+		Parameters: message.Parameters{
+			// Level with live video: it is the same pictures and they are needed
+			// first. See the priority constants for how much that is worth on
+			// either transport available here.
+			message.SubscriberPriorityParam(videoPriority),
+			// The base layer alone — see the doc comment. One contiguous range,
+			// well inside any sane MAX_FILTER_RANGES; a relay advertising zero
+			// prohibits Range Filters outright and refuses the FETCH, which is
+			// handled below as any other refusal.
+			message.RangeFilterParam(&message.RangeFilter{
+				Type:   message.ParamSubgroupFilter,
+				Ranges: []message.Range{{Start: baseSubgroup, End: baseSubgroup}},
+			}),
+		},
+	}
+	fetch, err := r.room.sess.Fetch(r.ctx, fetchMsg)
+	if err != nil {
+		// Degraded, not fatal: without it the tile stays blank until the next
+		// keyframe, which is what it did before this existed.
+		r.log.Debug("video backfill FETCH refused", "handle", track.handle, "err", err)
+		finish()
+		return
+	}
+
+	// Both sides under the lock, because a track dropped while its backfill was
+	// still being set up would otherwise leave the FETCH open, still delivering
+	// a whole group to a handle the frontend has been told to retire.
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		fetch.Close()
+		finish()
+		return
+	}
+	track.fetch = fetch
+	r.mu.Unlock()
+
+	r.room.router.HandleFetch(fetchMsg.RequestID, func(s *session.IncomingFetchStream) {
+		defer finish()
+		r.readMediaFetch(s, track, counter)
+	})
+}
+
+// readMediaFetch drains a backfilled group, forwarding it exactly as the live
+// path does — through the group's reassembler and the track's group orderer, so
+// there is one ordering to reason about and not two.
+//
+// The reassembler is a pass-through here and that is by construction: the FETCH
+// is filtered to the base layer, a base-layer object is emitted on arrival, and
+// nothing ever waits. See reorder.go.
+func (r *remote) readMediaFetch(
+	s *session.IncomingFetchStream,
+	track *remoteTrack,
+	counter *telemetry.TrackCounter,
+) {
+	group := track.backfilled
+	reassembler := track.reassemblerFor(group)
+	counter.AddGroup()
+
+	for {
+		obj, err := s.ReadDecoded()
+		if err != nil {
+			if !errors.Is(err, io.EOF) && r.ctx.Err() == nil {
+				r.log.Debug("video backfill ended", "handle", track.handle, "err", err)
+			}
+			return
+		}
+		// §11.4.4.2 absence markers carry no payload.
+		if obj.EndOfNonExistentRange || obj.EndOfUnknownRange {
+			continue
+		}
+
+		decoded, err := loc.Decode(obj.Properties, obj.Payload)
+		if err != nil {
+			r.log.Warn("LOC decode failed in backfill", "handle", track.handle, "err", err)
+			continue
+		}
+
+		counter.AddObject(len(decoded.Payload))
+		frame := bridge.MediaFrame{
+			Kind:      track.kind,
+			Handle:    track.handle,
+			Timestamp: scaleTimestamp(decoded.Properties),
+			// Object 0 of the base layer opens the group, and for video every
+			// group opens on a keyframe. The filter means every object here is
+			// a base-layer one, so the subgroup half of the live path's test is
+			// already answered.
+			KeyFrame:      obj.ObjectID == 0,
+			Config:        decoded.Properties.VideoConfig,
+			Payload:       decoded.Payload,
+			TemporalLayer: baseSubgroup,
+		}
+		index := emissionIndex(obj.ObjectID, decoded.Properties)
+		reassembler.Push(baseSubgroup, index, func() {
+			track.order.Push(group, index, func() { r.room.sink.SendMedia(&frame) })
+		})
+	}
+}
+
+// requestNewGroup asks the publisher to cut a new group, which for video is a
+// keyframe — the other half of arriving with a picture, and the half that does
+// not depend on anything being cached.
+//
+// The backfill answers "show me what I missed"; this answers "start me a fresh
+// one". It is what decouples the keyframe interval from the join latency: a
+// subscriber no longer waits out the publisher's own schedule, so the interval
+// becomes a bitrate-and-loss trade decided on its own merits rather than the
+// thing a blank tile is measured in.
+//
+// §10.2.13 NEW_GROUP_REQUEST, carried on a REQUEST_UPDATE rather than on the
+// SUBSCRIBE itself. A relay only forwards the SUBSCRIBE-borne form upstream
+// when the SUBSCRIBE makes it open a *new* upstream subscription, and in this
+// topology it never does: every participant PUBLISHes to the relay, so the
+// upstream for the track already exists and is shared by everyone watching.
+//
+// The relay does the rate limiting, which is the reason to let it: it forwards
+// only a request above the current largest group and only when none of equal or
+// greater value is outstanding, so a whole room joining at once costs the
+// publisher one keyframe rather than one each. The publisher rate-limits again
+// on its own side (see App.requestKeyFrame).
+//
+// Best effort throughout. A publisher that does not advertise DYNAMIC_GROUPS
+// (§12.6) — an older build, or a track that cannot honour it — makes the relay
+// decline silently, and the backfill and the next scheduled keyframe are what
+// remain. That is exactly the behaviour before this existed.
+func (r *remote) requestNewGroup(track *remoteTrack) {
+	// The value is the group being asked for: one past the largest known, or
+	// zero for "no group information", which §10.2.13 defines as always
+	// forwardable. Asking for a group that already exists is not forwarded, so
+	// the +1 is what makes the request mean anything.
+	var want uint64
+	if track.hasBackfill {
+		want = track.backfilled + 1
+	}
+	if _, err := track.sub.Update(r.ctx, message.Parameters{
+		message.NewGroupRequestParam(want),
+	}); err != nil {
+		if r.ctx.Err() == nil {
+			r.log.Debug("new-group request declined",
+				"handle", track.handle, "group", want, "err", err)
+		}
+		return
+	}
+	r.log.Debug("asked the publisher for a new group",
+		"handle", track.handle, "group", want)
 }
 
 // dropTrack closes one media subscription and tells the frontend to
@@ -926,6 +1230,11 @@ func (r *remote) dropTrack(slot **remoteTrack) {
 	r.mu.Lock()
 	track := *slot
 	*slot = nil
+	var fetch *session.FetchRequest
+	if track != nil {
+		fetch = track.fetch
+		track.fetch = nil
+	}
 	r.mu.Unlock()
 	if track == nil {
 		return
@@ -936,6 +1245,12 @@ func (r *remote) dropTrack(slot **remoteTrack) {
 	// the decoder they would go to is being retired in the next breath.
 	track.dropGroups()
 
+	// Ahead of the subscription, because a backfill still draining would
+	// otherwise keep delivering a whole group to a handle the frontend has just
+	// been told to retire.
+	if fetch != nil {
+		fetch.Close()
+	}
 	track.sub.Close()
 	r.room.counters.Forget(track.label)
 	r.room.sink.SendControl(&bridge.ServerMessage{
@@ -955,47 +1270,61 @@ func (r *remote) readMedia(
 	// there is nothing left to read by then.
 	defer r.checkLagForStream(track, counter)
 
-	// The end of this stream is the end of its group's turn, however it ended —
-	// closed by the publisher or reset by a relay. Deferred so a read that fails
-	// part-way releases the groups waiting behind it rather than stranding them.
-	// The group's turn was claimed on the accept loop, where the arrival order
-	// still exists; this is the other end of it. Deferred so a read that fails
-	// part-way releases the groups waiting behind it rather than stranding them.
-	// The base layer alone, matching the Open above: nothing may ever wait on
-	// the enhancement layer. It is the one a relay delays by half a second and
-	// sheds outright, so a group that waited for it would hand that delay to the
-	// next group's keyframe — the disposable layer holding up the one that
-	// cannot be dropped, which is the priority design backwards.
-	if s.Header.SubgroupID == baseSubgroup {
-		defer track.order.Finish(s.Header.GroupID)
-	}
-
 	// One group can arrive on several subgroup streams at once — one per
 	// temporal layer — each on its own goroutine. Objects go through the
 	// group's reassembler rather than straight to the frontend so the decoder
 	// sees them in decode order however the transport interleaved them.
 	group, subgroup := s.Header.GroupID, s.Header.SubgroupID
-	reassembler := track.reassemblerFor(group)
 
-	// Diagnostic: log when the reassembler discards an enhancement frame.
-	// Audio has no layers, so the callback is wired for video only. The
-	// reassembler is shared across subgroup goroutines, so the callback is
-	// set once per group — the first stream to create it wins, and the
-	// closure captures group and track for context.
-	if track.kind == bridge.KindVideo && reassembler.onDrop == nil {
-		g, h := group, track.handle // captured for the closure
-		reassembler.onDrop = func(sg, idx uint64, reason dropReason) {
-			r.log.Warn("reassembler dropped frame",
-				"participant", r.id, "handle", h,
-				"group", g, "subgroup", sg,
-				"index", idx, "reason", reason)
-		}
+	// The backfilled group belongs to the backfill, whole. The live subscription
+	// gets nothing to say about it, and the stream is reset rather than drained
+	// so the relay stops spending the link on it.
+	//
+	// With temporal layers there is nothing to lose. A largest-object
+	// subscription starts after the largest object at subscribe time, and with
+	// per-layer ID ranges (see layerObjectStride) that is always an enhancement
+	// object — so what live carries for this group is enhancement frames whose
+	// base frames the same filter withheld. Undecodable however carefully they
+	// are ordered, and pushing them would additionally tell the group's
+	// reassembler that the enhancement layer is live on a group whose base layer
+	// is arriving, whole and already ordered, from somewhere else.
+	//
+	// Without them — an encoder that ignored scalabilityMode, so one subgroup —
+	// the largest object is a base one and the objects after it are a decodable
+	// continuation, and this does give them up. It is still the better trade.
+	// Ordering them behind the backfill inside one group is something neither
+	// the reassembler nor the group orderer can express: to the reassembler a
+	// base object is one to emit on arrival, and the orderer works a group at a
+	// time. The cost is the tail of one group; what replaces it is the next
+	// group's keyframe, which requestNewGroup has already asked for. Against a
+	// blank tile for the whole interval, which is what this group used to be
+	// worth to a joining subscriber, both halves are a gain.
+	if track.hasBackfill && group <= track.backfilled {
+		s.Cancel(moqt.StreamResetInternalError)
+		return
 	}
+
+	// The end of this stream is the end of its group's turn, however it ended —
+	// closed by the publisher or reset by a relay. Deferred so a read that fails
+	// part-way releases the groups waiting behind it rather than stranding them.
+	// The group's turn was claimed on the accept loop, where the arrival order
+	// still exists; this is the other end of it.
+	//
+	// The base layer alone, matching the Open there: nothing may ever wait on
+	// the enhancement layer. It is the one a relay delays and sheds outright, so
+	// a group that waited for it would hand that delay to the next group's
+	// keyframe — the disposable layer holding up the one that cannot be dropped,
+	// which is the priority design backwards.
+	if subgroup == baseSubgroup {
+		defer track.order.Finish(group)
+	}
+
+	reassembler := track.reassemblerFor(group)
 
 	// Counted once per group, by the stream that opens it. Every layer of a
 	// group is the same group, so counting per stream would report a group
 	// count that tracked the layer count instead.
-	if subgroup == 0 {
+	if subgroup == baseSubgroup {
 		counter.AddGroup()
 	}
 	for {
@@ -1011,31 +1340,17 @@ func (r *remote) readMedia(
 			continue
 		}
 
-		keyFrame := subgroup == 0 && obj.ObjectID == 0
-		// Diagnostic: log the keyframe derivation for video. The flag is
-		// inferred from position (subgroup 0, object 0), not from the
-		// bitstream — a mismatch between the encoder's keyframe cadence
-		// and the group boundary would produce a delta frame marked as a
-		// key, corrupting the decoder's reference chain until the next
-		// real keyframe. Logged at debug to avoid flooding in the steady
-		// state; raise to info if investigating artifacts.
-		if track.kind == bridge.KindVideo && keyFrame {
-			r.log.Debug("video keyframe derived",
-				"participant", r.id, "handle", track.handle,
-				"group", group, "subgroup", subgroup,
-				"objectID", obj.ObjectID,
-				"payloadBytes", len(decoded.Payload))
-		}
 		frame := bridge.MediaFrame{
 			Kind:      track.kind,
 			Handle:    track.handle,
 			Timestamp: scaleTimestamp(decoded.Properties),
 			// The first object of every group opens it, and for video
-			// every group opens on a keyframe (see the publisher). Object 0
+			// every group opens on a keyframe: writeVideo rotates the group
+			// *on* the keyframe, so the two cannot come apart. Object 0
 			// of subgroup 0 specifically: each layer numbers from its own
 			// base now (see layerObjectStride), so the enhancement layer has
 			// an object 0 too and it is an ordinary delta frame.
-			KeyFrame:      keyFrame,
+			KeyFrame:      subgroup == baseSubgroup && obj.ObjectID == 0,
 			Payload:       decoded.Payload,
 			TemporalLayer: uint8(subgroup),
 		}

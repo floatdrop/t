@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"t/internal/bridge"
 	"t/internal/telemetry"
 )
 
@@ -165,16 +164,7 @@ func publishPacedLayers(
 func publisherWithBothTracks(t *testing.T, addr, room, nickname string) *Room {
 	t.Helper()
 	r, _ := joinRoom(t, addr, room, nickname)
-	if err := r.DeclareTrack(&bridge.TrackConfig{
-		Kind: "audio", Codec: "opus", SampleRate: 48000, Channels: 1,
-	}); err != nil {
-		t.Fatalf("declare audio: %v", err)
-	}
-	if err := r.DeclareTrack(&bridge.TrackConfig{
-		Kind: "video", Codec: "avc1.42e01f", Width: 640, Height: 360,
-	}); err != nil {
-		t.Fatalf("declare video: %v", err)
-	}
+	declareBothTracks(t, r)
 	return r
 }
 

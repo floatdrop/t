@@ -18,10 +18,24 @@
 //
 // # Stream mapping
 //
-// Video uses one group per GOP: a keyframe opens a new group, and the
-// frames that follow are objects 1..n inside it on a single subgroup
-// stream. A relay can therefore drop a whole group under congestion and
-// land the subscriber exactly on the next keyframe.
+// Video uses one group per GOP: a keyframe opens a new group and the
+// frames that follow it belong to the same one. A relay can therefore
+// drop a whole group under congestion and land the subscriber exactly on
+// the next keyframe.
+//
+// Within a group the objects are split across one subgroup per temporal
+// layer — subgroup 0 the base, higher subgroups the enhancement layers
+// nothing references — so a relay can shed the top of the ladder without
+// touching the bottom. Each layer numbers its objects from its own base
+// (see layerObjectStride), so an Object ID orders a subgroup against
+// itself and nothing else; what puts a group back into decode order is
+// the emission index each object carries. See reorder.go.
+//
+// A subscriber joining mid-group does not wait for the next keyframe. It
+// backfills the group in progress with a Joining FETCH narrowed to the
+// base layer, and asks the publisher for a fresh group besides — see
+// backfillGroup and requestNewGroup in remote.go. The keyframe interval
+// is therefore not the join latency, which is what it used to be.
 //
 // Audio has no keyframes, so it uses a fixed cadence instead — a new
 // group every audioGroupObjects frames. Each group's first object carries
@@ -129,6 +143,17 @@ type Config struct {
 	// Insecure skips TLS certificate verification. Development relays
 	// use self-signed certificates, so the app defaults this on.
 	Insecure bool
+	// OnKeyFrameRequest, when non-nil, is called when a subscriber asks this
+	// participant to start a new group (§10.2.13 NEW_GROUP_REQUEST) on the
+	// video track — which for video means a keyframe, since a group opens on
+	// one. It is how a joining peer stops waiting out the local encoder's own
+	// keyframe schedule.
+	//
+	// A callback rather than something this package acts on, because the
+	// encoder is on the other side of the bridge and the app owns both the
+	// message that asks it and the rate limit on asking. Called from the
+	// publication's broker goroutine, so it must not block.
+	OnKeyFrameRequest func()
 }
 
 // NewID returns a short random participant identifier. It only has to be

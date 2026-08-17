@@ -30,13 +30,16 @@ namespace, so it can be anything and can repeat.
 ### Stream mapping
 
 **Video** uses one group per GOP: a keyframe opens a new group and the frames
-after it are objects `1..n`. A relay can therefore drop a whole group under
-congestion and land the subscriber exactly on the next keyframe. A group is one
-second long, which is also what a joining subscriber waits before its first
-picture: nothing replays the group in progress any more, so the keyframe
-interval *is* the join latency, and it halves what losing a group costs. H.264 is
-encoded in Annex B, so SPS/PPS travel in-band with every keyframe and no
-out-of-band config is needed.
+after it belong to the same one. A relay can therefore drop a whole group under
+congestion and land the subscriber exactly on the next keyframe. A group is five
+seconds long, which is how much a lost group costs — the other side of that
+trade being that keyframes are only about one per cent of the bitrate at this
+interval. H.264 is encoded in Annex B, so SPS/PPS travel in-band with every
+keyframe and no out-of-band config is needed.
+
+The interval used to be the join latency as well, and that is what kept it
+short. It is not any more — see [Arriving with a picture](#arriving-with-a-picture)
+— so the length is now a bitrate-and-loss question decided on its own.
 
 Within a group, the objects are split across **one subgroup per temporal
 layer**. The primary encoding is configured `L1T2`, so frames alternate between
@@ -93,9 +96,20 @@ all.
 Giving up is restricted to the same layer, because nothing references an
 enhancement frame: dropping one costs itself, where dropping a base frame costs
 every frame after it until the next keyframe. The backlog holds sixteen
-enhancement objects, a GOP's worth at 30 fps with a one-second keyframe
-interval, so a whole layer arriving ahead of the other — a backfilled group, or
-a publisher catching up after a stall — is still placed frame by frame.
+enhancement objects — well under a GOP, which at 30 fps and a five-second
+interval is seventy-five of them, because holding a GOP's worth for every group
+in flight on every participant would buy frames whose moment has passed by the
+time the base layer catches up.
+
+A base frame will wait a few milliseconds for a missing enhancement frame ahead
+of it, which recovers the ones the two readers' scheduling would otherwise have
+overtaken. Only a few, and only when the frame can still arrive: the wait needs
+the enhancement layer to have been seen on this group, so a layer a relay shed
+is never waited for, and it needs the gap to be ahead of everything that layer
+has delivered — its subgroup is one ordered stream, so a higher index already in
+hand proves the gap is not in flight. Without that second condition a burst
+that overflows the backlog makes every base frame behind it wait the full window
+for a frame already discarded.
 
 Both halves of that were learned the hard way. An earlier design ordered the two
 layers through one bounded backlog and conceded its head when the bound was
@@ -121,8 +135,8 @@ straggler is placed and then emitted.
 Emitted into a decoder that has already taken the next keyframe. A keyframe is
 an IDR and an IDR empties the decoded picture buffer, so a frame from the group
 before it references pictures that are gone: one flash of macroblocks per
-boundary it happens on, which on a one-second GOP is once a second. That is the
-artifact this went looking for. Audio has no such coupling — every Opus packet
+boundary it happens on, which on a five-second GOP is once every five seconds.
+That is the artifact this went looking for. Audio has no such coupling — every Opus packet
 stands on its own — but the ring buffer in the player worklet is contiguous by
 construction, so a packet handed to it late is simply played in the wrong place.
 
@@ -173,12 +187,68 @@ already passed. A backstop has to sit above any backlog the transport
 legitimately produces, which a burst of several groups is.
 
 The enhancement layer is also marked **disposable**, by a §8 object delivery
-timeout stamped on the first object of its subgroup: half a second, against the
-two seconds the base layer's subgroup gets. A relay honouring it resets that one
+timeout stamped on the first object of its subgroup: five seconds, against the
+ten the base layer's subgroup gets. A relay honouring it resets that one
 stream with `DELIVERY_TIMEOUT` rather than terminating the subscription, so a
 link that cannot carry everything loses half its frame rate rather than its
 picture. Measured behind a 32 kB/s bottleneck, the enhancement layer fell from
 47% of the video bytes to 19% while the base layer kept arriving.
+
+The two numbers matter only in their order — the disposable layer has to be
+given up on first, or shedding it buys nothing the dropped group would not have
+taken anyway. Their sizes are inherited from the keyframe interval rather than
+measured, and generously: an enhancement frame worth delivering half a second
+late is not worth delivering five seconds late.
+
+### Arriving with a picture
+
+A subscription starts at the live edge. `SUBSCRIBE` with the largest-object
+filter delivers what comes *after* everything that already exists, which for
+video is the middle of a GOP, and playback discards inbound frames until it sees
+a keyframe. On its own, then, a fresh subscription is a blank tile until the
+publisher's next keyframe — and it is not only joining that pays it, but every
+layer change, every demotion, every lag resync and every tile scrolled back
+into view.
+
+There are two answers and they are deliberately independent, because each has a
+precondition the other does not.
+
+**A Joining FETCH replays the group in progress.** `JoiningStart=0` resolves to
+`{largest.Group, 0}` through `{largest.Group, largest.Object + 1}`: the current
+group from its keyframe, ending exactly where the subscription begins. It needs
+the relay to still have the group cached. Narrowed to the base layer with a
+§5.1.3 `SUBGROUP_FILTER`, which is what makes it affordable — that is the whole
+reference chain and nothing else, since no enhancement frame in the past is
+referenced by anything — and also what lets it stream: a FETCH answers in
+ascending Object ID, so filtered to one subgroup it is already in decode order
+and goes to the decoder frame by frame.
+
+**A NEW_GROUP_REQUEST asks the publisher for a keyframe.** §10.2.13, carried on
+a `REQUEST_UPDATE` after the subscribe rather than on the `SUBSCRIBE` itself: a
+relay only forwards the SUBSCRIBE-borne form when it has to open a *new* upstream
+subscription, and here it never does, since every participant publishes to the
+relay and one upstream serves everybody. The video track advertises
+`DYNAMIC_GROUPS` so the relay will forward it at all, and the relay is what rate
+limits — it forwards only above the current largest group and only when no
+equal-or-greater request is outstanding, so a room joining at once costs the
+publisher one keyframe rather than one each. It needs the publisher to still be
+there and encoding.
+
+There was a backfill here once and it was removed, because it *raced* live video
+and lost by construction: every backfilled frame is older than every live one,
+so the first live object made the whole replay stale after a round trip and a
+group of bytes. The ranges were never racing, though — they are adjacent and
+disjoint, so they concatenate. This one claims its group's turn in the same
+group orderer live video goes through, and live waits behind it, bounded at three
+seconds. There is still exactly one path from the wire to the decoder, which is
+what removing the old backfill was really for.
+
+The one place the two meet inside a group is the group the backfill replays.
+What live carries there depends on the ladder: with temporal layers the largest
+object at subscribe time is always an enhancement object, so what passes the
+filter is enhancement frames whose base frames it withheld — undecodable, and
+dropped. Without them the largest is a base object and the next one continues
+the chain, so it is kept, and held until the backfill has finished.
 
 There is one encoding. There used to be a second, smaller one published
 alongside it, and a ladder that walked a struggling subscriber down onto it —
@@ -495,7 +565,7 @@ every request is a scheme-handler round trip, which Wails' own comments put at
 about eleven cgo calls on macOS.
 
 Measured against the current socket on macOS 26.5.1 / arm64, under this app's
-real media shape — 720p30 at 1.5 Mbps with one-second keyframes plus Opus at
+real media shape — 720p30 at 1.5 Mbps with five-second keyframes plus Opus at
 32 kbps in 20 ms frames, one participant's worth published upstream and *n*
 participants' worth arriving downstream — over 20-second runs, with CPU as a
 share of one core across both the app process and the WebContent process the
@@ -697,7 +767,9 @@ Two failure shapes, and they are detected differently:
 After reconnecting the backend asks the frontend for an immediate keyframe: a
 new session has no open group and the publisher will not start one on a delta
 frame, so without that the remote view stays blank until the next scheduled
-keyframe.
+keyframe. Two other things reach the same request now — a write that finds no
+open group, and a remote subscriber's `NEW_GROUP_REQUEST` — so it is rate
+limited, and one place asks the encoder for all three.
 
 `internal/conf` covers all of it — graceful loss, silent loss, a deliberate
 leave *not* looking like loss, GOAWAY surfacing while the session is still
@@ -767,11 +839,14 @@ Drag its top edge to resize. Three tabs:
   queue depth, dropped frames, audio buffer depth, A/V offset). Reading them side
   by side is what localises a fault: a track carrying bytes while its decoder
   sits at 0 fps means the problem is in the WebView, not the network. The local
-  capture bitrate there is averaged over a second, which is one GOP: a keyframe
-  is several times the size of a delta frame, so a rate taken over a single
-  250 ms sample reports where the keyframes fell rather than what the encoder is
-  spending — it was measured swinging between 400 and 1500 kbps, four times a
-  second, on an encoder whose target had not moved at all. That target sits next
+  capture bitrate there is averaged over a second: a keyframe is several times
+  the size of a delta frame, so a rate taken over a single 250 ms sample reports
+  where the keyframes fell rather than what the encoder is spending — it was
+  measured swinging between 400 and 1500 kbps, four times a second, on an
+  encoder whose target had not moved at all. The window used to be exactly one
+  GOP, so the average covered the same one keyframe wherever it landed; at a
+  five-second interval it no longer does, and no longer needs to — keyframes are
+  about one per cent of the bitrate there, so the alternation is under the noise. That target sits next
   to it, because a picture that has quietly stepped down and one that never
   needed to look alike in every other number here. The **A/V**
   column is how far ahead of the audio clock the last presented frame was, plus
@@ -969,6 +1044,10 @@ path from a `MediaStreamTrack` to WebCodecs, so video frames are pulled off a
   verified to compile and link, and the window grants camera and microphone
   through Wails' cross-platform `Permissions` option (which those two backends
   honour and macOS ignores), but neither has been exercised in a real call.
-- A subscriber discards inbound video until the first keyframe, so joining
-  mid-GOP costs up to the keyframe interval (1 s) before the first frame paints.
-  Those frames show up as `dropped` in the decoders table and are expected.
+- A subscriber discards inbound video until the first keyframe. Joining mid-GOP
+  no longer waits out the five-second interval for one — the group in progress
+  is backfilled and the publisher is asked for a fresh keyframe — but the frames
+  ahead of it are still discarded, and show up as `dropped` in the decoders
+  table. That is expected. What neither answer covers is a publisher that has
+  gone quiet and a relay whose cache has aged the group out: nothing can produce
+  a keyframe then, and the tile stays blank until the publisher sends one.

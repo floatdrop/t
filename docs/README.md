@@ -50,18 +50,39 @@ publisher mark sheddable (§8 delivery timeouts), so numbering them by layer is
 what makes the enhancement layer separately droppable — at the cost of frame
 rate rather than a frozen tile.
 
-Each layer numbers its objects **from its own base** — subgroup *L* uses IDs
-starting at `L × 65536` — because two rules apply at once. Object IDs must be
-unique within a group, since a relay's cache keys objects on `(group, object)`
-alone and a colliding ID overwrites the other layer's frame in the store that
-answers backfill FETCHes. And §11.4.3 forbids forwarding a non-consecutive
-object on an existing subgroup stream, so a relay handed one resets that stream
-and opens another. Numbering in emission order across the subgroups satisfies
-the first and breaks the second: each layer then sees every other ID, so *every*
-object is non-consecutive on its own stream. Measured against moq-go's relay,
-that produced one QUIC stream and one RESET_STREAM per frame per subscriber, and
-lost about half the frames of a group that arrived as a burst. Per-layer ranges
-bring it back to one stream per subgroup.
+Each layer numbers its objects **from its own base**, because two rules apply at
+once. Object IDs must be unique within a group, since a relay's cache keys
+objects on `(group, object)` alone and a colliding ID overwrites the other
+layer's frame in the store that answers backfill FETCHes. And §11.4.3 forbids
+forwarding a non-consecutive object on an existing subgroup stream, so a relay
+handed one resets that stream and opens another. Numbering in emission order
+across the subgroups satisfies the first and breaks the second: each layer then
+sees every other ID, so *every* object is non-consecutive on its own stream.
+Measured against moq-go's relay, that produced one QUIC stream and one
+RESET_STREAM per frame per subscriber, and lost about half the frames of a group
+that arrived as a burst. Per-layer ranges bring it back to one stream per
+subgroup.
+
+Which layer gets which range is not cosmetic, and the obvious direction was
+wrong. **The base layer owns the highest range** — subgroup *L* starts at
+`(3 − L) × 65536` — because a Location is ordered by `(Group, Object)`, so the
+Largest Object of a group is whichever layer holds the top range, and the
+Largest Object is where §5.1.2's largest-object filter starts a subscription.
+With the base at the bottom, every base object of the group in progress sorted
+*below* the mark a joining subscriber was given: the filter withheld precisely
+the frames that were decodable and forwarded precisely the ones that were not,
+so a joiner was sent enhancement frames referencing base frames it would never
+receive, paid for them, and could use none. Inverted, the mark lands on a base
+object, the base layer keeps flowing from the moment of the subscribe, and it is
+the disposable layer that is withheld for the rest of that group — half the
+frame rate for one GOP, against no picture at all.
+
+The keyframe therefore does not sit at Object ID 0, and that is a wire break
+rather than an internal detail: a subscriber deriving "this opens the group"
+from the ID alone sees no keyframe from such a publisher and never paints.
+Readers take it from the emission index instead, which is defined as the
+position in the group's emission order and answers the question directly. A
+build from 0.7.2 or earlier will not show video published by a later one.
 
 That leaves the object ID saying nothing about where a frame belongs relative to
 another subgroup's, so every object carries its position in the group's
@@ -243,12 +264,25 @@ group orderer live video goes through, and live waits behind it, bounded at thre
 seconds. There is still exactly one path from the wire to the decoder, which is
 what removing the old backfill was really for.
 
-The one place the two meet inside a group is the group the backfill replays.
-What live carries there depends on the ladder: with temporal layers the largest
-object at subscribe time is always an enhancement object, so what passes the
-filter is enhancement frames whose base frames it withheld — undecodable, and
-dropped. Without them the largest is a base object and the next one continues
-the chain, so it is kept, and held until the backfill has finished.
+The one place the two meet is inside the group the backfill replays, where the
+group orderer — which works a group at a time — cannot separate them. What live
+carries there is the base layer, and it is decodable: the largest object at
+subscribe time is a base object, so the objects after it continue the chain the
+backfill is replaying, and it is the enhancement layer of that group the filter
+withholds instead. It has to land *behind* the backfill, though, and nothing
+downstream can arrange that — to the reassembler a base object is one to emit on
+arrival, so it would go out first and the whole backfill would then arrive below
+the mark and be dropped as late. So it waits.
+
+Waiting means the group's turn cannot end until both sources are done, and there
+is no guarantee the second one exists: the publisher may have rotated to the next
+group before the subscribe. The live stream ends the turn when there is one, at
+the moment its stream ends, which is the rule every other group follows; when
+there is not, the signal is a base stream announced for a *later* group, since
+the publisher closes every subgroup of a group before opening the next. Evidence
+rather than a deadline, and the distinction is the whole of it — a live stream
+that arrives late because the relay was still draining is not absent, and cutting
+it off to end the turn on schedule strands the group short.
 
 There is one encoding. There used to be a second, smaller one published
 alongside it, and a ladder that walked a struggling subscriber down onto it —

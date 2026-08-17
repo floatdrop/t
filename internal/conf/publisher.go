@@ -155,6 +155,37 @@ const propEmissionIndexLegacy message.PropertyType = 0x8002
 // of headroom for a two-byte varint.
 const layerObjectStride = 1 << 16
 
+// objectIDFor places one object of one layer in that layout: the ranges descend
+// with the layer, so the **base layer owns the highest one**.
+//
+// Which way round they go is not cosmetic, and the obvious direction was wrong.
+// A Location is ordered by (Group, Object), so the Largest Object of a group is
+// whichever layer holds the top range — and the Largest Object is what §5.1.2's
+// largest-object filter starts a subscription after. With the base layer at the
+// bottom, every base object of the group in progress sorts *below* the mark a
+// joining subscriber is given, so the filter withholds precisely the frames that
+// are decodable and forwards precisely the ones that are not: the subscriber is
+// sent enhancement frames referencing base frames it will never receive, pays
+// for them, and can use none of them. Inverted, the mark lands on a base object,
+// the base layer keeps flowing from the moment of the subscribe, and it is the
+// disposable layer that is withheld for the remainder of that group. Half the
+// frame rate for the rest of one GOP, against no picture at all.
+//
+// The keyframe therefore no longer sits at Object ID 0, and that is a wire
+// break rather than an internal detail: a subscriber deriving "this opens the
+// group" from the ID alone sees no keyframe from this publisher and never
+// paints. Readers here take it from the emission index instead, which is
+// defined as the position in the group's emission order and so answers the
+// question directly, and which they have always been sent. That makes this
+// build read both layouts; it does not make an older build read this one.
+//
+// Counting down from MaxTemporalLayer rather than up from zero keeps the base
+// on top however many layers the ladder grows to, and keeps every range inside
+// the two-byte varint the stride was chosen for.
+func objectIDFor(layer uint8, n uint64) uint64 {
+	return uint64(bridge.MaxTemporalLayer-layer)*layerObjectStride + n
+}
+
 // publisher owns the local participant's three publications: the MSF
 // catalog and the two LOC media tracks.
 type publisher struct {
@@ -766,7 +797,7 @@ func (t *trackPublisher) writeObject(f *bridge.MediaFrame) error {
 		return err
 	}
 
-	objectID := uint64(layer)*layerObjectStride + t.objects[layer]
+	objectID := objectIDFor(layer, t.objects[layer])
 	if err := sg.WriteObjectAt(objectID, &message.SubgroupObject{
 		Properties: encodedProps,
 		Payload:    payload,

@@ -254,14 +254,15 @@ type remoteTrack struct {
 	// there is one. Set before any stream can arrive and never written again,
 	// so both are read without a lock.
 	//
-	// It is also the boundary the live path ignores below. A largest-object
-	// subscription starts after the largest object in that group, which with
-	// per-layer ID ranges (see layerObjectStride) is always an *enhancement*
-	// object — so what live delivers for this group is enhancement frames whose
-	// base frames the same filter withheld. Undecodable by construction, and the
-	// backfill is the authority on this group instead.
+	// It is also the boundary the live path treats specially: that group has two
+	// sources — the FETCH for what came before the subscribe, the live stream
+	// for what came after — and they have to be ordered against each other
+	// inside one group. See backfillGate and readMedia.
 	backfilled  uint64
 	hasBackfill bool
+	// backfill coordinates the FETCH with the live stream continuing the same
+	// group. Nil when there is nothing to backfill.
+	backfill *backfillGate
 	// fetch is the joining FETCH backfilling that group. Written and read under
 	// the remote's lock, so a track dropped mid-setup cannot leave it open.
 	fetch *session.FetchRequest
@@ -916,6 +917,8 @@ func (r *remote) subscribeTrack(
 	// in progress, and there is nothing to backfill.
 	if largest, ok := sub.OK.Parameters.Find(message.ParamLargestObject); ok {
 		track.backfilled, track.hasBackfill = largest.Group, true
+		group := largest.Group
+		track.backfill = newBackfillGate(func() { track.order.Finish(group) })
 	}
 	if kind == bridge.KindVideo {
 		// Video only: audio has no layers, so its reassembler never holds
@@ -946,8 +949,16 @@ func (r *remote) subscribeTrack(
 	// scheduler ran the goroutines, and a burst then reads as the later group
 	// having come first — see groupOrderer.Open.
 	arrived := func(s *session.IncomingSubgroupStream) {
-		if s.Header.SubgroupID == baseSubgroup {
-			track.order.Open(s.Header.GroupID)
+		if s.Header.SubgroupID != baseSubgroup {
+			return
+		}
+		track.order.Open(s.Header.GroupID)
+		if track.backfill != nil {
+			// Which side of the backfilled group this stream falls on decides
+			// who ends that group's turn. Recorded here for the same reason
+			// Open is: this is where the transport's delivery order still
+			// exists. See backfillGate.
+			track.backfill.announce(s.Header.GroupID, track.backfilled)
 		}
 	}
 	r.room.router.HandleSubgroups(sub.TrackAlias(), arrived,
@@ -996,6 +1007,134 @@ func (r *remote) subscribeTrack(
 		go r.requestNewGroup(track)
 	}
 	return nil
+}
+
+// backfillGate coordinates the two sources of one backfilled group: the FETCH
+// replaying what the publisher wrote before the subscribe, and the live stream
+// carrying what it wrote after. It answers two questions, and they are not the
+// same one.
+//
+// **Which goes first.** Both carry the base layer of one group, and to the
+// reassembler a base object is one to emit on arrival — so live going first
+// would advance the mark past the whole backfill and drop it as late. Wait
+// holds the live stream until the FETCH is done. Nothing else can arrange this:
+// the group orderer works a group at a time, and this is inside one.
+//
+// **When the group's turn ends**, which is what lets the next group through.
+// The live stream ends it if there is one, at the moment its stream ends, which
+// is the same rule every other group follows. If there is not one, something
+// still has to, and the signal for "there is not one" is the publisher having
+// moved on: a base stream announced for a later group. The publisher closes
+// every subgroup of a group before opening the next, so a later group's stream
+// existing proves this one is finished — the same reasoning retireSupersededLocked
+// runs on.
+//
+// Evidence rather than a timer, and that distinction is the whole of it. A
+// deadline here was wrong in a way that only showed under load: a live stream
+// that arrives late — because the relay was still draining what the publisher
+// had already written — is not absent, and cutting it off to end the turn on
+// schedule discards the frames it was carrying and strands the group short.
+type backfillGate struct {
+	// done closes when the FETCH has finished with the group, however it
+	// finished. Read by wait, closed once by release.
+	done        chan struct{}
+	releaseOnce sync.Once
+
+	mu sync.Mutex
+	// claimed is true once a live stream for this group has been announced, so
+	// that stream is the one that will end the turn. movedOn is true once a
+	// stream for a later group has been, which is the proof that no live stream
+	// for this one is coming. finished is true once the turn has been ended.
+	claimed  bool
+	movedOn  bool
+	released bool
+	finished bool
+	// end is what ends the group's turn — track.order.Finish bound to the group.
+	// Supplied at construction, so the gate owns no ordering of its own.
+	end func()
+}
+
+func newBackfillGate(end func()) *backfillGate {
+	return &backfillGate{done: make(chan struct{}), end: end}
+}
+
+// announce records that a base-layer stream has arrived for group, which is
+// either the backfilled group or one after it. Called from the router's arrival
+// hook, so it runs on the accept loop in the order the transport delivered the
+// streams — the only place that order still exists, and the reason the decision
+// is made here rather than when a reader goroutine happens to be scheduled.
+//
+// Nothing is emitted here. Ending the turn drains the orderer, which emits, and
+// the accept loop is what every other stream on the session is queued behind —
+// so when the evidence is complete the finish goes to its own goroutine.
+func (g *backfillGate) announce(group, backfilled uint64) {
+	g.mu.Lock()
+	if group <= backfilled {
+		g.claimed = true
+	} else {
+		g.movedOn = true
+	}
+	due := g.finishDueLocked()
+	g.mu.Unlock()
+	if due {
+		go g.finish()
+	}
+}
+
+// finishDueLocked reports whether nothing more is coming for the backfilled
+// group: the FETCH is done, the publisher has moved past it, and no live stream
+// ever turned up to carry the rest. The caller holds mu.
+func (g *backfillGate) finishDueLocked() bool {
+	return g.released && g.movedOn && !g.claimed && !g.finished
+}
+
+// wait blocks until the FETCH has finished with the group, reporting false if
+// the remote went away first.
+func (g *backfillGate) wait(ctx context.Context) bool {
+	select {
+	case <-g.done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// stale reports whether the group's turn is already over, so a stream still
+// carrying it has nothing the orderer would accept. It is the case the group
+// orderer documents and cannot recover from either: a stream opened for an
+// earlier group after the mark has moved past it.
+func (g *backfillGate) stale() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.finished
+}
+
+// finish ends the group's turn, once.
+func (g *backfillGate) finish() {
+	g.mu.Lock()
+	if g.finished {
+		g.mu.Unlock()
+		return
+	}
+	g.finished = true
+	g.mu.Unlock()
+	g.end()
+}
+
+// release records that the FETCH is done with the group, letting through the
+// live stream that continues it — and ending the turn here if the publisher has
+// already moved on and no such stream exists.
+func (g *backfillGate) release() {
+	g.releaseOnce.Do(func() {
+		g.mu.Lock()
+		g.released = true
+		due := g.finishDueLocked()
+		g.mu.Unlock()
+		close(g.done)
+		if due {
+			g.finish()
+		}
+	})
 }
 
 // backfillGroup replays the group already in progress, so a fresh video
@@ -1054,13 +1193,12 @@ func (r *remote) backfillGroup(
 	track *remoteTrack,
 	counter *telemetry.TrackCounter,
 ) {
-	// The group's turn is claimed before the FETCH is sent and has to be given
-	// back however this ends — refused, reset, drained, or timed out. Left
-	// unreleased, every live group would sit behind a group that is never
-	// coming until the cross-group backlog gave up on it, which is seconds of
-	// video held for nothing.
-	var once sync.Once
-	finish := func() { once.Do(func() { track.order.Finish(track.backfilled) }) }
+	// The group's turn is claimed before the FETCH is sent and has to be handed
+	// on however this ends — refused, reset, drained, or timed out. Left
+	// unreleased, the live stream continuing this group never starts and every
+	// later group sits behind one nothing more is coming for, until the
+	// cross-group backlog gives up on it: seconds of video held for nothing.
+	finish := track.backfill.release
 	// The FETCH itself has no deadline, and the objects arrive on a stream that
 	// can simply stall. This is the ceiling on how long live video waits for a
 	// picture that would have been nicer to have first.
@@ -1156,20 +1294,20 @@ func (r *remote) readMediaFetch(
 		}
 
 		counter.AddObject(len(decoded.Payload))
+		index := emissionIndex(obj.ObjectID, decoded.Properties)
 		frame := bridge.MediaFrame{
 			Kind:      track.kind,
 			Handle:    track.handle,
 			Timestamp: scaleTimestamp(decoded.Properties),
-			// Object 0 of the base layer opens the group, and for video every
-			// group opens on a keyframe. The filter means every object here is
-			// a base-layer one, so the subgroup half of the live path's test is
-			// already answered.
-			KeyFrame:      obj.ObjectID == 0,
+			// The object that opened the group, which for video is the keyframe.
+			// Emission index rather than Object ID for the reason the live path
+			// gives; the filter means every object here is a base-layer one, so
+			// the subgroup half of that test is already answered.
+			KeyFrame:      index == 0,
 			Config:        decoded.Properties.VideoConfig,
 			Payload:       decoded.Payload,
 			TemporalLayer: baseSubgroup,
 		}
-		index := emissionIndex(obj.ObjectID, decoded.Properties)
 		reassembler.Push(baseSubgroup, index, func() {
 			track.order.Push(group, index, func() { r.room.sink.SendMedia(&frame) })
 		})
@@ -1276,32 +1414,39 @@ func (r *remote) readMedia(
 	// sees them in decode order however the transport interleaved them.
 	group, subgroup := s.Header.GroupID, s.Header.SubgroupID
 
-	// The backfilled group belongs to the backfill, whole. The live subscription
-	// gets nothing to say about it, and the stream is reset rather than drained
-	// so the relay stops spending the link on it.
+	// The group the backfill replays is the one place the two delivery paths meet,
+	// and they meet *inside* a group, where the group orderer — which works group
+	// by group — cannot separate them.
 	//
-	// With temporal layers there is nothing to lose. A largest-object
-	// subscription starts after the largest object at subscribe time, and with
-	// per-layer ID ranges (see layerObjectStride) that is always an enhancement
-	// object — so what live carries for this group is enhancement frames whose
-	// base frames the same filter withheld. Undecodable however carefully they
-	// are ordered, and pushing them would additionally tell the group's
-	// reassembler that the enhancement layer is live on a group whose base layer
-	// is arriving, whole and already ordered, from somewhere else.
+	// What arrives here for that group is the base layer, and it is decodable:
+	// the largest object at subscribe time is a base object (see objectIDFor), so
+	// the objects after it continue the chain the backfill is replaying, and the
+	// enhancement layer of that group is what the filter withholds instead. It
+	// used to be the other way round, and everything live carried for this group
+	// was undecodable.
 	//
-	// Without them — an encoder that ignored scalabilityMode, so one subgroup —
-	// the largest object is a base one and the objects after it are a decodable
-	// continuation, and this does give them up. It is still the better trade.
-	// Ordering them behind the backfill inside one group is something neither
-	// the reassembler nor the group orderer can express: to the reassembler a
-	// base object is one to emit on arrival, and the orderer works a group at a
-	// time. The cost is the tail of one group; what replaces it is the next
-	// group's keyframe, which requestNewGroup has already asked for. Against a
-	// blank tile for the whole interval, which is what this group used to be
-	// worth to a joining subscriber, both halves are a gain.
-	if track.hasBackfill && group <= track.backfilled {
-		s.Cancel(moqt.StreamResetInternalError)
-		return
+	// It has to land behind the backfill, though, and nothing downstream can
+	// arrange that: to the reassembler a base object is one to emit on arrival,
+	// so this would go out first and the whole backfill would then arrive below
+	// the mark and be dropped as late. So it waits, and takes over responsibility
+	// for ending the group's turn — see backfillGate.
+	//
+	// Anything else for that group is past. An enhancement object can only reach
+	// here from a publisher on the older ID layout, where it is undecodable for
+	// the reason above; the stream is reset rather than drained so the relay
+	// stops spending the link on it.
+	backfilledGroup := track.hasBackfill && group <= track.backfilled
+	if backfilledGroup {
+		if subgroup != baseSubgroup || track.backfill.stale() {
+			s.Cancel(moqt.StreamResetInternalError)
+			return
+		}
+		// Through the gate rather than the plain Finish below, because this
+		// group has two sources and the turn ends when the last of them lets go.
+		defer track.backfill.finish()
+		if !track.backfill.wait(r.ctx) {
+			return
+		}
 	}
 
 	// The end of this stream is the end of its group's turn, however it ended —
@@ -1315,7 +1460,7 @@ func (r *remote) readMedia(
 	// a group that waited for it would hand that delay to the next group's
 	// keyframe — the disposable layer holding up the one that cannot be dropped,
 	// which is the priority design backwards.
-	if subgroup == baseSubgroup {
+	if subgroup == baseSubgroup && !backfilledGroup {
 		defer track.order.Finish(group)
 	}
 
@@ -1340,17 +1485,30 @@ func (r *remote) readMedia(
 			continue
 		}
 
+		// Keyed on the publisher's emission index, not the object ID: each
+		// subgroup numbers its objects from its own base, so an ID orders a
+		// stream against itself and nothing else. See reorder.go.
+		index := emissionIndex(obj.ObjectID, decoded.Properties)
+
 		frame := bridge.MediaFrame{
 			Kind:      track.kind,
 			Handle:    track.handle,
 			Timestamp: scaleTimestamp(decoded.Properties),
-			// The first object of every group opens it, and for video
-			// every group opens on a keyframe: writeVideo rotates the group
-			// *on* the keyframe, so the two cannot come apart. Object 0
-			// of subgroup 0 specifically: each layer numbers from its own
-			// base now (see layerObjectStride), so the enhancement layer has
-			// an object 0 too and it is an ordinary delta frame.
-			KeyFrame:      subgroup == baseSubgroup && obj.ObjectID == 0,
+			// The first object emitted in a group opens it, and for video every
+			// group opens on a keyframe: writeVideo rotates the group *on* the
+			// keyframe, so the two cannot come apart.
+			//
+			// Emission index rather than Object ID, which is what this used to
+			// read. The ID says nothing on its own — each layer numbers from its
+			// own base (see layerObjectStride), so "object 0" exists once per
+			// layer and only one of them is the keyframe, and which range the
+			// base layer occupies has already changed once. The emission index
+			// is defined as the position in the group's emission order, so index
+			// zero is the object that opened the group whatever the ID layout,
+			// and for a publisher that stamps no index it falls back to the ID —
+			// which is right for the unlayered case that is the only one without
+			// one. The subgroup test is then redundant and kept as a guard.
+			KeyFrame:      subgroup == baseSubgroup && index == 0,
 			Payload:       decoded.Payload,
 			TemporalLayer: uint8(subgroup),
 		}
@@ -1368,14 +1526,10 @@ func (r *remote) readMedia(
 		}
 
 		counter.AddObject(len(decoded.Payload))
-		// Keyed on the publisher's emission index, not the object ID: each
-		// subgroup numbers its objects from its own base, so an ID orders a
-		// stream against itself and nothing else. See reorder.go.
 		// Two gates, and they answer different questions. The reassembler puts
-		// this group's subgroups back into decode order; deliver holds that
-		// order across the group boundary, where there is no reassembler to do
-		// it. See deliver.
-		index := emissionIndex(obj.ObjectID, decoded.Properties)
+		// this group's subgroups back into decode order; the group orderer holds
+		// that order across the group boundary, where there is no reassembler to
+		// do it. See reorder.go and grouporder.go.
 		reassembler.Push(subgroup, index, func() {
 			track.order.Push(group, index, func() { r.room.sink.SendMedia(&frame) })
 		})

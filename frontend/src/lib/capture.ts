@@ -465,11 +465,31 @@ const MODULE_TIMEOUT_MS = 10000;
  * How long the frame pump may go without a callback before it is taken to have
  * stopped rather than to be running slowly.
  *
- * A second is thirty frames at the camera's rate and fifteen at a screen
- * share's, so a source that is merely struggling is never mistaken for a chain
- * that has ended. See #startCaptureWatchdog.
+ * A second is thirty frames at a camera's rate, so a camera that is merely
+ * struggling is never mistaken for a chain that has ended.
+ *
+ * A screen is a different source and gets [SCREEN_STALL_MS]. This used to read
+ * "and fifteen at a screen share's", which assumed a share delivers frames on a
+ * clock. It does not: requestVideoFrameCallback fires once per *presentation*,
+ * and a desktop presents nothing at all while nothing on it moves — the same
+ * property that makes a share worth 3 Mbps at 1080p rather than smoothness. A
+ * reader that holds still is the ordinary case, and this threshold called it a
+ * dead pump. See #startCaptureWatchdog.
  */
 const CAPTURE_STALL_MS = 1000;
+
+/**
+ * The same, for a screen share, where going quiet is not a fault.
+ *
+ * There is no length of stillness that proves a desktop's capture has broken —
+ * a slide left on screen is indistinguishable from a pump that stopped being
+ * called. So this is not a diagnosis, it is a floor under how often the cheap
+ * remedy is worth trying: re-arming costs nothing and answers the one fault a
+ * screen shares with a camera, a dropped callback. What must never follow is
+ * the escalation — see #startCaptureWatchdog, where a screen never spends a
+ * restart and so is never withdrawn for being still.
+ */
+const SCREEN_STALL_MS = 5000;
 
 /** How often to check that the frame pump is still being called. */
 const CAPTURE_WATCHDOG_MS = 500;
@@ -604,6 +624,12 @@ export class Capture {
 
   /** The live frame pump, so the watchdog can re-arm the chain it drives. */
   #pump: (() => void) | null = null;
+  /**
+   * Encodes what the capture element is showing, without waiting to be handed
+   * a new frame. Held so forceKeyFrame can reach it — see there for why a
+   * keyframe cannot be left to the pump.
+   */
+  #encodeCurrent: (() => void) | null = null;
   #lastPumpMs = 0;
   #pumpRestarts = 0;
   #lastTapMs = 0;
@@ -1045,35 +1071,55 @@ export class Capture {
       if (this.#videoEncoder.encodeQueueSize > 2) {
         this.#dropped++;
       } else {
-        this.#lastEncodeMs = nowMs;
-        let frame: VideoFrame | null = null;
-        try {
-          frame = new VideoFrame(this.#video, {
-            timestamp: Math.round(performance.now() * 1000 - this.#epochUs),
-            ...(crop ? { visibleRect: { x: 0, y: 0, width, height } } : {}),
-          });
-          const forced = this.#forceKeyFrame;
-          this.#forceKeyFrame = false;
-          if (forced) {
-            // Restart the cadence from here, so a forced keyframe does not
-            // leave the next scheduled one moments behind it.
-            this.#frameIndex = 0;
-          }
-          const key = forced || this.#frameIndex % keyEvery === 0;
-          this.#videoEncoder.encode(frame, { keyFrame: key });
-          // The same frame, the same keyframe decision. Aligned deliberately:
-          // a subscriber that switches layers has to land on a keyframe in the
-          // one it moves to, and there is no way to ask for one — so the only
-          // guarantee available is that both layers always have one at the
-          // same moment.
-          this.#frameIndex++;
-        } catch (err) {
-          bridge.report('WARN', 'video frame capture failed', { err: String(err) });
-        } finally {
-          frame?.close();
-        }
+        encodeCurrent();
       }
       this.#video.requestVideoFrameCallback(pump);
+    };
+
+    /**
+     * Encodes whatever the element is showing right now.
+     *
+     * Split out of the pump so that a forced keyframe does not have to wait for
+     * the next presentation, because there may not be one. The element holds
+     * the last frame it was given, so this reads a picture whether or not the
+     * source has produced a new one — which is the whole of the difference for
+     * a screen, where "no new frame" is the ordinary state of a desktop nobody
+     * is touching rather than a fault.
+     *
+     * The pacing check stays with the pump and not here: skipping a frame that
+     * arrived too soon is about the *rate*, and a forced keyframe is not part
+     * of the rate. The queue check does apply and is the caller's, because a
+     * backed-up encoder is a reason to drop either kind.
+     */
+    const encodeCurrent = () => {
+      if (!this.#videoEncoder || !this.#video) return;
+      this.#lastEncodeMs = performance.now();
+      let frame: VideoFrame | null = null;
+      try {
+        frame = new VideoFrame(this.#video, {
+          timestamp: Math.round(performance.now() * 1000 - this.#epochUs),
+          ...(crop ? { visibleRect: { x: 0, y: 0, width, height } } : {}),
+        });
+        const forced = this.#forceKeyFrame;
+        this.#forceKeyFrame = false;
+        if (forced) {
+          // Restart the cadence from here, so a forced keyframe does not
+          // leave the next scheduled one moments behind it.
+          this.#frameIndex = 0;
+        }
+        const key = forced || this.#frameIndex % keyEvery === 0;
+        this.#videoEncoder.encode(frame, { keyFrame: key });
+        // The same frame, the same keyframe decision. Aligned deliberately:
+        // a subscriber that switches layers has to land on a keyframe in the
+        // one it moves to, and there is no way to ask for one — so the only
+        // guarantee available is that both layers always have one at the
+        // same moment.
+        this.#frameIndex++;
+      } catch (err) {
+        bridge.report('WARN', 'video frame capture failed', { err: String(err) });
+      } finally {
+        frame?.close();
+      }
     };
 
     this.#rememberVideo(settings);
@@ -1081,6 +1127,7 @@ export class Capture {
     if (camera) this.#watchTrack(camera);
     this.#videoRunning = true;
     this.#pump = pump;
+    this.#encodeCurrent = encodeCurrent;
     this.#lastPumpMs = performance.now();
     this.#pumpRestarts = 0;
     el.requestVideoFrameCallback(pump);
@@ -1116,8 +1163,9 @@ export class Capture {
       this.#checkTap();
       if (!this.#videoRunning || !this.#video || !this.#pump) return;
       if (document.visibilityState !== 'visible') return;
+      const sharing = this.#videoFor?.source === 'screen';
       const sinceMs = performance.now() - this.#lastPumpMs;
-      if (sinceMs < CAPTURE_STALL_MS) return;
+      if (sinceMs < (sharing ? SCREEN_STALL_MS : CAPTURE_STALL_MS)) return;
 
       // Which fault is this? Re-arming answers exactly one of the three, and
       // counting attempts without asking spent the whole budget on the two it
@@ -1142,6 +1190,19 @@ export class Capture {
             stalledMs: String(Math.round(sinceMs)),
           });
         }
+        return;
+      }
+
+      if (sharing) {
+        // A screen re-arms and never escalates. Stillness is what a desktop
+        // does, so the count that ends in withdrawal has nothing to measure
+        // here — and withdrawal is a one-way door for a share, because the
+        // recovery behind it needs a click that a timer does not have. A share
+        // that really has broken is caught by the track ending, which is
+        // handled above and is the way one actually stops.
+        void this.#video.play().catch(() => {});
+        this.#lastPumpMs = performance.now();
+        this.#video.requestVideoFrameCallback(this.#pump);
         return;
       }
 
@@ -1224,8 +1285,24 @@ export class Capture {
    * well as restarted, so this covers a track that ended and not only one that
    * stalled. Each failure lengthens the wait, so a camera that is genuinely
    * gone costs one attempt a minute rather than a spin.
+   *
+   * A screen is not a camera here and cannot be recovered this way at all:
+   * getDisplayMedia needs the transient activation of the click that asked for
+   * it, and there is none behind a timer. Retrying anyway is not merely futile,
+   * it is the worst available outcome — every attempt throws "must be called
+   * from a user gesture handler", each one lengthens the wait, and video stays
+   * withdrawn for the rest of the call while the log talks about a camera. The
+   * share is reported lost instead, and the store puts the camera back; see
+   * onVideoSourceLost, which is the same landing an externally-stopped share
+   * already has.
    */
   #scheduleVideoRecovery(): void {
+    if (this.#videoFor?.source === 'screen') {
+      bridge.report('INFO', 'the screen share stopped publishing and cannot be ' +
+        'reopened without a click; falling back');
+      this.onVideoSourceLost?.();
+      return;
+    }
     if (this.#videoRecovery !== null || !this.#videoFor) return;
     this.#videoRecoveryWait = this.#videoRecoveryWait
       ? Math.min(this.#videoRecoveryWait * 2, VIDEO_RECOVERY_MAX_MS)
@@ -1241,6 +1318,13 @@ export class Capture {
   #recoverVideoNow(): void {
     const settings = this.#videoFor;
     if (!settings || this.#videoRunning) return;
+    if (settings.source === 'screen') {
+      // Reachable directly as well as through the timer — the track-unmute
+      // path calls this. A screen cannot be reopened without a click either
+      // way. See #scheduleVideoRecovery.
+      this.#scheduleVideoRecovery();
+      return;
+    }
 
     if (this.#videoRecovery !== null) {
       clearTimeout(this.#videoRecovery);
@@ -2027,6 +2111,9 @@ export class Capture {
     this.#frameIndex = 0;
     this.#lastEncodeMs = 0;
     this.#videoFor = null;
+    // Dropped with the encoder it closes over, so a keyframe request arriving
+    // between pipelines cannot reach into the one that has gone.
+    this.#encodeCurrent = null;
   }
 
   /** Releases the microphone, its encoder and the audio graph. */
@@ -2098,14 +2185,34 @@ export class Capture {
   }
 
   /**
-   * Makes the next captured frame a keyframe.
+   * Makes a keyframe now, rather than marking the next captured frame.
    *
    * Used after a reconnect: the new session has no open group, and the
-   * publisher will not start one on a delta frame, so without this the
-   * remote view stays blank until the next scheduled keyframe.
+   * publisher will not start one on a delta frame, so until a keyframe reaches
+   * it every frame is refused and the remote view stays blank.
+   *
+   * "The next captured frame" was the whole of this, and it is a promise a
+   * screen share cannot keep. Frames are captured on presentation, and a
+   * desktop presents nothing while nothing on it moves — so a share of a slide
+   * or a document came back from a reconnect blank and stayed blank until
+   * somebody happened to move a window. A camera hid it: at 30 fps the next
+   * frame is 33 ms away.
+   *
+   * So the flag is set and the encode is done immediately, from what the
+   * capture element is already holding. The pump's rate limiter is
+   * deliberately not consulted — it exists to hold a *frame rate*, and this is
+   * not part of one — but the flag still stands on its own, so a pump that
+   * beats us to it produces the keyframe instead and this one is a no-op.
    */
   forceKeyFrame(): void {
     this.#forceKeyFrame = true;
+    if (!this.#videoRunning) return;
+    if (this.#videoEncoder?.state !== 'configured') return;
+    // A backed-up encoder is the one case worth waiting for: another frame
+    // would deepen the queue, and the flag will be taken by the pump as soon
+    // as it drains.
+    if (this.#videoEncoder.encodeQueueSize > 2) return;
+    this.#encodeCurrent?.();
   }
 
   /** The local participant's current voice state. */

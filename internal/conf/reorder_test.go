@@ -3,6 +3,7 @@ package conf
 import (
 	"sync"
 	"testing"
+	"time"
 )
 
 // collector records the order objects were emitted in, which is the only thing
@@ -137,6 +138,7 @@ func TestReassemblerNeverHoldsTheBaseLayer(t *testing.T) {
 func TestReassemblerKeepsTheBaseLayerWholeUnderAnyBacklog(t *testing.T) {
 	const frames = maxHeldEnhancement * 4
 	g := newGroupReassembler()
+	g.graceWindow = 0 // pure-drop semantics; the grace window is tested separately
 	var c collector
 
 	for i := range uint64(frames) {
@@ -323,6 +325,7 @@ func TestReassemblerRunsAGroupJoinedPartWayThrough(t *testing.T) {
 func TestReassemblerConcurrentPushesStayOrdered(t *testing.T) {
 	const perLayer = maxHeldEnhancement * 2
 	g := newGroupReassembler()
+	g.graceWindow = 0 // pure-drop semantics; the grace window is tested separately
 	var c collector
 
 	var wg sync.WaitGroup
@@ -435,5 +438,126 @@ func TestGroupsAreNotReusedAfterARestart(t *testing.T) {
 		t.Fatalf("emitted %v: a reused group ID is indistinguishable from a "+
 			"replay, so this must stay dropped — the fix belongs in the "+
 			"publisher, which must advance the group", got)
+	}
+}
+
+// TestReassemblerGraceWindowWaitsForLateEnhancement is the case the grace window
+// exists for: the enhancement layer has been seen, so it is being delivered,
+// but its next frame is delayed by the scheduler while the base layer races
+// ahead. Without the grace window the base frame advances past the missing
+// enhancement index, and when it finally arrives it is dropped as "overtaken"
+// — the decoder then receives frames referencing a frame it never saw, which
+// is macroblock garbage until the next keyframe.
+//
+// The grace window holds the base frame briefly, and the enhancement frame
+// arrives within that window, so both go out in order.
+func TestReassemblerGraceWindowWaitsForLateEnhancement(t *testing.T) {
+	g := newGroupReassembler()
+	g.graceWindow = 50 * time.Millisecond // generous for a goroutine to wake
+	var c collector
+
+	// The enhancement layer opens the group, proving it is being delivered.
+	// Enhancement@1 is held — it has overtaken the base frame it references.
+	g.Push(1, 1, c.emitter(1))
+	// The base layer's first frame goes out. Enhancement@1 stays held: it is
+	// released only when a later base frame proves nothing earlier is coming.
+	g.Push(baseSubgroup, 0, c.emitter(0))
+	if got, want := c.order(), []uint64{0}; !equal(got, want) {
+		t.Fatalf("order = %v, want %v — enhancement@1 stays held until a later "+
+			"base frame releases it", got, want)
+	}
+
+	// Base@2 arrives and releases enhancement@1 via releaseBelowLocked (1 < 2).
+	// Now g.next is 3. The enhancement layer's reader has not been scheduled yet,
+	// so enhancement@3 has not arrived. Base@4 finds a gap at 3 — and
+	// sawEnhancement is true, so the grace window engages.
+	//
+	// We push base@4 on a goroutine; it enters the grace wait for the gap at 3.
+	// After a brief sleep, enhancement@3 arrives on its own goroutine and fills
+	// the gap, letting base@4 proceed.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Base@2 goes out immediately (index == g.next == 2), releasing held@1.
+		g.Push(baseSubgroup, 2, c.emitter(2))
+		// Base@4 finds a gap at 3. The grace window waits for enhancement@3.
+		g.Push(baseSubgroup, 4, c.emitter(4))
+	}()
+
+	// Give the goroutine time to push base@2 (releasing enhancement@1) and enter
+	// the grace wait for the gap at 3, then deliver the missing enhancement.
+	time.Sleep(10 * time.Millisecond)
+	g.Push(1, 3, c.emitter(3))
+	<-done
+
+	if got, want := c.order(), []uint64{0, 1, 2, 3, 4}; !equal(got, want) {
+		t.Fatalf("order = %v, want %v — the grace window should have held the "+
+			"base frame at 4 until the enhancement frame at 3 arrived", got, want)
+	}
+}
+
+// TestReassemblerGraceWindowExpiresAndDrops is the cost side of the grace
+// window: the enhancement frame does not arrive within the window, so the
+// base frame goes out after the wait and the late enhancement frame is
+// dropped on arrival. This is the same outcome as before the grace window —
+// the window only helps when the frame is actually coming, and when it is
+// not, the behavior is unchanged.
+func TestReassemblerGraceWindowExpiresAndDrops(t *testing.T) {
+	g := newGroupReassembler()
+	g.graceWindow = 5 * time.Millisecond
+	var c collector
+
+	// Enhancement layer seen, then base layer races ahead.
+	g.Push(1, 1, c.emitter(1))
+	g.Push(baseSubgroup, 0, c.emitter(0))
+	g.Push(baseSubgroup, 2, c.emitter(2))
+
+	// Base frame at 4 finds a gap at 3. The grace window waits, expires,
+	// and the base frame goes out. The enhancement at 3 never arrived.
+	start := time.Now()
+	g.Push(baseSubgroup, 4, c.emitter(4))
+	elapsed := time.Since(start)
+
+	if elapsed < g.graceWindow {
+		t.Fatalf("base frame went out after %v, expected to wait at least %v",
+			elapsed, g.graceWindow)
+	}
+	if got, want := c.order(), []uint64{0, 1, 2, 4}; !equal(got, want) {
+		t.Fatalf("order = %v, want %v — after the grace window the base frame "+
+			"goes out and the missing enhancement slot is skipped", got, want)
+	}
+
+	// The late enhancement frame arrives after the window expired. It is
+	// below g.next and dropped as overtaken — the same behavior as before.
+	g.Push(1, 3, c.emitter(3))
+	if got, want := c.order(), []uint64{0, 1, 2, 4}; !equal(got, want) {
+		t.Fatalf("order = %v, want %v — a frame that arrives after the grace "+
+			"window expired is overtaken and must not be emitted", got, want)
+	}
+}
+
+// TestReassemblerGraceWindowDoesNotEngageForShedLayer pins the design invariant
+// the grace window exists alongside: when the enhancement layer is not being
+// delivered at all (a relay shed it and never opened its stream), the base
+// layer must go out on arrival with no waiting. sawEnhancement stays false,
+// so the grace window never engages, and TestReassemblerNeverHoldsTheBaseLayer
+// holds.
+func TestReassemblerGraceWindowDoesNotEngageForShedLayer(t *testing.T) {
+	g := newGroupReassembler()
+	g.graceWindow = 5 * time.Second // would be catastrophic if it engaged
+	var c collector
+
+	// Only the base layer arrives — the enhancement layer was shed.
+	for _, index := range []uint64{0, 2, 4, 6} {
+		start := time.Now()
+		g.Push(baseSubgroup, index, c.emitter(index))
+		if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+			t.Fatalf("base frame at %d took %v — the grace window engaged when "+
+				"the enhancement layer was never seen, which would freeze the "+
+				"tile on a shed link", index, elapsed)
+		}
+	}
+	if got, want := c.order(), []uint64{0, 2, 4, 6}; !equal(got, want) {
+		t.Fatalf("order = %v, want %v", got, want)
 	}
 }

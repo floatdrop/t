@@ -977,6 +977,21 @@ func (r *remote) readMedia(
 	group, subgroup := s.Header.GroupID, s.Header.SubgroupID
 	reassembler := track.reassemblerFor(group)
 
+	// Diagnostic: log when the reassembler discards an enhancement frame.
+	// Audio has no layers, so the callback is wired for video only. The
+	// reassembler is shared across subgroup goroutines, so the callback is
+	// set once per group — the first stream to create it wins, and the
+	// closure captures group and track for context.
+	if track.kind == bridge.KindVideo && reassembler.onDrop == nil {
+		g, h := group, track.handle // captured for the closure
+		reassembler.onDrop = func(sg, idx uint64, reason dropReason) {
+			r.log.Warn("reassembler dropped frame",
+				"participant", r.id, "handle", h,
+				"group", g, "subgroup", sg,
+				"index", idx, "reason", reason)
+		}
+	}
+
 	// Counted once per group, by the stream that opens it. Every layer of a
 	// group is the same group, so counting per stream would report a group
 	// count that tracked the layer count instead.
@@ -996,6 +1011,21 @@ func (r *remote) readMedia(
 			continue
 		}
 
+		keyFrame := subgroup == 0 && obj.ObjectID == 0
+		// Diagnostic: log the keyframe derivation for video. The flag is
+		// inferred from position (subgroup 0, object 0), not from the
+		// bitstream — a mismatch between the encoder's keyframe cadence
+		// and the group boundary would produce a delta frame marked as a
+		// key, corrupting the decoder's reference chain until the next
+		// real keyframe. Logged at debug to avoid flooding in the steady
+		// state; raise to info if investigating artifacts.
+		if track.kind == bridge.KindVideo && keyFrame {
+			r.log.Debug("video keyframe derived",
+				"participant", r.id, "handle", track.handle,
+				"group", group, "subgroup", subgroup,
+				"objectID", obj.ObjectID,
+				"payloadBytes", len(decoded.Payload))
+		}
 		frame := bridge.MediaFrame{
 			Kind:      track.kind,
 			Handle:    track.handle,
@@ -1005,7 +1035,7 @@ func (r *remote) readMedia(
 			// of subgroup 0 specifically: each layer numbers from its own
 			// base now (see layerObjectStride), so the enhancement layer has
 			// an object 0 too and it is an ordinary delta frame.
-			KeyFrame:      subgroup == 0 && obj.ObjectID == 0,
+			KeyFrame:      keyFrame,
 			Payload:       decoded.Payload,
 			TemporalLayer: uint8(subgroup),
 		}

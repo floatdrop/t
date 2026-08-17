@@ -1,6 +1,9 @@
 package conf
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // Reassembling a group that arrives on more than one subgroup stream.
 //
@@ -61,13 +64,47 @@ const baseSubgroup = 0
 // drains one subgroup well ahead of the other — a backfilled group, or a
 // publisher catching up after a stall, where a whole layer can arrive before
 // the first object of the other. Sized for that: a GOP is a keyframe interval
-// at the capture frame rate, so an L1T2 group at 30 fps with a one-second
-// interval carries fifteen enhancement frames.
+// at the capture frame rate, so an L1T2 group at 30 fps with a five-second
+// interval carries seventy-five enhancement frames.
 //
 // Overflow drops the oldest, which is the one whose base frame is furthest
 // behind and so the likeliest to have been overtaken already. Nothing
-// references it, so the cost is that frame and nothing else.
+// references it, so the cost is that frame and nothing else. The bound is
+// deliberately below a full GOP: a backfill that dumps the entire enhancement
+// layer at once is a relay pathology, not the steady state, and holding 75
+// frames for each of several groups is memory the call cannot spare.
 const maxHeldEnhancement = 16
+
+// enhancementGraceWindow is how long a base-layer frame waits for a missing
+// enhancement frame whose index sits between the reassembler's current
+// position and the base frame's own index, when the enhancement layer has
+// already been seen on this group.
+//
+// Two temporal layers ride separate QUIC streams, each read on its own
+// goroutine with no ordering between them. The base layer can deliver several
+// frames before the enhancement layer's reader is scheduled, and the
+// reassembler's next pointer advances past the missing enhancement index —
+// when it finally arrives it is below the mark and dropped as "overtaken",
+// even though nothing was wrong: the frame was in flight, merely delayed by
+// the scheduler. The decoder then receives frames that reference the dropped
+// one, producing macroblock garbage until the next keyframe.
+//
+// The grace window closes that gap. It is bounded: the wait is at most this
+// long, and it only engages when the enhancement layer has already been seen
+// on this group — proving the layer is being delivered, not shed by a relay.
+// A shed layer never opens its stream, so sawEnhancement stays false and the
+// base layer goes out on arrival, exactly as before. This is what keeps
+// TestReassemblerNeverHoldsTheBaseLayer passing: the freeze that design
+// exists to prevent is the case where the layer is not coming at all.
+//
+// Five milliseconds is far longer than a goroutine takes to be scheduled on a
+// loaded machine, and short enough to disappear into the inter-frame gap at
+// 30 fps (33 ms). The cost is one grace window per genuine gap, and a genuine
+// gap — an enhancement frame that is actually missing rather than merely
+// delayed — is the case the bound is sized for: after the window, the base
+// frame goes out and the missing enhancement frame is dropped on arrival, as
+// before.
+const enhancementGraceWindow = 5 * time.Millisecond
 
 // heldObject is one object waiting for its turn, with whatever the caller needs
 // to emit it. The payload is opaque here: this file owns ordering, not media.
@@ -75,6 +112,14 @@ type heldObject struct {
 	index uint64
 	emit  func()
 }
+
+// dropReason is why the reassembler discarded an object, for diagnostic logging.
+type dropReason string
+
+const (
+	dropReasonOvertaken   dropReason = "overtaken"   // index < next: arrived after its turn
+	dropReasonBacklogFull dropReason = "backlogFull" // maxHeldEnhancement exceeded, oldest shed
+)
 
 // groupReassembler orders one group's objects across its subgroup streams.
 //
@@ -93,10 +138,29 @@ type groupReassembler struct {
 	// state, and a linear insert beats a heap's constant factor and its
 	// allocation at the depth this reaches.
 	held []heldObject
+
+	// sawEnhancement is true once any enhancement object has been pushed for
+	// this group, whether or not it was emitted. It gates the grace window:
+	// the wait engages only when the enhancement layer has been seen, proving
+	// it is being delivered rather than shed. A shed layer never opens its
+	// stream, so this stays false and the base layer is never held.
+	sawEnhancement bool
+
+	// graceWindow is how long a base frame waits for a missing enhancement
+	// frame before advancing past it. Set to enhancementGraceWindow in
+	// newGroupReassembler; overridden to zero by tests that exercise the
+	// pure-drop semantics the grace window is layered on top of.
+	graceWindow time.Duration
+
+	// onDrop, when non-nil, is called with the subgroup, index, and reason
+	// whenever an object is discarded. Diagnostic: the reassembler is a pure
+	// ordering component, so this is the only window into what it gave up on.
+	// Wired by readMedia in remote.go, which has the logger and track context.
+	onDrop func(subgroup, index uint64, reason dropReason)
 }
 
 func newGroupReassembler() *groupReassembler {
-	return &groupReassembler{}
+	return &groupReassembler{graceWindow: enhancementGraceWindow}
 }
 
 // Push takes one object from one subgroup stream and emits whatever that makes
@@ -119,18 +183,59 @@ func newGroupReassembler() *groupReassembler {
 // handing it one at all.
 func (g *groupReassembler) Push(subgroup, index uint64, emit func()) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
+
+	if subgroup != baseSubgroup {
+		g.sawEnhancement = true
+	}
 
 	if index < g.next {
+		reason := dropReasonOvertaken
+		drop := g.onDrop
+		g.mu.Unlock()
+		if drop != nil {
+			drop(subgroup, index, reason)
+		}
 		return
 	}
 	if subgroup != baseSubgroup && index != g.next {
 		g.holdLocked(heldObject{index: index, emit: emit})
+		g.mu.Unlock()
 		return
 	}
+
+	// A base-layer object, or any object that is the next index due. Release
+	// everything held below it first, then check for a gap: if the enhancement
+	// layer has been seen and there is a missing index between what was just
+	// released and this object, the missing frame may be in flight on its own
+	// goroutine — merely delayed by the scheduler, not absent. Wait briefly
+	// for it; if it does not arrive, proceed as before and let the late Push
+	// drop it.
 	g.releaseBelowLocked(index)
+	if g.sawEnhancement && g.next < index && g.graceWindow > 0 {
+		g.waitForGapLocked(index)
+	}
 	g.next = index + 1
+	g.mu.Unlock()
 	emit()
+}
+
+// waitForGapLocked waits up to graceWindow for the enhancement frame at g.next
+// to arrive, sleeping in short increments and re-running releaseBelowLocked
+// on each wake to pick up anything that landed. The lock is released during
+// each sleep so the enhancement layer's goroutine can Push; reacquired on
+// wake. Returns with g.next at or above index, or with the window expired.
+//
+// When the missing frame arrives during a sleep, its own Push emits it and
+// advances g.next past the gap; on the next wake the loop condition fails and
+// the wait ends.
+func (g *groupReassembler) waitForGapLocked(index uint64) {
+	deadline := time.Now().Add(g.graceWindow)
+	for g.next < index && time.Now().Before(deadline) {
+		g.mu.Unlock()
+		time.Sleep(1 * time.Millisecond)
+		g.mu.Lock()
+		g.releaseBelowLocked(index)
+	}
 }
 
 // releaseBelowLocked emits every held object numbered before index, in order.
@@ -159,7 +264,11 @@ func (g *groupReassembler) holdLocked(obj heldObject) {
 	g.held[i] = obj
 
 	if len(g.held) > maxHeldEnhancement {
+		shed := g.held[0]
 		g.held = g.held[1:]
+		if g.onDrop != nil {
+			g.onDrop(baseSubgroup+1, shed.index, dropReasonBacklogFull)
+		}
 	}
 }
 

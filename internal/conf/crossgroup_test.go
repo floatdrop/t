@@ -22,8 +22,8 @@ import (
 // A keyframe is an IDR, and an IDR empties the decoded picture buffer. A frame
 // of the previous group arriving after it references pictures the decoder no
 // longer holds, so it decodes to garbage or not at all — one flash of
-// macroblocks per group boundary it happens on, which on a one-second GOP is
-// once a second.
+// macroblocks per group boundary it happens on, which on a five-second GOP is
+// once every five seconds.
 //
 // A burst is what makes it show. Nothing then paces the two subgroup streams
 // against each other or a group's streams against the next group's, and the

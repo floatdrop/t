@@ -28,28 +28,36 @@ import { addTapModule, watchAudioContext, type TapBlock } from './worklets';
  *
  * It is what a subscriber waits before its first picture, because a decoder
  * cannot start on a delta frame. That used to be covered by a FETCH replaying
- * the group in progress; the FETCH is gone, so this is the wait, and one
- * second is a tile that appears rather than one that is missing.
+ * the group in progress; the FETCH is gone, so this is the wait, and five
+ * seconds is a tile that appears rather than one that is missing.
  *
  * It is also how much a lost group costs, which is the other half of the
- * argument: a group is all-or-nothing to a decoder, so halving its length
- * halves the damage of losing one.
+ * argument: a group is all-or-nothing to a decoder, so a longer group
+ * raises the cost of losing one.
  *
- * The price is keyframes being a larger share of the stream — at 30 fps and
- * roughly four delta frames to a keyframe, about six per cent of the bitrate
+ * The price is keyframes being a smaller share of the stream — at 30 fps and
+ * roughly four delta frames to a keyframe, about one per cent of the bitrate
  * moves from deltas to keyframes. That is the cheaper side of this trade for
  * a call, where a blank tile is noticed and a slightly softer picture is not.
+ *
+ * Five seconds rather than one: the shorter interval was chosen when the FETCH
+ * still set the join latency, and the interval was the only thing that did.
+ * The grace window in the reassembler now covers the inter-layer skew that
+ * was the original reason for the short interval, so the longer group is safe
+ * and the bitrate savings and reduced keyframe overhead are worth the longer
+ * join wait.
  */
-const KEYFRAME_INTERVAL_SEC = 1;
+const KEYFRAME_INTERVAL_SEC = 5;
 
 /**
  * How many samples the reported video bitrate is averaged over.
  *
- * One second at the panel's 250 ms cadence, which is exactly one GOP: the
- * average then covers the same one keyframe however the window happens to land,
- * and the number stops alternating between the rate with a keyframe in it and
- * the rate without. Kept to a second so it still follows a real change — an
- * adaptive step shows up within a second of being taken.
+ * One second at the panel's 250 ms cadence. With a five-second GOP the window
+ * no longer covers a whole keyframe, but keyframes are one per cent of the
+ * bitrate at this interval, so the alternation between the rate with a
+ * keyframe in it and the rate without is below the noise floor anyway. Kept
+ * to a second so it still follows a real change — an adaptive step shows up
+ * within a second of being taken.
  */
 const VIDEO_KBPS_WINDOW = 4;
 

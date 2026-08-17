@@ -100,8 +100,8 @@ func joinRoomWithCounters(
 
 // publishPaced writes audio and video at something like a real call's cadence
 // until stop is closed: audio every 20 ms, video at 30 fps with a keyframe
-// every two seconds. Together they come to roughly half a megabit, which is
-// the figure the bottleneck in these tests is set against.
+// every two seconds (i%60 at 33 ms steps). Together they come to roughly half
+// a megabit, which is the figure the bottleneck in these tests is set against.
 //
 // Flat video: every frame on the base layer, which is one subgroup and the
 // shape every track had before temporal layers existed. See layers_test.go for
@@ -150,7 +150,7 @@ func publishPacedLayers(
 				return
 			case <-tick.C:
 			}
-			key := i%60 == 0 // every ~2 s
+			key := i%60 == 0 // every ~2 s — test cadence, not the production interval
 			size := videoSize
 			if key {
 				size = keySize

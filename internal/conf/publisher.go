@@ -37,8 +37,8 @@ var ErrAwaitingKeyFrame = errors.New("conf: waiting for first keyframe")
 // is already in the send buffer, so this bounds how long a *finished* group may
 // keep occupying the link and nothing about how one is written.
 //
-// Two seconds because a group is one GOP: the next keyframe, which is where a
-// subscriber recovers to regardless, is due two seconds after this one opened.
+// Ten seconds because a group is one GOP: the next keyframe, which is where a
+// subscriber recovers to regardless, is due ten seconds after this one opened.
 //
 // Audio deliberately has none, and used to. The reasoning for the one it had
 // was wrong — it claimed a late group would be discarded on arrival anyway,
@@ -50,7 +50,7 @@ var ErrAwaitingKeyFrame = errors.New("conf: waiting for first keyframe")
 // nothing logged and no counter moving. And lateness now has a precise remedy
 // — the subscriber notices the slip and rebuilds its subscription at the live
 // edge — so the blunt one is not worth the holes it costs.
-const videoSubgroupTimeout = 2 * time.Second
+const videoSubgroupTimeout = 10 * time.Second
 
 // enhancementObjectTimeout is how long a temporal enhancement frame may sit
 // queued for a subscriber before that layer is given up on for the group.
@@ -70,7 +70,7 @@ const videoSubgroupTimeout = 2 * time.Second
 // eight kilobytes at half a megabit is an eighth of a second, and the
 // enhancement layer queues behind every one of them — so a link that is merely
 // slow does not lose its top layer for coping.
-const enhancementObjectTimeout = 500 * time.Millisecond
+const enhancementObjectTimeout = 5 * time.Second
 
 // propEmissionIndex is a producer-defined Object Property carrying an object's
 // position in its group's emission order, counted across every subgroup of the
@@ -140,8 +140,8 @@ const propEmissionIndexLegacy message.PropertyType = 0x8002
 //
 // So each layer gets its own contiguous range: consecutive within the subgroup,
 // disjoint between them. The stride only has to exceed the objects one layer
-// can contribute to a group, which is a GOP's frame count — about 30 at a
-// two-second keyframe interval. Sixty-five thousand is four orders of magnitude
+// can contribute to a group, which is a GOP's frame count — about 150 at a
+// five-second keyframe interval. Sixty-five thousand is three orders of magnitude
 // of headroom for a two-byte varint.
 const layerObjectStride = 1 << 16
 

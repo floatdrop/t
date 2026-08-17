@@ -200,8 +200,8 @@ func TestTemporalLayersArriveInDecodeOrder(t *testing.T) {
 // Nothing may be stranded at the end of a group. A group's last frames are held
 // against the streams still open, and the streams of a group all end together
 // when the next keyframe rotates it — so a group that ends with something still
-// held is a group whose tail never reaches the decoder, which on a one-second
-// GOP is most of a second of a tile frozen part-way through.
+// held is a group whose tail never reaches the decoder, which on a five-second
+// GOP is most of five seconds of a tile frozen part-way through.
 func TestNoFramesAreStrandedAtTheEndOfALayeredGroup(t *testing.T) {
 	alice, bobRec := layeredPair(t, "layered2")
 

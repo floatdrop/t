@@ -15,6 +15,14 @@ import { KIND_VIDEO, fromBase64, type MediaFrame, type RemoteTrack } from './pro
 import { addPlayerModule, watchAudioContext, type PlayerChunk, type PlayerReport } from './worklets';
 
 /**
+ * Diagnostic flag for SVC layer stitching. When true, logs every video frame
+ * fed to the decoder with its temporal layer, keyframe flag, and timestamp,
+ * and warns on pre-keyframe drops. Set to true to investigate inter-keyframe
+ * artifacts; leave false for normal use to avoid console flooding.
+ */
+const DEBUG_SVC_STITCHING = false;
+
+/**
  * The shared output limiter. Every participant sums into it, so it exists to
  * keep four people talking at once from clipping the device.
  *
@@ -684,9 +692,32 @@ export class Playback {
 
     if (frame.kind === KIND_VIDEO) {
       const video = sink as VideoSink;
+      // Diagnostic: track the SVC layer sequence the decoder receives.
+      // An out-of-order layer or a gap in the base layer would produce
+      // artifacts between keyframes. Logged at debug to avoid flooding;
+      // the last layer and keyframe flag are kept for correlation.
+      const layer = frame.temporalLayer ?? 0;
+      if (DEBUG_SVC_STITCHING) {
+        console.debug('[svc] decode feed', {
+          handle: frame.handle,
+          participant: video.track.participant,
+          layer,
+          keyFrame: frame.keyFrame,
+          timestamp: frame.timestamp,
+          payloadBytes: frame.payload.byteLength,
+          sawKeyFrame: video.sawKeyFrame,
+        });
+      }
       if (!video.sawKeyFrame) {
         if (!frame.keyFrame) {
           video.dropped++;
+          if (DEBUG_SVC_STITCHING) {
+            console.warn('[svc] dropped pre-keyframe frame', {
+              handle: frame.handle,
+              layer,
+              timestamp: frame.timestamp,
+            });
+          }
           return;
         }
         video.sawKeyFrame = true;

@@ -17,8 +17,10 @@ import (
 // the keyframe anyway.
 //
 // So the keyframe is the contract and the group length is the wait — which is
-// why the publisher's keyframe interval came down to a second when the FETCH
-// went.
+// why the publisher's keyframe interval came down from the FETCH era's longer
+// value to a second when the FETCH went, and has since been raised to five
+// once the reassembler's grace window covered the inter-layer skew that the
+// short interval was also papering over.
 func TestAJoiningSubscriberStartsAtAKeyFrame(t *testing.T) {
 	relayServer := startRelay(t)
 	addr := relayServer.Addr()

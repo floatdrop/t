@@ -48,7 +48,7 @@ const (
 	// Two keyframe intervals, so what survives always contains a keyframe and a
 	// frontend coming back from a stall resumes on one instead of decoding
 	// deltas against references it never received.
-	videoMaxAge = 2 * time.Second
+	videoMaxAge = 10 * time.Second
 	// Under the player's own 250 ms ceiling, so the bridge gives up on stale
 	// sound before the ring buffer has to trim it. Both are audible; this one
 	// is shorter and it moves a counter.

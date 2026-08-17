@@ -640,9 +640,15 @@ func TestTwoParticipants(t *testing.T) {
 
 	// Alice's own namespace is announced back to her by the relay; she must
 	// not subscribe to herself.
+	//
+	// Waited on by nickname rather than by count, because a participant enters
+	// the roster when its subscription opens and gets its nickname when the
+	// catalog arrives — two separate publishParticipants calls. Waiting for the
+	// count alone is satisfied by the first and then races the second, which
+	// fails as a roster holding one nameless peer about one run in twenty.
 	waitFor(t, "alice to see bob", 5*time.Second, func() bool {
 		_, _, peers, _ := aliceRec.snapshot()
-		return len(peers) == 1
+		return len(peers) == 1 && peers[0].Nickname == "bob"
 	})
 	_, _, alicePeers, _ := aliceRec.snapshot()
 	if len(alicePeers) != 1 || alicePeers[0].Nickname != "bob" {

@@ -26,9 +26,11 @@
 // Within a group the objects are split across one subgroup per temporal
 // layer — subgroup 0 the base, higher subgroups the enhancement layers
 // nothing references — so a relay can shed the top of the ladder without
-// touching the bottom. Each layer numbers its objects from its own base
-// (see layerObjectStride), so an Object ID orders a subgroup against
-// itself and nothing else; what puts a group back into decode order is
+// touching the bottom. Each layer numbers its objects from its own base,
+// the base layer taking the highest range so that the Largest Object of a
+// group is always one of its frames (see objectIDFor). An Object ID
+// therefore orders a subgroup against itself and nothing else; what puts a
+// group back into decode order, and what says which object opened it, is
 // the emission index each object carries. See reorder.go.
 //
 // A subscriber joining mid-group does not wait for the next keyframe. It

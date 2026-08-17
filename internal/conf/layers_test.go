@@ -425,3 +425,51 @@ func TestABottleneckCostsTheEnhancementLayerFirst(t *testing.T) {
 			100*squeezedShare, 100*roomyShare)
 	}
 }
+
+// TestTheBaseLayerOwnsTheHighestObjectIDs pins the property the joining path
+// depends on, and the one that is invisible until it is wrong.
+//
+// A Location is ordered by (Group, Object), so the Largest Object of a group is
+// whichever layer holds the top object-ID range — and §5.1.2's largest-object
+// filter starts a subscription *after* the Largest Object. Put the base layer
+// at the bottom, as this used to, and the filter withholds every base object of
+// the group in progress while forwarding the enhancement objects above them:
+// precisely the frames a joining subscriber cannot decode, and none of the ones
+// it can. Inverted, the mark lands on a base object and the base layer keeps
+// flowing.
+//
+// Asserted as the ordering rather than as the arithmetic, because the ordering
+// is the requirement — any layout with base on top would do.
+func TestTheBaseLayerOwnsTheHighestObjectIDs(t *testing.T) {
+	// A GOP's worth at 30 fps and a five-second interval, and then some: the
+	// ranges must not overlap even when a group runs long.
+	const frames = 300
+
+	for layer := uint8(1); layer <= bridge.MaxTemporalLayer; layer++ {
+		for n := range uint64(frames) {
+			base := objectIDFor(baseSubgroup, n)
+			enhancement := objectIDFor(layer, n)
+			if enhancement >= base {
+				t.Fatalf("layer %d object %d has ID %d, at or above the base layer's %d: "+
+					"the largest object in a group would then be an enhancement one, and a "+
+					"largest-object subscription would withhold the whole base layer",
+					layer, n, enhancement, base)
+			}
+		}
+		// The strongest form: the *last* object an enhancement layer can
+		// contribute must still sort below the *first* base object, or a long
+		// group lets the layers cross.
+		if last, first := objectIDFor(layer, frames-1), objectIDFor(baseSubgroup, 0); last >= first {
+			t.Errorf("layer %d runs up to ID %d, which reaches the base layer's first at %d",
+				layer, last, first)
+		}
+	}
+
+	// And the keyframe is no longer at object 0, which is why readMedia derives
+	// it from the emission index instead. Pinned so the coupling is not
+	// rediscovered by a peer that never paints.
+	if id := objectIDFor(baseSubgroup, 0); id == 0 {
+		t.Error("the keyframe is at object 0 again; either the layout was reverted " +
+			"or the base layer is back at the bottom of the range")
+	}
+}

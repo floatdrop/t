@@ -43,14 +43,37 @@ type router struct {
 	// fetches does the same by Request ID.
 	subgroups map[uint64][]*session.IncomingSubgroupStream
 	fetches   map[uint64][]*session.IncomingFetchStream
+	// subgroupHandlers and fetchHandlers mirror what has been registered with
+	// the Demux, and exist so that parking and registering are decided under
+	// one lock rather than two.
+	//
+	// The Demux drops its own lock before handing an unrouted stream to
+	// OnUnknown, which opens a window nothing downstream can see: the accept
+	// loop looks up a handler and misses, the caller registers one and finds
+	// nothing parked, and only then does the accept loop park the stream — into
+	// a list that has already been drained. The stream is then held by a
+	// handler that will never be consulted for it and reset when orphanTTL
+	// expires. For a catalog that is a participant who never gets a nickname
+	// and never has their media subscribed; observed as one run in three under
+	// load, and as "resetting unclaimed fetch stream" five seconds before the
+	// test gave up.
+	//
+	// Checking these under r.mu closes it. Either park gets there first and the
+	// registration finds the parked stream, or the registration gets there
+	// first and park hands the stream straight to the handler; there is no
+	// interleaving where both look and neither acts.
+	subgroupHandlers map[uint64]func(*session.IncomingSubgroupStream)
+	fetchHandlers    map[uint64]func(*session.IncomingFetchStream)
 }
 
 func newRouter(log *slog.Logger) *router {
 	r := &router{
-		log:       log,
-		demux:     session.NewDemux(),
-		subgroups: make(map[uint64][]*session.IncomingSubgroupStream),
-		fetches:   make(map[uint64][]*session.IncomingFetchStream),
+		log:              log,
+		demux:            session.NewDemux(),
+		subgroups:        make(map[uint64][]*session.IncomingSubgroupStream),
+		fetches:          make(map[uint64][]*session.IncomingFetchStream),
+		subgroupHandlers: make(map[uint64]func(*session.IncomingSubgroupStream)),
+		fetchHandlers:    make(map[uint64]func(*session.IncomingFetchStream)),
 	}
 	r.demux.OnUnknown(r.park)
 	return r
@@ -75,7 +98,10 @@ func (r *router) HandleSubgroups(alias uint64, arrived, h func(*session.Incoming
 	}
 	r.demux.HandleTrack(alias, dispatch)
 
+	// Recorded and drained together, which is what makes this safe against a
+	// stream being parked concurrently — see the handler maps.
 	r.mu.Lock()
+	r.subgroupHandlers[alias] = dispatch
 	parked := r.subgroups[alias]
 	delete(r.subgroups, alias)
 	r.mu.Unlock()
@@ -89,16 +115,20 @@ func (r *router) HandleSubgroups(alias uint64, arrived, h func(*session.Incoming
 // HandleFetch routes the FETCH response for requestID to h, on its own
 // goroutine, and delivers a response that has already arrived.
 func (r *router) HandleFetch(requestID uint64, h func(*session.IncomingFetchStream)) {
-	r.demux.HandleFetch(requestID, func(s *session.IncomingFetchStream) { go h(s) })
+	dispatch := func(s *session.IncomingFetchStream) { go h(s) }
+	r.demux.HandleFetch(requestID, dispatch)
 
+	// Recorded and drained together, which is what makes this safe against a
+	// stream being parked concurrently — see the handler maps.
 	r.mu.Lock()
+	r.fetchHandlers[requestID] = dispatch
 	parked := r.fetches[requestID]
 	delete(r.fetches, requestID)
 	r.mu.Unlock()
 
 	for _, s := range parked {
 		r.log.Debug("delivering parked fetch stream", "request_id", requestID)
-		go h(s)
+		dispatch(s)
 	}
 }
 
@@ -115,8 +145,18 @@ func (r *router) park(ds session.DataStream) {
 	case *session.IncomingSubgroupStream:
 		alias := s.Header.TrackAlias
 		r.mu.Lock()
-		r.subgroups[alias] = append(r.subgroups[alias], s)
+		handler := r.subgroupHandlers[alias]
+		if handler == nil {
+			r.subgroups[alias] = append(r.subgroups[alias], s)
+		}
 		r.mu.Unlock()
+		if handler != nil {
+			// Registered while this stream was on its way down from the Demux.
+			// Still on the accept loop, so the arrival hook keeps the delivery
+			// order it is there to read.
+			handler(s)
+			return
+		}
 		time.AfterFunc(orphanTTL, func() {
 			if r.claimSubgroup(alias, s) {
 				r.log.Debug("resetting unclaimed subgroup stream", "alias", alias)
@@ -127,8 +167,15 @@ func (r *router) park(ds session.DataStream) {
 	case *session.IncomingFetchStream:
 		id := s.Header.RequestID
 		r.mu.Lock()
-		r.fetches[id] = append(r.fetches[id], s)
+		handler := r.fetchHandlers[id]
+		if handler == nil {
+			r.fetches[id] = append(r.fetches[id], s)
+		}
 		r.mu.Unlock()
+		if handler != nil {
+			handler(s)
+			return
+		}
 		time.AfterFunc(orphanTTL, func() {
 			if r.claimFetch(id, s) {
 				r.log.Debug("resetting unclaimed fetch stream", "request_id", id)

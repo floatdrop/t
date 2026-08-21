@@ -6,10 +6,6 @@ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/dunglas/httpsfv v1.1.0 h1:Jw76nAyKWKZKFrpMMcL76y35tOpYHqQPzHQiwDvpe54=
 github.com/dunglas/httpsfv v1.1.0/go.mod h1:zID2mqw9mFsnt7YC3vYQ9/cjq30q41W+1AnDwH8TiMg=
-github.com/floatdrop/moq-go v0.0.0-20260809102001-36184f36364e h1:WkbHXKopw3m7/qZ+z7ZkKFILOXbuZHZ1qjroA3LoRJQ=
-github.com/floatdrop/moq-go v0.0.0-20260809102001-36184f36364e/go.mod h1:/zHcdFlORz9sUlYdKxdvTdeTvXLS1wRTUm3gVIe5qZM=
-github.com/floatdrop/moq-go v0.0.0-20260817075557-2ae0bc926cd5 h1:3DORZCIcUaaxIFc+aUXouuCCoxM0TYYfOhaD42ol8EA=
-github.com/floatdrop/moq-go v0.0.0-20260817075557-2ae0bc926cd5/go.mod h1:uJwj0HXgBgovx8eT4EEAwe2jIrdU8LSRoRNM1rsruDI=
 github.com/floatdrop/moq-go v0.0.0-20260817080028-93560b0e17e2 h1:nPYuBToh7hAVDA306QjPhqRNKzpwxYkv0Zg2h0Otga0=
 github.com/floatdrop/moq-go v0.0.0-20260817080028-93560b0e17e2/go.mod h1:uJwj0HXgBgovx8eT4EEAwe2jIrdU8LSRoRNM1rsruDI=
 github.com/go-json-experiment/json v0.0.0-20251027170946-4849db3c2f7e h1:Lf/gRkoycfOBPa42vU2bbgPurFong6zXeFtPoxholzU=
@@ -42,8 +38,8 @@ github.com/quic-go/webtransport-go v0.12.0 h1:CpnKNwZvdV0LD73xoHO8QaR0NI3llqpWRw
 github.com/quic-go/webtransport-go v0.12.0/go.mod h1:GHne8aRFJ24h73pAMrcywXtuaz/ShBXCLXLvG/NPFdU=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
-github.com/wailsapp/wails/v3 v3.0.0-beta.8 h1:r5d+5ERZ6TYI/OPJnqq91Ugux+TkfplCURUi/+6vA/Q=
-github.com/wailsapp/wails/v3 v3.0.0-beta.8/go.mod h1:A/OaL1mXOnwWynTJv4rZU89Wbk5q3rtq3C3qkx4rRN0=
+github.com/wailsapp/wails/v3 v3.0.0-beta.12 h1:Vema2kFgJvkwPovQ8GMBBrkZNm5cKVR4bYzSCMgU+PU=
+github.com/wailsapp/wails/v3 v3.0.0-beta.12/go.mod h1:zKZYhB3WjrN5LhJWbnOAVMN0Xf8qTozbw2nf5micKl4=
 go.uber.org/mock v0.5.2 h1:LbtPTcP8A5k9WPXj54PPPbjcI4Y6lhyOZXn+VS7wNko=
 go.uber.org/mock v0.5.2/go.mod h1:wLlUxC2vVTPTaE3UD51E0BGOAElKrILxhVSDYQLld5o=
 golang.org/x/crypto v0.54.0 h1:YLIA59K4fiNzHzjnZt2tUJQjQtUWfWbeHBqKtk3eScw=

@@ -14,6 +14,7 @@
   import Settings2 from '@lucide/svelte/icons/settings-2';
   import { onMount } from 'svelte';
   import { rungValue, VIDEO_LADDER } from '../lib/capture';
+  import { videoCodecOptions, type VideoCodecId } from '../lib/codec';
   import { ICON_SIZE } from '../lib/icons';
   import { parseInviteLink } from '../lib/invite';
   import { randomNickname, randomRoom } from '../lib/nickname';
@@ -155,6 +156,21 @@
 
   /** Reopens the devices when a selection changes, so preview follows it. */
   const reopen = refreshDevices;
+
+  const codecs = $derived(videoCodecOptions(store.videoCodecs, store.media.videoCodec));
+
+  /**
+   * Records the codec pick. Nothing to reopen: the preview shows the camera,
+   * not the encoder, so this only matters from the moment there is a call to
+   * encode for.
+   */
+  function pickCodec(ev: Event): void {
+    const id = (ev.currentTarget as HTMLSelectElement).value as VideoCodecId;
+    // Nothing to record for a pick that changes nothing — and storing it would
+    // pin a preference nobody expressed, which a later default could not move.
+    if (id === store.media.videoCodec) return;
+    store.setVideoCodec(id);
+  }
 
   /**
    * Shows or hides the settings, opening the devices on the way in and
@@ -417,6 +433,26 @@
                 <option value={rungValue(rung)}>{rung.label}</option>
               {/each}
             </select>
+          </div>
+          <div class="field">
+            <label for="codec">Codec</label>
+            <!-- Listed from what this WebView answered to, so the list is
+                 short and everything in it works. The note under a pick says
+                 what it costs; see codec.ts for why H.264 High is the default
+                 and not baseline. -->
+            <select
+              id="codec"
+              value={store.media.videoCodec}
+              onchange={pickCodec}
+              disabled={!store.media.useVideo}
+            >
+              {#each codecs as codec (codec.id)}
+                <option value={codec.id}>
+                  {codec.label}{codec.available ? '' : ' (unavailable here)'}
+                </option>
+              {/each}
+            </select>
+            <p class="hint">{codecs.find((c) => c.id === store.media.videoCodec)?.note ?? ''}</p>
           </div>
           <div class="field">
             <label for="vbr">Video bitrate</label>

@@ -13,7 +13,7 @@ Each participant owns a namespace tuple and publishes three tracks under it:
 ```
 ("t", <room>, <participant-id>)
     catalog   MSF catalog (draft-ietf-moq-msf-01) — declares the media tracks
-    video     LOC-packaged H.264 (Annex B)
+    video     LOC-packaged H.264 or HEVC (Annex B)
     audio     LOC-packaged Opus
 ```
 
@@ -34,21 +34,31 @@ after it belong to the same one. A relay can therefore drop a whole group under
 congestion and land the subscriber exactly on the next keyframe. A group is five
 seconds long, which is how much a lost group costs — the other side of that
 trade being that keyframes are only about one per cent of the bitrate at this
-interval. H.264 is encoded in Annex B, so SPS/PPS travel in-band with every
-keyframe and no out-of-band config is needed.
+interval. Annex B is asked for whichever codec is chosen, and given for H.264:
+SPS/PPS travel in-band with every keyframe and no out-of-band config is needed.
+WebKit ignores the request for HEVC — see [Choosing a codec](#choosing-a-codec)
+— so that stream carries its `hvcC` in the catalog instead.
 
 The interval used to be the join latency as well, and that is what kept it
 short. It is not any more — see [Arriving with a picture](#arriving-with-a-picture)
 — so the length is now a bitrate-and-loss question decided on its own.
 
 Within a group, the objects are split across **one subgroup per temporal
-layer**. The primary encoding is configured `L1T2`, so frames alternate between
+layer**. The primary encoding asks for `L1T2`, so frames alternate between
 a base layer that decodes on its own and an enhancement layer nothing
 references; the base is subgroup 0 and the enhancement subgroup 1. A subgroup is
 the smallest unit MOQT lets a subscriber decline (§5.1.3 Range Filters) or a
 publisher mark sheddable (§8 delivery timeouts), so numbering them by layer is
 what makes the enhancement layer separately droppable — at the cost of frame
 rate rather than a frozen tile.
+
+Asked for, not assumed. `scalabilityMode` is probed per codec, because the
+encoders behind two families are two different pieces of software and neither
+the API nor the spec promises they answer the same way; a codec this platform
+will only take flat is configured flat, publishes one subgroup, and says so at
+WARN — an unsupported mode throws out of `configure()`, and a throw there costs
+the call its picture rather than its layering. The receiving path needs no
+warning: one subgroup is what a flat stream has always looked like.
 
 Each layer numbers its objects **from its own base**, because two rules apply at
 once. Object IDs must be unique within a group, since a relay's cache keys
@@ -715,6 +725,86 @@ across the swap so timestamps stay monotonic — a subscriber mid-decode must no
 see them jump backwards — while the audio clock offset is deliberately taken
 again, because the new `AudioContext` starts its own clock from zero.
 `TestTrackReconfiguration` in `internal/conf` covers that wire behaviour.
+
+### Choosing a codec
+
+The video codec is a setting too, and `codec.ts` owns it: the list, the codec
+string each entry is written as, the framing member its family spells framing
+with, and the probe that decides which of them this WebView is offered.
+
+There used to be one answer, constrained baseline H.264 at the lowest level
+that carried the stream. Baseline is the safest bitstream anything will decode
+and it is also the weakest — no CABAC, no 8×8 transform, no B-frames — so at
+the rates a call runs on, it is what puts blocks on a face that moves. The
+bitrate was never the problem; the profile was spending it badly. **H.264 High
+is the default now**: the same codec to every decoder that matters, since High
+has been mandatory in hardware for well over a decade, and a far better use of
+the same number of bits. HEVC is offered above it where the platform encodes
+it, for the best picture per bit and the heaviest decode.
+
+The list is probe-driven. On startup — not when a picker opens — the store asks
+`VideoEncoder.isConfigSupported` and `VideoDecoder.isConfigSupported` about
+each entry, once per run, and the pickers show what came back. Both directions
+are required, deliberately: a call is symmetric, so a codec this build can
+produce and cannot play is one that works until a second person joins on the
+same platform, which is the worst shape a media fault can have. A codec that is
+simply absent is not reported as a fault — "this Mac has no AV1 encoder" is not
+a fault in this app.
+
+What it answers on macOS, measured: constrained baseline and High both encode,
+decode and layer; HEVC encodes and decodes but will only be taken **flat**. So
+the picker says that under HEVC — a flat stream publishes one subgroup, which
+leaves a relay under pressure nothing to shed and costs the whole group instead
+of half the frame rate. It is a real trade rather than a reason to hide the
+codec, and it is the one cost of a codec choice that is not about the picture.
+
+#### What HEVC cost to get working
+
+Nothing above is what made HEVC hard. WebCodecs has an `hevc: { format:
+'annexb' }` member, this asked for it, and **WebKit ignores it**: measured
+across every combination — with the member and without it, spelled `hvc1` and
+spelled `hev1` — the encoder returned length-prefixed HEVC with a 105-byte
+`hvcC` description every time. A decoder configured from the codec string alone
+then failed on *every frame*, forever: `EncodingError: Decoder failure`, one per
+frame, with `playback.ts` rebuilding the decoder on a timer behind it and each
+new decoder failing the same way. In a call that is a permanently black tile
+where a participant should be. Carrying the description instead decoded 24 of 24
+frames.
+
+Two things had to change for that description to reach a subscriber. The
+frontend declares the video track up front — the backend needs it in the catalog
+before anyone can subscribe — but the description only exists once the first
+chunk has been encoded, so the track is **declared a second time** when one
+appears, exactly as the audio track is declared when its OpusHead does. And the
+catalog carried a description for audio only: `buildCatalog` now emits a §5.1.7
+`initDataList` entry for video under `video-config`, and `parseCatalog` reads it
+back. H.264 emits no description, so it takes neither path and nothing about it
+changed. `TestCatalogCarriesTheVideoDescription` and
+`TestCatalogOmitsAnAbsentVideoDescription` pin both halves.
+
+So the codec string is `hvc1`, not `hev1`, and that is not cosmetic: `hvc1` says
+the parameter sets are out of band, which — WebKit having decided the matter —
+is what they are.
+
+The probe is advisory and `configure()` is authoritative, so nothing depends on
+the probe being right. `resolveVideoCodec` resolves the preference against it
+before an encoder is built, and it walks *down* the list rather than up: a
+platform that refuses High is answered with baseline, never with HEVC, which
+would be a heavier decode chosen on behalf of everyone else in the room. A
+probe that found nothing at all defers to the pick and lets the encoder's error
+path say why not.
+
+The preference is remembered in `localStorage` under `t.videoCodec`, in the
+same namespace as the relay, room and nickname, and it is validated on the way
+back in — the value outlives the build that wrote it. A change costs exactly
+what a resolution change costs, and is applied the same way; the in-call picker
+is disabled during a screen share for the same reason resolution is, with a
+sharper edge, since applying it re-acquires the source and for a screen that
+means the picker opening again mid-call. Everything past the encoder is
+codec-agnostic: the Go half moves bytes and reads the keyframe flag out of the
+bridge header rather than the bitstream, and playback configures a decoder from
+the codec string in the catalog. Adding a family is an entry in the table and
+nothing else.
 
 ## Version and updates
 

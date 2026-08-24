@@ -81,8 +81,9 @@ type MediaFrame struct {
 	// Config is the codec description (WebCodecs
 	// VideoDecoderConfig.description / AudioDecoderConfig.description).
 	// Present only on frames where the encoder emitted a new config —
-	// which for Opus is the first frame, and for H.264 in Annex B is
-	// never, since SPS/PPS travel in-band.
+	// which for Opus is the first frame, for H.264 in Annex B is never,
+	// since SPS/PPS travel in-band, and for HEVC is the first frame,
+	// since WebKit hands back an hvcC whatever framing is asked of it.
 	Config  []byte
 	Payload []byte
 
@@ -188,7 +189,7 @@ type TrackConfig struct {
 
 	// Description is the codec extradata, base64-encoded — WebCodecs
 	// VideoDecoderConfig/AudioDecoderConfig `description`. Empty for
-	// Annex B H.264.
+	// Annex B H.264. HEVC is length-prefixed and always carries one.
 	Description string `json:"description,omitempty"`
 
 	Width     uint32  `json:"width,omitempty"`

@@ -18,6 +18,7 @@
   import Video from '@lucide/svelte/icons/video';
   import VideoOff from '@lucide/svelte/icons/video-off';
   import { rungValue, VIDEO_LADDER } from '../lib/capture';
+  import { videoCodecOptions, type VideoCodecId } from '../lib/codec';
   import { ICON_SIZE } from '../lib/icons';
   import { store } from '../lib/session.svelte';
 
@@ -31,6 +32,22 @@
 
   const cameras = $derived(store.devices.cameras);
   const microphones = $derived(store.devices.microphones);
+  const codecs = $derived(videoCodecOptions(store.videoCodecs, store.media.videoCodec));
+
+  /**
+   * Not bound like the other fields: the pick is remembered across launches, so
+   * writing it has to go through the store rather than straight into the state.
+   */
+  async function pickCodec(ev: Event): Promise<void> {
+    const id = (ev.currentTarget as HTMLSelectElement).value as VideoCodecId;
+    // Re-picking what is already running is not a change to apply. Guarded
+    // because applying it is not free even when nothing differs: it walks the
+    // whole switch path, and the encoder it would rebuild is the one already
+    // encoding.
+    if (id === store.media.videoCodec) return;
+    store.setVideoCodec(id);
+    await apply();
+  }
 
   /** Applies the current selection, keeping the call up. */
   async function apply(): Promise<void> {
@@ -247,6 +264,35 @@
           >
             {#each VIDEO_LADDER as rung (rung.label)}
               <option value={rungValue(rung)}>{rung.label}</option>
+            {/each}
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="call-codec">Video codec</label>
+          <!-- Changing this mid-call costs exactly what a resolution change
+               costs — a new encoder here, a decoder reconfigure and a wait for
+               the next keyframe on every subscriber — so it is applied the same
+               way rather than deferred to a rejoin.
+
+               And disabled during a share for the same reason resolution is,
+               with a sharper edge: applying it re-acquires the source, and for
+               a screen that means the picker opening again mid-call. The pick
+               is remembered, so it is made before the share and applies to it.
+          -->
+          <select
+            id="call-codec"
+            value={store.media.videoCodec}
+            onchange={pickCodec}
+            disabled={!cameraLive || busy}
+            title={store.sharingScreen
+              ? 'The screen is being shared'
+              : codecs.find((c) => c.id === store.media.videoCodec)?.note ?? ''}
+          >
+            {#each codecs as codec (codec.id)}
+              <option value={codec.id}>
+                {codec.label}{codec.available ? '' : ' (unavailable here)'}
+              </option>
             {/each}
           </select>
         </div>

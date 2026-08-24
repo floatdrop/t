@@ -20,6 +20,13 @@ import {
   type VideoSettings,
   type VideoSource,
 } from './capture';
+import {
+  DEFAULT_VIDEO_CODEC,
+  isVideoCodecId,
+  videoCodecSupport,
+  type VideoCodecId,
+  type VideoCodecSupport,
+} from './codec';
 import { playback, type PlaybackStats } from './playback';
 import type {
   InviteMessage,
@@ -48,6 +55,24 @@ const STATS_INTERVAL_MS = 250;
  */
 const SPEAKING_TIMEOUT_MS = 400;
 
+/**
+ * Where the codec preference is kept between launches, in the same namespace
+ * the welcome screen already uses for the relay, room and nickname.
+ */
+const CODEC_KEY = 't.videoCodec';
+
+/**
+ * The stored codec preference, or the default.
+ *
+ * Validated rather than trusted: the value is whatever is in this WebView's
+ * local storage, which outlives the build that wrote it — a codec dropped from
+ * the list would otherwise come back as a string nothing can encode.
+ */
+function storedVideoCodec(): VideoCodecId {
+  const stored = localStorage.getItem(CODEC_KEY);
+  return stored && isVideoCodecId(stored) ? stored : DEFAULT_VIDEO_CODEC;
+}
+
 /** How many times to try building a sink before giving up on a participant. */
 const PLAYBACK_ADD_ATTEMPTS = 3;
 
@@ -70,6 +95,15 @@ export interface MediaSettings {
    * it, because a participant has one video track in the catalog.
    */
   videoSource: VideoSource;
+  /**
+   * Which codec the local encoder uses — see codec.ts, which owns the list.
+   *
+   * Remembered across launches, because it is a property of the machine as much
+   * as of the call: what this WebView encodes well does not change between one
+   * run and the next, and a pick that had to be made again every launch would
+   * be made once and then forgotten about.
+   */
+  videoCodec: VideoCodecId;
   /** "WIDTHxHEIGHT", one of the rungs in VIDEO_LADDER. */
   resolution: string;
   /**
@@ -159,6 +193,7 @@ class Store {
     useVideo: true,
     useAudio: true,
     videoSource: 'camera',
+    videoCodec: storedVideoCodec(),
     resolution: DEFAULT_RESOLUTION,
     videoBitrate: 'adaptive',
     audioBitrate: defaultAudioSettings.bitrate,
@@ -170,6 +205,48 @@ class Store {
     cameras: [],
     microphones: [],
   });
+
+  /**
+   * The codecs this WebView said it can both encode and decode, once the probe
+   * has answered. Empty until then, and empty is what the pickers show as "the
+   * current pick and nothing else" — offering a codec before the platform has
+   * agreed to it would be offering a broken call.
+   */
+  videoCodecs = $state<VideoCodecSupport[]>([]);
+
+  /** Whether the probe has answered, and whether its answer has been logged. */
+  #codecsProbed = false;
+  #codecsReported = false;
+
+  /**
+   * Puts the probe's answer in the debug log, once, as soon as there is a
+   * socket to carry it.
+   *
+   * Held rather than written where it is learned: the probe finishes in
+   * milliseconds and the bridge takes a handshake, so reporting it on arrival
+   * would lose exactly the line that explains why a machine is publishing
+   * something other than what its picker says.
+   */
+  #reportCodecs(): void {
+    if (!this.#codecsProbed || this.#codecsReported || !this.connected) return;
+    this.#codecsReported = true;
+    bridge.report('INFO', 'video codecs this platform accepts', {
+      codecs: this.videoCodecs
+        .map((c) => `${c.id}${c.scalabilityMode ? '' : ' (flat)'}`)
+        .join(', ') || 'none',
+      using: this.media.videoCodec,
+    });
+  }
+
+  /**
+   * Changes the codec preference and remembers it. The caller applies it: a
+   * change mid-call rebuilds the encoder and re-declares the track, which is
+   * the same cost as changing resolution and is applied the same way.
+   */
+  setVideoCodec(id: VideoCodecId): void {
+    this.media.videoCodec = id;
+    localStorage.setItem(CODEC_KEY, id);
+  }
 
   /**
    * An invite link the backend received, waiting for the welcome screen to
@@ -268,8 +345,19 @@ class Store {
 
   /** Wires the bridge into this store. Call once at startup. */
   attach(): void {
+    // Started here rather than where a picker opens, so the answer is already
+    // in hand by the time anything asks: the probe builds no encoder and holds
+    // no device, and capture awaits the same memoised promise before it
+    // configures one.
+    void videoCodecSupport().then((found) => {
+      this.videoCodecs = found;
+      this.#codecsProbed = true;
+      this.#reportCodecs();
+    });
+
     bridge.onStatus((connected) => {
       this.connected = connected;
+      this.#reportCodecs();
       // The descriptor has been fetched by the time the socket is open.
       if (connected && bridge.version) this.version = bridge.version;
       if (connected && bridge.os) this.os = bridge.os;
@@ -511,6 +599,10 @@ class Store {
     if (this.media.videoSource === 'screen') {
       return {
         source: 'screen',
+        // The same codec as the camera's. One encoder runs at a time, and a
+        // share that quietly changed codec would cost every subscriber a
+        // decoder reconfigure on top of the one the size change already costs.
+        codec: this.media.videoCodec,
         width: screenVideoSettings.width,
         height: screenVideoSettings.height,
         framerate: screenVideoSettings.framerate,
@@ -535,6 +627,7 @@ class Store {
     return {
       source: 'camera',
       deviceId: this.media.cameraId || undefined,
+      codec: this.media.videoCodec,
       width,
       height,
       framerate: defaultVideoSettings.framerate,

@@ -57,6 +57,14 @@ func PlatformName() string {
 	}
 }
 
+// videoInitRef is the initDataList ID linking the video track to its
+// codec description, for a codec whose parameter sets do not travel in the
+// bitstream. H.264 in Annex B needs none — SPS/PPS ride ahead of every
+// keyframe — but WebKit hands back HEVC length-prefixed with an hvcC
+// regardless of the Annex B format asked for, and a subscriber that never
+// sees it decodes nothing at all.
+const videoInitRef = "video-config"
+
 // audioInitRef is the initDataList ID linking the audio track to its
 // codec configuration payload (§5.1.7).
 const audioInitRef = "audio-config"
@@ -88,6 +96,18 @@ func buildCatalog(nickname, version string, video, audio *bridge.TrackConfig) (m
 			Bitrate:     v.Bitrate,
 			Timescale:   timescaleMicros,
 			RenderGroup: &renderGroup,
+		}
+		// Same §5.1.7 inline payload the audio track uses, and for the same
+		// reason: it is where a subscriber joining mid-call finds the config,
+		// since the object properties only carry it to someone already
+		// subscribed. Empty for a codec that needs none.
+		if v.Description != "" {
+			track.InitRef = videoInitRef
+			initData = append(initData, msf.InitData{
+				ID:   videoInitRef,
+				Type: msf.InitDataTypeInline,
+				Data: v.Description,
+			})
 		}
 		tracks = append(tracks, track)
 	}
@@ -200,12 +220,13 @@ func parseCatalog(payload []byte) (parsedCatalog, error) {
 			// track was subscribed, not about the pictures inside it, and the
 			// frontend decodes either identically.
 			cfg := &bridge.TrackConfig{
-				Kind:      "video",
-				Codec:     tr.Codec,
-				Width:     tr.Width,
-				Height:    tr.Height,
-				Framerate: tr.Framerate,
-				Bitrate:   tr.Bitrate,
+				Kind:        "video",
+				Codec:       tr.Codec,
+				Width:       tr.Width,
+				Height:      tr.Height,
+				Framerate:   tr.Framerate,
+				Bitrate:     tr.Bitrate,
+				Description: inits[tr.InitRef],
 			}
 			// Only the track named "video"; anything else with the video role is
 			// ignored rather than guessed at.

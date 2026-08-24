@@ -119,3 +119,68 @@ func TestPlatformNameIsNeverEmpty(t *testing.T) {
 		t.Error("PlatformName is empty; our own row would show the unknown icon")
 	}
 }
+
+// A video codec whose parameter sets do not travel in the bitstream is only
+// decodable if its description reaches the subscriber, and the catalog is the
+// only place a participant joining mid-call can find it. Measured on WebKit:
+// HEVC comes out of the encoder length-prefixed with an hvcC whatever framing
+// is asked for, and a decoder configured without it fails on every frame — so
+// this is the difference between a picture and a permanently black tile.
+func TestCatalogCarriesTheVideoDescription(t *testing.T) {
+	const hvcC = "AQFAAAAAgAAAAAAAAA=="
+	video := &bridge.TrackConfig{
+		Kind: "video", Codec: "hvc1.1.6.L93.B0", Width: 1280, Height: 720,
+		Description: hvcC,
+	}
+	audio := &bridge.TrackConfig{Kind: "audio", Codec: "opus", SampleRate: 48000, Channels: 1,
+		Description: "T3B1c0hlYWQ="}
+
+	cat, err := buildCatalog("alice", "0.8.2", video, audio)
+	if err != nil {
+		t.Fatalf("buildCatalog: %v", err)
+	}
+	payload, err := encodeCatalog(cat)
+	if err != nil {
+		t.Fatalf("encodeCatalog: %v", err)
+	}
+	got, err := parseCatalog(payload)
+	if err != nil {
+		t.Fatalf("parseCatalog: %v", err)
+	}
+	if got.Video == nil {
+		t.Fatal("Video is nil")
+	}
+	if got.Video.Description != hvcC {
+		t.Errorf("Video.Description = %q, want %q", got.Video.Description, hvcC)
+	}
+	// Each track references its own init payload; sharing one ID would hand
+	// the video decoder an OpusHead.
+	if got.Audio == nil || got.Audio.Description != "T3B1c0hlYWQ=" {
+		t.Errorf("Audio.Description = %v, want the OpusHead", got.Audio)
+	}
+}
+
+// H.264 in Annex B needs no description, and inventing an empty initDataList
+// entry for it would put a reference in the catalog pointing at nothing.
+func TestCatalogOmitsAnAbsentVideoDescription(t *testing.T) {
+	video := &bridge.TrackConfig{Kind: "video", Codec: "avc1.64001F", Width: 1280, Height: 720}
+
+	cat, err := buildCatalog("alice", "0.8.2", video, nil)
+	if err != nil {
+		t.Fatalf("buildCatalog: %v", err)
+	}
+	if len(cat.InitDataList) != 0 {
+		t.Errorf("InitDataList = %+v, want empty", cat.InitDataList)
+	}
+	payload, err := encodeCatalog(cat)
+	if err != nil {
+		t.Fatalf("encodeCatalog: %v", err)
+	}
+	got, err := parseCatalog(payload)
+	if err != nil {
+		t.Fatalf("parseCatalog: %v", err)
+	}
+	if got.Video == nil || got.Video.Description != "" {
+		t.Errorf("Video.Description = %v, want empty", got.Video)
+	}
+}

@@ -5,13 +5,26 @@
  * Two WebKit constraints shape this file. There is no
  * MediaStreamTrackProcessor, so video frames are pulled off a <video>
  * element with requestVideoFrameCallback and audio PCM comes from an
- * AudioWorklet (see worklets.ts). And H.264 is configured in Annex B, so
- * SPS/PPS travel in-band with every keyframe and no out-of-band
- * description has to be carried in the catalog.
+ * AudioWorklet (see worklets.ts). And Annex B is asked for but not always
+ * given: H.264 comes back with SPS/PPS in-band, HEVC comes back length-prefixed
+ * with an hvcC whatever is asked, so a codec description has to be carried in
+ * the catalog for the codecs that produce one.
+ *
+ * Which video codec that is, is a setting — see codec.ts, which owns the list
+ * and the probe. This file resolves the preference against what the platform
+ * approved and configures what came back.
  */
 
 import { bridge } from './bridge';
-import type { ClientMessage } from './protocol';
+import {
+  DEFAULT_VIDEO_CODEC,
+  resolveVideoCodec,
+  videoCodecSpec,
+  videoCodecSupport,
+  VIDEO_SCALABILITY_MODE,
+  type VideoCodecId,
+} from './codec';
+import type { ClientMessage, TrackConfig } from './protocol';
 import {
   HANDLE_LOCAL_AUDIO,
   HANDLE_LOCAL_VIDEO,
@@ -56,24 +69,6 @@ const KEYFRAME_INTERVAL_SEC = 5;
  * within a second of being taken.
  */
 const VIDEO_KBPS_WINDOW = 4;
-
-/**
- * The SVC mode the primary video encoding is configured with.
- *
- * One spatial layer, two temporal ones: frames alternate between a base layer
- * that stands on its own and an enhancement layer nothing else references. The
- * backend maps the layer onto the subgroup it publishes the frame in, so the
- * enhancement layer is separately declinable and separately sheddable.
- *
- * The small layer stays flat. It already runs at a divided framerate, so
- * shedding half of what is left is not a degraded picture but a broken one —
- * and a subscriber small enough to be given that layer has already taken the
- * step down this would be offering.
- *
- * Kept as a constant because two things have to agree on how many layers there
- * are — this and the two bits the bridge header spends on the layer id.
- */
-const VIDEO_SCALABILITY_MODE = 'L1T2';
 
 /**
  * Which temporal layer an encoded chunk belongs to.
@@ -149,6 +144,13 @@ export interface VideoSettings {
   source: VideoSource;
   /** Which camera. Meaningless for a screen, which is not a device. */
   deviceId?: string;
+  /**
+   * The codec to encode with, as a preference rather than a promise: it is
+   * resolved against what this platform actually approved before an encoder is
+   * built, so a pick this WebView will not take falls back to a plainer one
+   * instead of failing the video. See codec.ts.
+   */
+  codec: VideoCodecId;
   width: number;
   height: number;
   framerate: number;
@@ -185,6 +187,7 @@ export interface AudioSettings {
 
 export const defaultVideoSettings: VideoSettings = {
   source: 'camera',
+  codec: DEFAULT_VIDEO_CODEC,
   width: 1280,
   height: 720,
   framerate: 30,
@@ -282,6 +285,10 @@ function sameVideoSettings(want: VideoSettings, have: VideoSettings | null): boo
     // request to start sharing doing nothing at all.
     have.source === want.source &&
     have.deviceId === want.deviceId &&
+    // A different codec is a different encoder and a different track: it costs
+    // every subscriber a decoder reconfigure, exactly as a resolution change
+    // does, which is why it is compared here rather than reconfigured in place.
+    have.codec === want.codec &&
     have.width === want.width &&
     have.height === want.height &&
     have.framerate === want.framerate &&
@@ -337,49 +344,6 @@ export interface CaptureStats {
   autoGainControl: boolean;
   /** True while the local RNNoise model is running. */
   denoiseActive: boolean;
-}
-
-/**
- * The H.264 levels this will ask for, lowest first, with the limits §A.3.1
- * sets on each: macroblocks per frame, and macroblocks per second.
- *
- * A level is a ceiling on what a decoder must be prepared for, so naming one
- * too low is naming a stream we do not send. 3.1 stops at 3600 macroblocks —
- * exactly 1280x720, and not one row more — while 1080p needs 8160. Both the
- * top rung of VIDEO_LADDER and every screen share ask for 1080p, so a fixed
- * 3.1 described neither: WebKit is free to refuse the configuration outright,
- * and a decoder that believes the string is entitled to size its buffers for
- * 720p and meet a frame it has no room for.
- *
- * 5.1 is not a size anything here asks for. It is the catch to a source that
- * outran the constraints put on it, so an unusual display cannot end the call
- * by being large.
- */
-const H264_LEVELS = [
-  { idc: 0x1f, maxFrameMBs: 3600, maxMBsPerSec: 108_000 }, // 3.1 — through 720p30
-  { idc: 0x28, maxFrameMBs: 8192, maxMBsPerSec: 245_760 }, // 4.0 — through 1080p30
-  { idc: 0x33, maxFrameMBs: 36864, maxMBsPerSec: 983_040 }, // 5.1 — the catch-all
-] as const;
-
-/**
- * The codec string for one stream: H.264 baseline at the lowest level that can
- * carry it.
- *
- * Baseline keeps the bitstream to what every decoder handles, and the probe
- * confirmed both encode and decode support with Annex B framing in this
- * WebView. The level is chosen per stream rather than fixed, so the string in
- * the catalog describes the stream a subscriber is actually about to receive —
- * the same reason the frame rate is capped before the encoder is configured
- * rather than at the pump.
- */
-function videoCodec(width: number, height: number, framerate: number): string {
-  // A macroblock is 16x16, and a partial one still costs a whole macroblock.
-  const frameMBs = Math.ceil(width / 16) * Math.ceil(height / 16);
-  const level =
-    H264_LEVELS.find(
-      (l) => frameMBs <= l.maxFrameMBs && frameMBs * framerate <= l.maxMBsPerSec,
-    ) ?? H264_LEVELS[H264_LEVELS.length - 1];
-  return `avc1.42E0${level.idc.toString(16).toUpperCase().padStart(2, '0')}`;
 }
 
 const AUDIO_CODEC = 'opus';
@@ -680,6 +644,18 @@ export class Capture {
   #audioBytes = 0;
   #keyFrames = 0;
   #dropped = 0;
+  /**
+   * The scalability mode the live encoder was configured with, or undefined if
+   * it was configured flat because the platform would take it no other way.
+   */
+  #svcMode: string | undefined = VIDEO_SCALABILITY_MODE;
+  /**
+   * The video track as it was first declared, and whether it has since been
+   * re-declared with a codec description. Held because the description only
+   * arrives with the first encoded chunk, long after the track was declared.
+   */
+  #videoDeclared: TrackConfig | null = null;
+  #videoConfigSent = false;
   /** Chunks watched, chunks that carried an svc layer id, and the split. */
   #svcSampled = 0;
   #svcReported = 0;
@@ -900,9 +876,9 @@ export class Capture {
       MAX_FRAMERATE,
     );
 
-    // H.264 is 4:2:0, so a chroma sample covers a 2x2 block of luma and both
-    // dimensions have to be even. A camera offers standard sizes that already
-    // are; a *window* is whatever size it happens to be, and sharing one of
+    // Every codec here is 4:2:0, so a chroma sample covers a 2x2 block of luma
+    // and both dimensions have to be even. A camera offers standard sizes that
+    // already are; a *window* is whatever size it happens to be, and sharing one of
     // 1279x859 — the size of this app's own window — had the encoder refuse the
     // configuration outright ("H264 only supports even sized frames") and close
     // before a single frame went through.
@@ -913,9 +889,32 @@ export class Capture {
     // something was actually rounded: the camera path is left exactly as it was.
     const crop = width !== grantedWidth || height !== grantedHeight;
 
+    // Resolved against what this WebView approved, not simply taken: a pick it
+    // will not encode has to become a plainer one here, while there is still a
+    // choice to make, rather than a NotSupportedError out of configure() — which
+    // closes the encoder for good and costs the call its picture.
+    const support = await videoCodecSupport();
+    const codecId = resolveVideoCodec(settings.codec, support);
+    const spec = videoCodecSpec(codecId);
     // Chosen from the size and rate settled on just above, so the level names
     // the stream being sent rather than the one that was asked for.
-    const codec = videoCodec(width, height, framerate);
+    const codec = spec.codec(width, height, framerate);
+    if (codecId !== settings.codec) {
+      bridge.report('WARN', 'the chosen video codec is unavailable here; using another', {
+        asked: settings.codec,
+        using: codecId,
+        available: support.map((c) => c.id).join(' ') || 'none',
+      });
+    }
+    // Undefined on a platform that would only take the configuration flat. The
+    // encoder is built either way — see the report below for what that costs.
+    //
+    // A probe that found nothing asks for layers regardless: it answered no to
+    // a codec this WebView is certainly encoding, so its silence about the
+    // scalability mode is worth no more than the rest of that answer.
+    const scalabilityMode = support.length === 0
+      ? VIDEO_SCALABILITY_MODE
+      : support.find((c) => c.id === codecId)?.scalabilityMode;
 
     // A <video> element is the only source WebKit offers for constructing
     // VideoFrames from a live track.
@@ -978,31 +977,45 @@ export class Capture {
       // keyframe. The backend puts each layer in its own subgroup, which is
       // what lets a subscriber decline one or a relay shed it.
       //
-      // L1T2 rather than L1T3: shedding takes 30 fps to 15, which reads as a
-      // slightly less fluid picture. L1T3's bottom rung is 7.5 fps, which reads
-      // as broken, and the middle rung is a second decision to get right for a
-      // saving the first rung already mostly banked.
-      scalabilityMode: VIDEO_SCALABILITY_MODE,
-      // Annex B puts SPS/PPS in the bitstream ahead of every keyframe, so
-      // a subscriber can start decoding from any group without an
-      // out-of-band description.
-      avc: { format: 'annexb' },
+      // Omitted entirely on a codec this platform would only take flat: the
+      // spec has an unsupported scalabilityMode throw out of configure(), and a
+      // throw there is the whole video rather than the layering. See
+      // VIDEO_SCALABILITY_MODE for why the mode is L1T2.
+      ...(scalabilityMode ? { scalabilityMode } : {}),
+      // Annex B puts the parameter sets in the bitstream ahead of every
+      // keyframe, so a subscriber can start decoding from any group without an
+      // out-of-band description. Which member says so is the codec family's
+      // business, not this function's.
+      ...spec.framing(),
     };
     encoder.configure(videoConfig);
     this.#videoEncoder = encoder;
     this.#videoConfig = videoConfig;
     this.#bitrateFixed = false;
+    this.#svcMode = scalabilityMode;
     // A fresh encoder is a fresh answer: scalabilityMode is configured here,
     // and whether this one honours it is not something the last one settled.
     this.#svcSampled = 0;
     this.#svcReported = 0;
     this.#svcLayers = {};
 
+    if (!scalabilityMode) {
+      // Said once, here, rather than left to the sampler: the layers are not
+      // missing because an encoder ignored what it was asked for, they were
+      // never asked for, and that is known before a frame is encoded.
+      bridge.report('WARN', 'this codec has no temporal layers here; publishing flat video', {
+        codec: codecId,
+        consequence: 'a relay has no enhancement layer to shed under pressure',
+      });
+    }
+
     // Reported after the call, not before it: this line used to be written
     // first and so claimed a configuration that had not happened yet, which is
     // exactly the wrong thing to find in a log when configuring is what failed.
     bridge.report('INFO', 'video encoder configured', {
       codec,
+      picked: codecId,
+      layers: scalabilityMode ?? 'none',
       source: settings.source,
       size: `${width}x${height}`,
       asked: `${settings.width}x${settings.height}`,
@@ -1017,17 +1030,20 @@ export class Capture {
     // Declare the track now rather than on first output: the backend needs
     // it in its catalog before remote participants can subscribe, and
     // waiting for a chunk would delay that by a frame interval.
-    this.#declare({
-      type: 'track',
-      track: {
-        kind: 'video',
-        codec,
-        width,
-        height,
-        framerate,
-        bitrate: primaryBitrate,
-      },
-    });
+    //
+    // Held as well as sent, because a codec whose parameter sets do not travel
+    // in the bitstream has to be declared again with its description once the
+    // first chunk carries one — see #onVideoChunk.
+    this.#videoDeclared = {
+      kind: 'video',
+      codec,
+      width,
+      height,
+      framerate,
+      bitrate: primaryBitrate,
+    };
+    this.#videoConfigSent = false;
+    this.#declare({ type: 'track', track: this.#videoDeclared });
 
 
     const keyEvery = Math.max(1, Math.round(framerate * KEYFRAME_INTERVAL_SEC));
@@ -1536,6 +1552,28 @@ export class Capture {
     const description = meta?.decoderConfig?.description;
     if (description) {
       config = toBytes(description);
+      // The encoder handed back a description, so the framing is not the Annex
+      // B that was asked for and the parameter sets are not in the bitstream. A
+      // subscriber configured from the catalog alone decodes nothing at all —
+      // measured, on HEVC: every frame `EncodingError: Decoder failure`, for
+      // the life of the call.
+      //
+      // So the track is declared a second time, now carrying it, exactly as the
+      // audio track is declared when its OpusHead appears. It costs one catalog
+      // republish and one decoder rebuild per subscriber, once, a frame into the
+      // encoding — and it is the only way a late joiner ever sees the config,
+      // since the object properties reach only those already subscribed.
+      if (!this.#videoConfigSent && this.#videoDeclared) {
+        this.#videoConfigSent = true;
+        this.#declare({
+          type: 'track',
+          track: { ...this.#videoDeclared, description: toBase64(config) },
+        });
+        bridge.report('INFO', 're-declared the video track with its codec description', {
+          codec: this.#videoDeclared.codec,
+          bytes: String(config.byteLength),
+        });
+      }
     }
 
     const isKey = chunk.type === 'key';
@@ -1576,6 +1614,9 @@ export class Capture {
    * what the call can survive, and at INFO with the split when it is not.
    */
   #sampleSVC(meta: EncodedVideoChunkMetadata | undefined, layer: number): void {
+    // Nothing to hold this encoder to: it was configured flat on purpose, and
+    // #startVideo already said so.
+    if (!this.#svcMode) return;
     if (this.#svcSampled >= SVC_SAMPLE_CHUNKS) return;
     const svc = (meta as { svc?: { temporalLayerId?: number } } | undefined)?.svc;
     if (typeof svc?.temporalLayerId === 'number') this.#svcReported++;
@@ -1589,14 +1630,14 @@ export class Capture {
       .join(' ');
     if (layers > 1) {
       bridge.report('INFO', 'temporal layers are being produced', {
-        mode: VIDEO_SCALABILITY_MODE,
+        mode: this.#svcMode,
         layers: String(layers),
         chunksPerLayer: split,
       });
       return;
     }
     bridge.report('WARN', 'the encoder ignored scalabilityMode; publishing flat video', {
-      mode: VIDEO_SCALABILITY_MODE,
+      mode: this.#svcMode,
       // Told apart because they are different faults: no svc field at all is an
       // encoder without the extension, while a field that only ever says 0 is
       // one that has it and is not layering.

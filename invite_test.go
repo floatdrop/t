@@ -41,6 +41,23 @@ func TestParseInviteURL(t *testing.T) {
 		room:  "r2",
 		ok:    true,
 	}, {
+		// The reported failure. buildInviteLink writes an https relay's
+		// authority with `new URL(relay).host`, which drops the default :443,
+		// and a chat client that stops linkifying at the "?" delivers only
+		// that. Read back as a bare host it lost the scheme too, and the dial
+		// failed on "missing port in address".
+		name:  "port-less authority is an https relay",
+		url:   "t://moq.tel.yandex.net/standup",
+		relay: "https://moq.tel.yandex.net/",
+		room:  "standup",
+		ok:    true,
+	}, {
+		name:  "port-less IPv6 authority keeps its brackets",
+		url:   "t://[::1]/standup",
+		relay: "https://[::1]/",
+		room:  "standup",
+		ok:    true,
+	}, {
 		name:  "room is percent-decoded",
 		url:   "t://localhost:4433/room%20one",
 		relay: "localhost:4433",

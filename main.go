@@ -15,6 +15,7 @@ import (
 	"flag"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -309,7 +310,7 @@ func parseInviteURL(raw string) (relay, room string, ok bool) {
 	}
 	relay = strings.TrimSpace(u.Query().Get("relay"))
 	if relay == "" {
-		relay = u.Host
+		relay = relayFromAuthority(u.Host)
 	}
 	// url.Parse has already percent-decoded Path.
 	room = strings.TrimSpace(strings.Trim(u.Path, "/"))
@@ -317,6 +318,29 @@ func parseInviteURL(raw string) (relay, room string, ok bool) {
 		return "", "", false
 	}
 	return relay, room, true
+}
+
+// relayFromAuthority reads the relay out of an invite link's authority, for
+// the links that carry no `relay` parameter. Must stay in step with the
+// function of the same name in frontend/src/lib/invite.ts.
+//
+// An authority with a port is a bare host:port, dialled as raw QUIC — that is
+// what a development relay looks like, and what the authority form was built
+// for. An authority without one can only have come from an https relay on the
+// default port: buildInviteLink derives the authority with
+// `new URL(relay).host`, and URL drops :443 from an https URL. Reading it back
+// as a bare host lost the scheme and the port together, so the dial died on
+// "missing port in address" — which is what an invite to the public relay did
+// whenever a chat client dropped the query string holding the real value.
+func relayFromAuthority(authority string) string {
+	if authority == "" {
+		return ""
+	}
+	if _, port, err := net.SplitHostPort(authority); err == nil && port != "" {
+		return authority
+	}
+	// A trailing colon is an empty port, which is no port at all.
+	return "https://" + strings.TrimSuffix(authority, ":") + "/"
 }
 
 // assetHandler serves the embedded frontend, plus the one extra route the

@@ -54,6 +54,46 @@ function relayAuthority(relay: string): string {
 }
 
 /**
+ * Normalises a relay written as an authority alone, leaving every other form
+ * untouched.
+ *
+ * The same rule parseInviteLink applies to a link's authority, exported for
+ * the two places a relay arrives without passing through a link: the value the
+ * welcome screen restores from localStorage, and the one someone types into
+ * it. A port-less hostname has never been dialable — it failed on "missing
+ * port in address" before a packet was sent — so rewriting it can only repair
+ * a value that was already broken, never change a working one.
+ */
+export function normalizeRelay(relay: string): string {
+  const trimmed = relay.trim();
+  if (!trimmed || !isBareHostPort(trimmed)) return trimmed;
+  return relayFromAuthority(trimmed);
+}
+
+/**
+ * Reads the relay out of an invite link's authority, for the links that carry
+ * no `relay` parameter. Must stay in step with the function of the same name
+ * in main.go; invite_test.go pins the pair to one dialect.
+ *
+ * An authority with a port is a bare `host:port`, dialled as raw QUIC — that
+ * is what a development relay looks like, and what the authority form was
+ * built for. An authority without one can only have come from an https relay
+ * on the default port: buildInviteLink derives the authority with
+ * `new URL(relay).host`, and URL drops :443 from an https URL. Reading it back
+ * as a bare host lost the scheme and the port together, so the dial died on
+ * "missing port in address" — which is what an invite to the public relay did
+ * whenever a chat client dropped the query string holding the real value.
+ */
+function relayFromAuthority(authority: string): string {
+  if (!authority) return '';
+  // URL.host keeps a port when there is one, and keeps an IPv6 literal's
+  // brackets around the host, so a trailing :port is the whole test.
+  if (/:\d+$/.test(authority)) return authority;
+  // A trailing colon is an empty port, which is no port at all.
+  return `https://${authority.replace(/:$/, '')}/`;
+}
+
+/**
  * Extracts an invite from pasted text, or null when it holds none.
  *
  * Tolerant on purpose: text arrives from chat clients that wrap, truncate or
@@ -69,7 +109,7 @@ export function parseInviteLink(text: string): Invite | null {
     const url = new URL(match[0]);
     // An explicit relay parameter wins: it is only ever present when the
     // authority alone could not express the relay.
-    const relay = (url.searchParams.get('relay') || url.host).trim();
+    const relay = (url.searchParams.get('relay') || relayFromAuthority(url.host)).trim();
     const room = decodeURIComponent(url.pathname).replace(/^\/+/, '').trim();
     if (!relay || !room) return null;
     return { relay, room };

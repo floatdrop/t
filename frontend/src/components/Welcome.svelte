@@ -16,7 +16,7 @@
   import { rungValue, VIDEO_LADDER } from '../lib/capture';
   import { videoCodecOptions, type VideoCodecId } from '../lib/codec';
   import { ICON_SIZE } from '../lib/icons';
-  import { parseInviteLink } from '../lib/invite';
+  import { normalizeRelay, parseInviteLink } from '../lib/invite';
   import { randomNickname, randomRoom } from '../lib/nickname';
   import { store } from '../lib/session.svelte';
   import Logo from './Logo.svelte';
@@ -35,7 +35,9 @@
    */
   const params = new URLSearchParams(location.search);
 
-  let relay = $state(params.get('relay') ?? localStorage.getItem(RELAY_KEY) ?? DEFAULT_RELAY);
+  let relay = $state(
+    normalizeRelay(params.get('relay') ?? localStorage.getItem(RELAY_KEY) ?? DEFAULT_RELAY),
+  );
   /**
    * The room to join, kept between runs like the relay and the nickname.
    *
@@ -213,6 +215,10 @@
     if (!relay.trim() || !room.trim()) return;
     joining = true;
     joinError = '';
+    // Normalised here as well as on the way in, because the field is editable:
+    // a hostname typed by hand means the same thing as one restored from a
+    // previous run, and both are stored in the form that dials.
+    relay = normalizeRelay(relay);
     localStorage.setItem(RELAY_KEY, relay);
     localStorage.setItem(NICK_KEY, nickname);
     localStorage.setItem(ROOM_KEY, room);

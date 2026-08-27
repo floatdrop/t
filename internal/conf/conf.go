@@ -127,7 +127,7 @@ const timescaleMicros = 1_000_000
 // Config identifies the local participant and the room it joins.
 type Config struct {
 	// Relay is the address to dial: "host:port", "moqt://…", or
-	// "https://…" for WebTransport.
+	// "https://…" for WebTransport. A missing port defaults to 443.
 	Relay string
 	Room  string
 	// Nickname is the display name shown to other participants. It

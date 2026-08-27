@@ -43,6 +43,9 @@ type dialResult struct {
 //   - a bare "host:port" or a "moqt://" URI — raw QUIC (§3.1.1)
 //   - an "https://" URI — WebTransport
 //
+// Every one of those may omit the port, in which case it gains the §3.1.1
+// default.
+//
 // insecure skips TLS verification, which development relays with
 // self-signed certificates require.
 func dial(ctx context.Context, log *slog.Logger, addr string, insecure bool) (*dialResult, error) {
@@ -97,6 +100,11 @@ func dial(ctx context.Context, log *slog.Logger, addr string, insecure bool) (*d
 		opts = append(opts, session.WithAuthority(u.Authority))
 		if pq := u.PathAndQuery(); pq != "" {
 			opts = append(opts, session.WithPath(pq))
+		}
+	} else {
+		var err error
+		if hostPort, err = withDefaultAuthorityPort(addr); err != nil {
+			return nil, err
 		}
 	}
 
@@ -166,6 +174,41 @@ func dialWebTransport(
 		return nil, fmt.Errorf("moqt handshake: %w", err)
 	}
 	return sess, nil
+}
+
+// withDefaultAuthorityPort gives a bare authority the port that dialling needs.
+//
+// The sibling of withDefaultPort below, for the one address form that never
+// reaches a URL parser. quic.DialAddr splits the authority itself and rejects
+// one with no port, so a relay written as a plain hostname — which is how an
+// invite link carrying no explicit relay parameter arrives, and how anyone
+// types the public relay — failed on "missing port in address" before a packet
+// was sent. moqt:// defaults its port in uri.Parse and https:// in
+// withDefaultPort; this is the third form catching up, so that no way of
+// writing a relay address can produce that error any more.
+func withDefaultAuthorityPort(authority string) (string, error) {
+	if authority == "" {
+		return "", fmt.Errorf("relay address is empty")
+	}
+	// An empty port ("host:") splits without error but cannot be dialled, so
+	// it is treated as the absence it is rather than passed on.
+	if host, port, err := net.SplitHostPort(authority); err == nil {
+		if port != "" {
+			return authority, nil
+		}
+		return net.JoinHostPort(host, uri.DefaultPort), nil
+	}
+	// No port at all. JoinHostPort brackets a host that contains colons, so an
+	// IPv6 literal has to arrive here bare or it comes back doubly bracketed.
+	return net.JoinHostPort(unbracket(authority), uri.DefaultPort), nil
+}
+
+// unbracket strips the brackets an IPv6 literal wears inside an authority.
+func unbracket(host string) string {
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		return host[1 : len(host)-1]
+	}
+	return host
 }
 
 // withDefaultPort gives an https URL the explicit port that dialling needs.

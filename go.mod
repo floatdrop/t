@@ -1,6 +1,6 @@
 module t
 
-go 1.26
+go 1.26.0
 
 require (
 	github.com/coder/websocket v1.8.15
@@ -26,3 +26,5 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
 )
+
+replace github.com/quic-go/quic-go => github.com/floatdrop/quic-go v0.0.0-20260831103541-20793e596225

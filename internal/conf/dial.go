@@ -48,7 +48,10 @@ type dialResult struct {
 //
 // insecure skips TLS verification, which development relays with
 // self-signed certificates require.
-func dial(ctx context.Context, log *slog.Logger, addr string, insecure bool) (*dialResult, error) {
+//
+// congestion selects the congestion controller; nil leaves quic-go's default
+// in place.
+func dial(ctx context.Context, log *slog.Logger, addr string, insecure bool, congestion CongestionController) (*dialResult, error) {
 	trace := telemetry.NewQUICTrace()
 
 	quicCfg := &quic.Config{
@@ -77,6 +80,9 @@ func dial(ctx context.Context, log *slog.Logger, addr string, insecure bool) (*d
 		Tracer: func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace {
 			return trace
 		},
+		// Nil is meaningful here: quic.Config documents it as "use the
+		// default", so an unset -congestion needs no special case.
+		Congestion: congestion,
 	}
 
 	if isWebTransport(addr) {

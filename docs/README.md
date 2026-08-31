@@ -666,6 +666,43 @@ bin/t.dev.app/Contents/MacOS/t \
 The welcome screen reads the same values from its own URL query, which is how
 these flags reach it.
 
+### `-congestion`
+
+One flag is not a prefill. `-congestion` selects the QUIC congestion controller
+every call this process makes, and is resolved at startup — a name that is not
+`bbr`, `reno` or `cubic` fails before anything is dialled. Unset, the transport
+picks, which is BBRv3. The value is recorded in the `starting t` log line, so a
+comparison is readable after the fact:
+
+```sh
+bin/t.dev.app/Contents/MacOS/t -relay localhost:4433 -room demo -join -congestion reno
+```
+
+It exists because this machine is one end of a live media flow on whatever
+network the user happens to be on, and the controller decides what happens to
+the outgoing camera and microphone when that network misbehaves. Reno reads
+every lost packet as congestion and halves its window, so a path that loses or
+reorders packets for reasons that are not congestion — wifi, cellular, a tunnel
+— pins it near its floor. BBRv3 paces at a gain-scaled multiple of the delivery
+rate it measures, treats loss under 2% as noise, and targets a shorter queue at
+the bottleneck, which is latency this app pays for directly.
+
+The trade runs the other way on a clean path with a deep buffer, where BBR gives
+up a few percent of throughput for roughly half the queueing delay. For a call
+that is the right side of it, but it is a trade, which is why the flag is here.
+
+**Comparing them.** The transport tab of the debug panel is the readout: watch
+peak RTT and lost packets on a deliberately poor connection. Do not judge this
+on a file transfer — a bulk transfer is never application-limited, and a call
+almost always is, so the two regimes exercise entirely different parts of the
+algorithm.
+
+This needs the fork. `quic.Config.Congestion` is not a field upstream quic-go
+has; `go.mod` replaces quic-go with
+[floatdrop/quic-go](https://github.com/floatdrop/quic-go) on the `bbrv3` branch,
+which adds BBRv3, the application-limited detection a call depends on, and the
+hook that selects a controller.
+
 ## Devices
 
 The welcome screen picks camera, microphone, resolution and bitrates before

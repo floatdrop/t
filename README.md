@@ -98,7 +98,7 @@ decision cost before it was made:
 | | |
 |---|---|
 | [Media and transport](docs/README.md#media-and-transport) | naming and discovery, stream mapping, presentation and mixing, audio processing, voice activity |
-| [Launch flags](docs/README.md#launch-flags) | prefilling and submitting the welcome form from the command line |
+| [Launch flags](docs/README.md#launch-flags) | prefilling and submitting the welcome form from the command line, and choosing the congestion controller |
 | [Devices](docs/README.md#devices) | camera, microphone, the resolution ladder, what Auto sized against, and choosing a codec |
 | [Version and updates](docs/README.md#version-and-updates) | where the version comes from and how a newer release is offered |
 | [Losing the relay](docs/README.md#losing-the-relay) | reconnection, and migrating on GOAWAY |

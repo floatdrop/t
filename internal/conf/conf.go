@@ -145,6 +145,10 @@ type Config struct {
 	// Insecure skips TLS certificate verification. Development relays
 	// use self-signed certificates, so the app defaults this on.
 	Insecure bool
+	// Congestion selects the QUIC congestion controller for this call's
+	// connection. Nil leaves the choice to the transport, which is BBRv3.
+	// See [LookupCongestionController].
+	Congestion CongestionController
 	// OnKeyFrameRequest, when non-nil, is called when a subscriber asks this
 	// participant to start a new group (§10.2.13 NEW_GROUP_REQUEST) on the
 	// video track — which for video means a keyframe, since a group opens on

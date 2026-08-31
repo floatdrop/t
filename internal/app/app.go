@@ -57,6 +57,11 @@ type App struct {
 	// version is the build this process is, published to the room in the
 	// catalog and compared against GitHub's newest release.
 	version string
+	// congestion is the QUIC congestion controller every call this process
+	// makes is dialled with. Process-wide rather than per-join: it is a
+	// transport experiment, not something a participant chooses per room.
+	// Nil leaves the choice to the transport.
+	congestion conf.CongestionController
 	// offer is the release worth telling the frontend about, once the check
 	// has found one. Held because the check finishes on its own schedule and
 	// the WebView may not be listening yet — and because a WebView that
@@ -142,6 +147,11 @@ func New(log *slog.Logger, sink *telemetry.LogSink, version string) *App {
 
 // SetOpenURL supplies the means of opening a link outside the WebView.
 func (a *App) SetOpenURL(open func(string) error) { a.openURL = open }
+
+// SetCongestion selects the QUIC congestion controller for every call this
+// process makes. Called once at startup, before any join; nil keeps the
+// transport's default.
+func (a *App) SetCongestion(cc conf.CongestionController) { a.congestion = cc }
 
 // Version is the build this process is running.
 func (a *App) Version() string { return a.version }
@@ -526,7 +536,8 @@ func (a *App) join(ctx context.Context, req *bridge.JoinRequest) error {
 		// Development relays run self-signed certificates, and the app
 		// has no UI for trusting one. Revisit before any deployment
 		// where the relay identity matters.
-		Insecure: true,
+		Insecure:   true,
+		Congestion: a.congestion,
 		// A peer subscribing to our video asks for a group so it does not have
 		// to wait out the encoder's keyframe schedule. Same rate-limited path
 		// the local triggers use, so a room joining at once — which the relay

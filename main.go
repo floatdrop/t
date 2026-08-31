@@ -69,7 +69,20 @@ func main() {
 	autoJoin := flag.Bool("join", false, "join immediately, without waiting for a click")
 	debugOpen := flag.Bool("debug", false, "open the debug drawer at start")
 	debugTab := flag.String("debug-tab", "", "debug tab to open: transport, tracks, or logs")
+	// Not a launch prefill like the flags above: this one selects the QUIC
+	// congestion controller for every call this process makes, so that the
+	// choice can be compared on a real network without shipping two builds.
+	congestionFlag := flag.String("congestion", "",
+		"QUIC congestion controller: "+strings.Join(conf.CongestionControllerNames(), ", ")+
+			" (default: the transport's, which is bbr)")
 	flag.Parse()
+
+	// Resolved before anything is dialled, so a typo fails at startup rather
+	// than on the first join.
+	congestion, err := conf.LookupCongestionController(*congestionFlag)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// Everything the backend logs goes two places: the terminal, for
 	// development, and a ring buffer the debug panel streams from. The
@@ -87,9 +100,10 @@ func main() {
 	slog.SetDefault(logger)
 
 	appVersion := version.Parse(buildConfig)
-	logger.Info("starting t", "version", appVersion)
+	logger.Info("starting t", "version", appVersion, "congestion", congestionName(*congestionFlag))
 
 	backend := app.New(logger, sink, appVersion)
+	backend.SetCongestion(congestion)
 	server, err := bridge.NewServer(logger, backend)
 	if err != nil {
 		log.Fatal(err)
@@ -249,6 +263,16 @@ type launch struct {
 // startURL turns the launch values into the query string the welcome screen
 // reads. Empty values are omitted, so a bare interactive start with no system
 // account name yields "/".
+// congestionName is what to log for a -congestion value: the transport's
+// default is BBRv3, and reporting it by name is what makes a log from an A/B
+// run readable afterwards.
+func congestionName(flagValue string) string {
+	if flagValue == "" {
+		return "bbr (default)"
+	}
+	return flagValue
+}
+
 func startURL(l launch) string {
 	q := url.Values{}
 	if l.relay != "" {

@@ -104,7 +104,7 @@ func Join(ctx context.Context, log *slog.Logger, sink Sink, counters *telemetry.
 		cfg.ID = id
 	}
 
-	res, err := dial(ctx, log, cfg.Relay, cfg.Insecure)
+	res, err := dial(ctx, log, cfg.Relay, cfg.Insecure, cfg.Congestion)
 	if err != nil {
 		return nil, err
 	}

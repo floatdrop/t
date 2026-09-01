@@ -34,8 +34,8 @@ github.com/quic-go/webtransport-go v0.12.0 h1:CpnKNwZvdV0LD73xoHO8QaR0NI3llqpWRw
 github.com/quic-go/webtransport-go v0.12.0/go.mod h1:GHne8aRFJ24h73pAMrcywXtuaz/ShBXCLXLvG/NPFdU=
 github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=
 github.com/stretchr/testify v1.12.1/go.mod h1:MDEgiDPPsNp5cuIrHPPCyornHKgEVbtFUmoNlxoYthg=
-github.com/wailsapp/wails/v3 v3.0.0-beta.12 h1:Vema2kFgJvkwPovQ8GMBBrkZNm5cKVR4bYzSCMgU+PU=
-github.com/wailsapp/wails/v3 v3.0.0-beta.12/go.mod h1:zKZYhB3WjrN5LhJWbnOAVMN0Xf8qTozbw2nf5micKl4=
+github.com/wailsapp/wails/v3 v3.0.0-beta.16 h1:ud3YMzTbPPae4EP3Wls4qBVsESZwwAkEny1P/zzw6Tk=
+github.com/wailsapp/wails/v3 v3.0.0-beta.16/go.mod h1:zKZYhB3WjrN5LhJWbnOAVMN0Xf8qTozbw2nf5micKl4=
 go.uber.org/mock v0.5.2 h1:LbtPTcP8A5k9WPXj54PPPbjcI4Y6lhyOZXn+VS7wNko=
 go.uber.org/mock v0.5.2/go.mod h1:wLlUxC2vVTPTaE3UD51E0BGOAElKrILxhVSDYQLld5o=
 go.yaml.in/yaml/v3 v3.0.5 h1:N6y/pJk8buWs9NY5ERU2HSMfm+IuD/OtfdAnq6kESPw=

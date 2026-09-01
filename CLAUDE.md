@@ -117,6 +117,15 @@ build version ride in the catalog as MSF §5.1 producer root fields.
 - `build/config.yml`'s `version` is the single source of truth; the binary reads
   it back via the embed in `main.go` and `internal/version`.
   `TestParseRealConfig` fails if the field moves.
+- Cutting a release means bumping that `version` **and** the three hand-written
+  files the operating systems read: `build/darwin/Info.plist`,
+  `build/darwin/Info.dev.plist` (`CFBundleVersion` and
+  `CFBundleShortVersionString`) and `build/windows/info.json` (`fixed`, where
+  Windows wants a fourth field — `0.11.0` is written `0.11.0.0` — and the
+  `info` string table). Nothing reads them at build time, so
+  `TestBundleMetadataMatchesConfig` is what catches a release that bumps only
+  `config.yml`. Do not regenerate them with `wails3 update build-assets`; see
+  the gotcha below.
 - `internal/conf/reorder.go` assumes subgroup 0 is the temporal base layer, and
   `internal/conf/publisher.go` is what makes that true by writing layer *L* to
   subgroup *L*. The base layer is emitted on arrival and never held or dropped;

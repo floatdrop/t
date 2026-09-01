@@ -1,10 +1,10 @@
 module t
 
-go 1.26.0
+go 1.27
 
 require (
 	github.com/coder/websocket v1.8.15
-	github.com/floatdrop/moq-go v0.0.0-20260817080028-93560b0e17e2
+	github.com/floatdrop/moq-go v0.0.0-20260901070730-17c8493d4f9b
 	github.com/lmittmann/tint v1.2.0
 	github.com/quic-go/quic-go v0.61.0
 	github.com/quic-go/webtransport-go v0.12.0

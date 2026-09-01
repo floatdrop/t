@@ -329,7 +329,7 @@ func (r *Room) SetVideoInterest(ids []string) {
 	r.mu.Unlock()
 
 	// Recorded here and reconciled elsewhere. Reconciling means a SUBSCRIBE
-	// and a FETCH round trip per newly wanted tile, and this is called from
+	// and a fill per newly wanted tile, and this is called from
 	// the bridge's read loop — the single goroutine that also carries captured
 	// media to the publisher. Doing the work here stopped this participant
 	// publishing for as long as those round trips took, which in a nine-way

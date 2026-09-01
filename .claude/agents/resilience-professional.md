@@ -90,8 +90,10 @@ application because reconcile is check-then-act and two concurrent catalogs
 would each subscribe the same track. `catalogGroup` drops a catalog older than
 the one applied, since streams are read concurrently and arrive in any order.
 `addRemote` reserves the map slot before subscribing so a duplicate
-announcement cannot start a second subscription. A failed catalog joining FETCH
-is a warning, not a fatal: degraded discovery, still a call.
+announcement cannot start a second subscription. The catalog backfill is a
+§5.1.3 fill asked for on the SUBSCRIBE, which has no failure signal at all — so
+`retryCatalogFill` subscribes again on a timeout rather than on an error, and
+giving up is a warning, not a fatal: degraded discovery, still a call.
 
 On the frontend, `bridge.ts` retries every `RECONNECT_DELAY_MS` and forgets the
 cached endpoint on failure, because the app may have restarted on a new port.

@@ -43,7 +43,7 @@ import { addTapModule, watchAudioContext, type TapBlock } from './worklets';
  * is the thing to know about it. A joining subscriber backfills the group in
  * progress from its keyframe and asks this encoder for a fresh one besides, so
  * the interval sets neither of those waits any more. The backend does both —
- * see `backfillGroup` and `requestNewGroup` in `internal/conf/remote.go`, and
+ * see `awaitBackfill` and `requestNewGroup` in `internal/conf/remote.go`, and
  * the keyframe it asks for arrives here as `requestKeyFrame`.
  *
  * So what is left is a straight bitrate-against-loss trade. A longer group

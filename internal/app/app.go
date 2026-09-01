@@ -388,7 +388,7 @@ func (a *App) runPublishPump(ctx context.Context, room *conf.Room, p *publishPum
 // for every subscriber. The reconnect path has always asked for one; the write
 // path, which reaches the same state for a different reason, never did.
 //
-// A remote subscriber can reach this too, through NEW_GROUP_REQUEST (§10.2.13)
+// A remote subscriber can reach this too, through NEW_GROUP_REQUEST (§10.2.19)
 // on our video publication — see conf.Config.OnKeyFrameRequest. That one is not
 // about reopening a stalled group: it is a peer that has just subscribed and
 // would otherwise see nothing until our next scheduled keyframe. Same remedy,

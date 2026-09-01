@@ -136,7 +136,7 @@ func TestPublishedObjectsCarryBothEmissionIndexCodePoints(t *testing.T) {
 	sub, err := sess.Subscribe(ctx, &message.Subscribe{
 		Namespace:  alice.pub.ns,
 		Name:       []byte(VideoTrack),
-		Parameters: message.Parameters{message.LargestObjectFilter()},
+		Parameters: message.Parameters{message.NextObjectFilter()},
 	})
 	if err != nil {
 		t.Fatalf("SUBSCRIBE %s: %v", VideoTrack, err)
@@ -250,7 +250,7 @@ func rawSubscriber(t *testing.T, ctx context.Context, addr string) *session.Sess
 	t.Helper()
 	qconn, err := quic.DialAddr(ctx, addr,
 		&tls.Config{
-			NextProtos: []string{alpnDraft19},
+			NextProtos: []string{alpnDraft20},
 			//nolint:gosec // G402: the test relay's certificate is self-signed and generated per run.
 			InsecureSkipVerify: true,
 		},

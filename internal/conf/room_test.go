@@ -133,7 +133,7 @@ type testRelay struct {
 	// mu guards running and addr. Tests stop the relay from a goroutine —
 	// draining is what they are observing — while t.Cleanup may stop it too.
 	// sessionOptions are handed to every session the relay accepts, which is
-	// how a test can stand up a relay that refuses §5.1.3 Range Filters — the
+	// how a test can stand up a relay that refuses §5.1.4 Range Filters — the
 	// shape a deployed one turned out to have.
 	sessionOptions []session.Option
 
@@ -205,7 +205,7 @@ func (r *testRelay) Start() {
 	}
 	ql, err := quic.Listen(udp, &tls.Config{
 		Certificates: []tls.Certificate{r.cert},
-		NextProtos:   []string{alpnDraft19},
+		NextProtos:   []string{alpnDraft20},
 	}, &quic.Config{
 		EnableDatagrams:                  true,
 		EnableStreamResetPartialDelivery: true,
@@ -600,7 +600,7 @@ func TestTwoParticipants(t *testing.T) {
 	_, bobRec := joinRoom(t, addr, "room1", "bob")
 
 	// Bob must discover alice through SUBSCRIBE_NAMESPACE and pick both of
-	// her tracks out of the catalog the joining FETCH backfills.
+	// her tracks out of the catalog the fill backfills.
 	waitFor(t, "bob to subscribe to both of alice's tracks", subscribeWait, func() bool {
 		_, tracks, _, _ := bobRec.snapshot()
 		return len(tracks) == 2

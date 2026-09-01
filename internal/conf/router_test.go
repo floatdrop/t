@@ -17,7 +17,7 @@ import (
 //
 // What that cost was a catalog. A participant publishes its first catalog
 // before announcing its namespace, so a peer that subscribes afterwards can
-// only get it from the Joining FETCH — and losing that response leaves the peer
+// only get it from the fill fetch stream — and losing that stream leaves the peer
 // in the roster with no nickname and no media subscribed, for the rest of the
 // call. Observed as one run in three under load, and in the log as "resetting
 // unclaimed fetch stream" exactly five seconds before the assertion gave up.

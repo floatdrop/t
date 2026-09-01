@@ -7,13 +7,13 @@ import (
 
 // What a subscriber sees when it joins a call already in progress.
 //
-// A largest-object SUBSCRIBE starts after everything that exists, which for
+// A Next Object SUBSCRIBE starts after everything that exists, which for
 // video is the middle of a GOP, and playback discards inbound frames until it
 // sees a keyframe. So on its own a fresh subscription is blank until the
 // publisher's next keyframe — five seconds, at the interval this app runs.
 //
-// Two things close that, and they are independent on purpose. A Joining FETCH
-// replays the group in progress from its keyframe, which needs the relay to
+// Two things close that, and they are independent on purpose. A fill fetch
+// stream replays the group in progress from its keyframe, which needs the relay to
 // have it cached; a NEW_GROUP_REQUEST asks the publisher for a fresh keyframe,
 // which needs the publisher to still be there and encoding. Either one alone
 // paints the tile. Both are exercised below — the backfill here, the request in
@@ -21,7 +21,7 @@ import (
 
 // TestAJoiningSubscriberIsBackfilledToTheKeyFrame is the backfill on its own:
 // the publisher writes a group and then stops, so nothing further is coming and
-// the only way a keyframe reaches the subscriber is the FETCH replaying one
+// the only way a keyframe reaches the subscriber is the fill replaying one
 // that has already been sent.
 //
 // This is the test the old backfill could not have passed. It raced live video
@@ -96,7 +96,7 @@ func TestAJoiningSubscriberIsBackfilledToTheKeyFrame(t *testing.T) {
 // that does not depend on anything being cached: subscribing to a video track
 // asks its publisher to cut a new group, which for video is a keyframe.
 //
-// §10.2.13 NEW_GROUP_REQUEST, carried on a REQUEST_UPDATE and forwarded to the
+// §10.2.19 NEW_GROUP_REQUEST, carried on a REQUEST_UPDATE and forwarded to the
 // publisher by the relay because the video track advertises DYNAMIC_GROUPS.
 // Every link in that chain is load-bearing and none of them reports a failure
 // anywhere the app would see, so this asserts the far end: the publisher's
@@ -118,7 +118,7 @@ func TestSubscribingAsksThePublisherForAKeyFrame(t *testing.T) {
 	})
 	declareBothTracks(t, alice)
 
-	// Something must have been published: §10.2.13 forwards a request only for a
+	// Something must have been published: §10.2.19 forwards a request only for a
 	// group above the largest, and the relay needs a largest to compare against.
 	if err := alice.WriteFrame(videoFrame(0, true, 900)); err != nil {
 		t.Fatalf("write the keyframe: %v", err)

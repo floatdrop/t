@@ -6,7 +6,7 @@
 
 A desktop teleconference client that carries every participant's camera and
 microphone over **Media over QUIC**, using
-[moq-go](https://github.com/floatdrop/moq-go) (draft-19) as the transport.
+[moq-go](https://github.com/floatdrop/moq-go) (draft-20) as the transport.
 
 There is no signalling server and no SFU: participants find each other through
 MOQT namespace discovery on a relay, and each publishes its own media directly.
@@ -52,7 +52,7 @@ of its own, and the relay's namespace discovery is what makes a room a room —
 You need a relay. The simplest is moq-go's, which needs no checkout:
 
 ```sh
-go run github.com/floatdrop/moq-go/cmd/relay@draft-19   # self-signed cert on :4433
+go run github.com/floatdrop/moq-go/cmd/relay@draft-20   # self-signed cert on :4433
 ```
 
 Then, in this directory:

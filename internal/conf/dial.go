@@ -26,9 +26,9 @@ import (
 // implementation is the MOQT_IMPLEMENTATION SETUP option value.
 const implementation = "t/0.1"
 
-// alpnDraft19 is the draft-19 ALPN. draft-19 SETUP carries no version
-// field, so the ALPN is the version signal (§3.1).
-const alpnDraft19 = "moqt-19"
+// alpnDraft20 is the draft-20 ALPN. MOQT SETUP carries no version field, so
+// the ALPN is the version signal (§3.1).
+const alpnDraft20 = "moqt-20"
 
 // dialResult carries the session plus the trace bound to its connection.
 type dialResult struct {
@@ -117,10 +117,10 @@ func dial(ctx context.Context, log *slog.Logger, addr string, insecure bool, con
 	tlsCfg := &tls.Config{
 		//nolint:gosec // G402: opt-in, for dev relays with self-signed certs.
 		InsecureSkipVerify: insecure,
-		NextProtos:         []string{alpnDraft19},
+		NextProtos:         []string{alpnDraft20},
 	}
 
-	log.Info("dialing relay over QUIC", "addr", hostPort, "alpn", alpnDraft19)
+	log.Info("dialing relay over QUIC", "addr", hostPort, "alpn", alpnDraft20)
 	qconn, err := quic.DialAddr(ctx, hostPort, tlsCfg, quicCfg)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", hostPort, err)

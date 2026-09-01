@@ -11,7 +11,7 @@ import (
 // transport: a single stream is ordered, and the reader forwarded each object
 // as it came. Temporal layers break that. The layers ride separate subgroups so
 // a relay can shed the top one without touching the base (a subgroup is the
-// smallest thing §5.1.3 lets a subscriber decline and §8 lets a publisher mark
+// smallest thing §5.1.4 lets a subscriber decline and §8 lets a publisher mark
 // sheddable), and separate subgroups mean separate streams, each read on its
 // own goroutine. Two goroutines interleaving arbitrarily is exactly what a
 // video decoder cannot take: a delta frame ahead of the frame it references is
@@ -51,8 +51,8 @@ import (
 //
 // # A backfilled group needs none of this
 //
-// The Joining FETCH that paints a joining subscriber's first picture asks for
-// the base layer alone (SUBGROUP_FILTER, see backfillGroup in remote.go). One
+// The fill that paints a joining subscriber's first picture asks for the base
+// layer alone (SUBGROUP_FILTER, see awaitBackfill in remote.go). One
 // subgroup is one stream and one stream is ordered, so a backfilled group
 // arrives already in decode order and passes straight through: every object is
 // a base-layer object, and a base-layer object is emitted on arrival. Nothing
@@ -60,7 +60,7 @@ import (
 // below never engages — there is no second stream for it to be racing.
 //
 // That is a property of the filter, not a coincidence, and it is what makes the
-// backfill affordable at all. A FETCH answers in ascending Object ID, and the
+// backfill affordable at all. A fetch stream answers in ascending Object ID, and the
 // layers own disjoint ID ranges, so an *unfiltered* backfill arrives as the
 // whole base layer followed by the whole enhancement layer — every enhancement
 // frame after every frame it belongs between. Ordering that means holding the

@@ -136,7 +136,7 @@ const propEmissionIndexLegacy message.PropertyType = 0x8002
 // IDs must be unique within a group — a relay's cache keys objects on (group,
 // object) and nothing else, so a colliding ID does not merely confuse a reader,
 // it overwrites the other layer's frame in the store that answers backfill
-// FETCHes. And §11.4.3 forbids forwarding a non-consecutive object on an
+// fetches. And §11.4.3 forbids forwarding a non-consecutive object on an
 // existing subgroup stream, so a relay presented with one resets that stream
 // and opens another.
 //
@@ -161,7 +161,7 @@ const layerObjectStride = 1 << 16
 // Which way round they go is not cosmetic, and the obvious direction was wrong.
 // A Location is ordered by (Group, Object), so the Largest Object of a group is
 // whichever layer holds the top range — and the Largest Object is what §5.1.2's
-// largest-object filter starts a subscription after. With the base layer at the
+// Next Object filter starts a subscription after. With the base layer at the
 // bottom, every base object of the group in progress sorts *below* the mark a
 // joining subscriber is given, so the filter withholds precisely the frames that
 // are decodable and forwards precisely the ones that are not: the subscriber is
@@ -211,7 +211,7 @@ type publisher struct {
 	videoConfig *bridge.TrackConfig
 	audioConfig *bridge.TrackConfig
 	// catalogGroup numbers successive catalog objects. Each catalog is a
-	// standalone group so a subscriber's Joining FETCH lands on the
+	// standalone group so a subscriber's fill lands on the
 	// newest one.
 	catalogGroup uint64
 }
@@ -229,7 +229,7 @@ type publisher struct {
 // on a fast loopback the SUBSCRIBE wins and hangs unanswered. Publishing
 // first closes that window — by the time anyone can learn this namespace,
 // every track is open and the first catalog object is already cached, which
-// is also what lets a late joiner's Joining FETCH find something.
+// is also what lets a late joiner's fill find something.
 func newPublisher(
 	ctx context.Context,
 	log *slog.Logger,
@@ -277,7 +277,7 @@ func newPublisher(
 // dynamicGroupsProperty advertises DYNAMIC_GROUPS=1 (§12.6) — this track's
 // groups are cut on demand, not on a schedule a subscriber could predict.
 //
-// It is the precondition for NEW_GROUP_REQUEST (§10.2.13): a relay declines to
+// It is the precondition for NEW_GROUP_REQUEST (§10.2.19): a relay declines to
 // forward one upstream unless the track says this, so without it a joining
 // subscriber's request is dropped at the relay and nothing reaches the encoder.
 //
@@ -293,7 +293,7 @@ var dynamicGroupsProperty = message.AppendTrackProperties([]wire.KVPair{
 // and serializes those replies against a later Done.
 //
 // onNewGroup, when non-nil, is called for a REQUEST_UPDATE carrying
-// NEW_GROUP_REQUEST (§10.2.13) — a subscriber asking this publisher to start a
+// NEW_GROUP_REQUEST (§10.2.19) — a subscriber asking this publisher to start a
 // group. The broker sends the REQUEST_OK either way; this is what makes the
 // answer more than polite.
 func (p *publisher) publish(
@@ -318,7 +318,7 @@ func (p *publisher) publish(
 				return true
 			}
 			// The value is the group being asked for. Nothing here acts on it:
-			// the relay has already applied §10.2.13's rules — it forwards a
+			// the relay has already applied §10.2.19's rules — it forwards a
 			// request only above the current largest group and only when none
 			// of equal or greater value is outstanding — so a room joining at
 			// once arrives as one request, and the answer to any of them is the
@@ -567,7 +567,7 @@ type trackPublisher struct {
 	// subgroups holds one open stream per temporal layer of the current group,
 	// indexed by layer. Video with temporal layers writes each frame to the
 	// subgroup matching its layer, so a subscriber can decline the upper ones
-	// (§5.1.3) and a relay can shed them, without either touching the base.
+	// (§5.1.4) and a relay can shed them, without either touching the base.
 	// Audio and unlayered video use index 0 alone, which is the shape every
 	// track had before layers existed.
 	//
@@ -680,7 +680,7 @@ func (t *trackPublisher) closeSubgroups() {
 // openSubgroup opens this group's stream for one temporal layer, or returns the
 // one already open. The caller holds mu.
 //
-// The Subgroup ID is the layer, which is the whole mechanism: §5.1.3 range
+// The Subgroup ID is the layer, which is the whole mechanism: §5.1.4 range
 // filters and §8 per-subgroup delivery timeouts both address a subgroup by ID,
 // so numbering them by layer is what lets a subscriber decline the upper layers
 // and a relay shed them. Spelled out explicitly rather than left implicit —

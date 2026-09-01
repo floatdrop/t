@@ -20,9 +20,9 @@ Each participant owns a namespace tuple and publishes three tracks under it:
 Discovery falls out of that layout. A participant announces itself with
 `PUBLISH_NAMESPACE` and watches the room with `SUBSCRIBE_NAMESPACE` on the
 prefix `("t", <room>)`; the relay then reports arrivals as `NAMESPACE` and
-departures as `NAMESPACE_DONE`. Each peer's catalog is fetched with a Relative
-Joining FETCH so a late joiner sees a catalog that was published before it
-arrived.
+departures as `NAMESPACE_DONE`. Each peer's catalog subscription carries
+`FILL_PARAMETERS`, which asks for a fill fetch stream over the current group, so
+a late joiner sees a catalog that was published before it arrived.
 
 The nickname travels in the catalog (a producer-defined root field), not in the
 namespace, so it can be anything and can repeat.
@@ -47,7 +47,7 @@ Within a group, the objects are split across **one subgroup per temporal
 layer**. The primary encoding asks for `L1T2`, so frames alternate between
 a base layer that decodes on its own and an enhancement layer nothing
 references; the base is subgroup 0 and the enhancement subgroup 1. A subgroup is
-the smallest unit MOQT lets a subscriber decline (§5.1.3 Range Filters) or a
+the smallest unit MOQT lets a subscriber decline (§5.1.4 Range Filters) or a
 publisher mark sheddable (§8 delivery timeouts), so numbering them by layer is
 what makes the enhancement layer separately droppable — at the cost of frame
 rate rather than a frozen tile.
@@ -63,7 +63,7 @@ warning: one subgroup is what a flat stream has always looked like.
 Each layer numbers its objects **from its own base**, because two rules apply at
 once. Object IDs must be unique within a group, since a relay's cache keys
 objects on `(group, object)` alone and a colliding ID overwrites the other
-layer's frame in the store that answers backfill FETCHes. And §11.4.3 forbids
+layer's frame in the store that answers backfill fetches. And §11.4.3 forbids
 forwarding a non-consecutive object on an existing subgroup stream, so a relay
 handed one resets that stream and opens another. Numbering in emission order
 across the subgroups satisfies the first and breaks the second: each layer then
@@ -77,7 +77,7 @@ Which layer gets which range is not cosmetic, and the obvious direction was
 wrong. **The base layer owns the highest range** — subgroup *L* starts at
 `(3 − L) × 65536` — because a Location is ordered by `(Group, Object)`, so the
 Largest Object of a group is whichever layer holds the top range, and the
-Largest Object is where §5.1.2's largest-object filter starts a subscription.
+Largest Object is where §5.1.2's Next Object filter starts a subscription.
 With the base at the bottom, every base object of the group in progress sorted
 *below* the mark a joining subscriber was given: the filter withheld precisely
 the frames that were decodable and forwarded precisely the ones that were not,
@@ -233,7 +233,7 @@ late is not worth delivering five seconds late.
 
 ### Arriving with a picture
 
-A subscription starts at the live edge. `SUBSCRIBE` with the largest-object
+A subscription starts at the live edge. `SUBSCRIBE` with the Next Object
 filter delivers what comes *after* everything that already exists, which for
 video is the middle of a GOP, and playback discards inbound frames until it sees
 a keyframe. On its own, then, a fresh subscription is a blank tile until the
@@ -244,17 +244,26 @@ into view.
 There are two answers and they are deliberately independent, because each has a
 precondition the other does not.
 
-**A Joining FETCH replays the group in progress.** `JoiningStart=0` resolves to
-`{largest.Group, 0}` through `{largest.Group, largest.Object + 1}`: the current
-group from its keyframe, ending exactly where the subscription begins. It needs
-the relay to still have the group cached. Narrowed to the base layer with a
-§5.1.3 `SUBGROUP_FILTER`, which is what makes it affordable — that is the whole
-reference chain and nothing else, since no enhancement frame in the past is
-referenced by anything — and also what lets it stream: a FETCH answers in
-ascending Object ID, so filtered to one subgroup it is already in decode order
-and goes to the decoder frame by frame.
+**A fill replays the group in progress.** `FILL_PARAMETERS` on the `SUBSCRIBE`
+carrying a one-group relative filter (§5.1.3) resolves to `{largest.Group, 0}`
+through `{largest.Group, largest.Object}`: the current group from its keyframe,
+ending exactly where the subscription begins. It needs the relay to still have
+the group cached. Narrowed to the base layer with a §5.1.4 `SUBGROUP_FILTER`,
+which is what makes it affordable — that is the whole reference chain and
+nothing else, since no enhancement frame in the past is referenced by anything —
+and also what lets it stream: a fetch stream answers in ascending Object ID, so
+filtered to one subgroup it is already in decode order and goes to the decoder
+frame by frame.
 
-**A NEW_GROUP_REQUEST asks the publisher for a keyframe.** §10.2.13, carried on
+draft-20 replaced draft-19's Relative Joining FETCH with this, and the swap is
+not free: a fill is a parameter, not a request. It has no Request ID of its own,
+no OK and no error — the stream arrives under the `SUBSCRIBE`'s Request ID, or
+it does not, and §5.1.3.1 leaves "the publisher declined" and "there was nothing
+cached" looking identical from the subscriber's side. So the code that used to
+act on a refusal now acts on a deadline: `videoBackfillTimeout` releases the
+group's turn, and `retryCatalogFill` subscribes again.
+
+**A NEW_GROUP_REQUEST asks the publisher for a keyframe.** §10.2.19, carried on
 a `REQUEST_UPDATE` after the subscribe rather than on the `SUBSCRIBE` itself: a
 relay only forwards the SUBSCRIBE-borne form when it has to open a *new* upstream
 subscription, and here it never does, since every participant publishes to the
@@ -298,7 +307,7 @@ There is one encoding. There used to be a second, smaller one published
 alongside it, and a ladder that walked a struggling subscriber down onto it —
 both gone. Shedding the enhancement layer does that job without anyone
 negotiating it, and the ladder's cheaper rung (declining the top subgroup with
-a §5.1.3 Range Filter) is unusable in practice anyway: MAX_FILTER_RANGES
+a §5.1.4 Range Filter) is unusable in practice anyway: MAX_FILTER_RANGES
 defaults to zero, so a relay that does not advertise it rejects the SUBSCRIBE
 outright. When the relay gives up on a subscription the client simply asks
 again — a fresh SUBSCRIBE starts at the live edge, and on a link that tight

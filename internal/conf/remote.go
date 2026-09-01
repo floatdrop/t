@@ -78,7 +78,8 @@ const maxLag = 1500 * time.Millisecond
 const resyncCooldown = 15 * time.Second
 
 // videoBackfillTimeout is the ceiling on how long live video waits behind a
-// joining FETCH that has not finished.
+// fill that has not finished — or that never arrived, which a fill gives no
+// other way of learning (§5.1.3.1).
 //
 // The backfill goes in front of live because that is the order a decoder needs
 // them in, and the price of that ordering is that a backfill which stalls holds
@@ -151,10 +152,12 @@ type remote struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	// catalogSub and catalogFetch stay referenced so close can release
-	// them; the fetch is nil when the backfill was refused.
-	catalogSub   *session.Subscription
-	catalogFetch *session.FetchRequest
+	// catalogSub and catalogFill stay referenced so close can release them.
+	// The fill is the §5.1.3 fetch stream the catalog SUBSCRIBE asked for,
+	// recorded when it arrives and nil until then — a relay with nothing
+	// cached opens none at all.
+	catalogSub  *session.Subscription
+	catalogFill *session.IncomingFetchStream
 
 	// applying serialises catalog application. Each catalog arrives on its
 	// own stream and the router reads streams concurrently, so two catalogs
@@ -250,22 +253,30 @@ type remoteTrack struct {
 	sub    *session.Subscription
 	label  string
 
-	// backfilled is the group the joining FETCH replays, and hasBackfill says
-	// there is one. Set before any stream can arrive and never written again,
-	// so both are read without a lock.
+	// backfilled is the group the fill replays, and hasBackfill says there is
+	// one. Set before any stream can arrive and never written again, so both are
+	// read without a lock.
 	//
 	// It is also the boundary the live path treats specially: that group has two
-	// sources — the FETCH for what came before the subscribe, the live stream
-	// for what came after — and they have to be ordered against each other
-	// inside one group. See backfillGate and readMedia.
+	// sources — the fill for what came before the subscribe, the live stream for
+	// what came after — and they have to be ordered against each other inside
+	// one group. See backfillGate and readMedia.
 	backfilled  uint64
 	hasBackfill bool
-	// backfill coordinates the FETCH with the live stream continuing the same
+	// backfill coordinates the fill with the live stream continuing the same
 	// group. Nil when there is nothing to backfill.
 	backfill *backfillGate
-	// fetch is the joining FETCH backfilling that group. Written and read under
-	// the remote's lock, so a track dropped mid-setup cannot leave it open.
-	fetch *session.FetchRequest
+	// fill is the fetch stream backfilling that group, recorded when it arrives.
+	// A fill is not a request this client holds a handle to, so the incoming
+	// stream is the only thing there is to stop. Written and read under the
+	// remote's lock, so a track dropped mid-delivery cannot leave it running.
+	fill *session.IncomingFetchStream
+	// dropped is set by dropTrack, under the remote's lock, and exists because
+	// a fill can arrive long after the SUBSCRIBE that asked for it. Without it
+	// a stream landing after the track was retired would record itself on a
+	// track nothing will ever close again, and pour a whole group into a handle
+	// the frontend has already forgotten.
+	dropped bool
 
 	// groupsMu guards groups, which holds one reassembler per group currently
 	// in flight — keyed by Group ID, entered by every subgroup stream of that
@@ -370,25 +381,39 @@ func newRemote(parent context.Context, room *Room, id string, ns wire.TrackNames
 		cancel()
 		return nil, err
 	}
+	go r.retryCatalogFill()
 	return r, nil
 }
 
-// subscribeCatalog opens the catalog subscription plus the Joining FETCH
-// that backfills it.
+// subscribeCatalog opens the catalog subscription, asking in the same message
+// for the fill that backfills it.
 //
-// The FETCH is not optional here. A catalog object is published once, when
-// the participant joins; SUBSCRIBE with the largest-object filter delivers
-// only objects *after* the current largest (§5.1.3), so a participant who
-// joins later would never see a catalog that was published before they
-// arrived. The Relative Joining FETCH (§10.12.2) with JoiningStart=0
-// backfills the current group, which is exactly that catalog object.
+// The fill is not optional here. A catalog object is published once, when the
+// participant joins; the Next Object filter delivers only objects *after* the
+// current Largest Object (§5.1.2), so a participant who joins later would
+// never see a catalog that was published before they arrived. FILL_PARAMETERS
+// (§10.2.15) carrying a one-group relative filter asks the publisher to open a
+// fill fetch stream (§5.1.3) covering the current group, which is exactly that
+// catalog object.
+//
+// draft-20 replaced draft-19's Relative Joining FETCH with this. The
+// difference that matters downstream is that a fill is not a request of its
+// own: it has no Request ID, no OK and no error — the stream simply arrives
+// under the SUBSCRIBE's Request ID, or does not. See retryCatalogFill for what
+// stands in for the refusal this used to be able to detect.
 func (r *remote) subscribeCatalog() error {
 	subMsg := &message.Subscribe{
 		Namespace: r.ns,
 		Name:      []byte(msf.CatalogTrackName),
 		Parameters: message.Parameters{
-			message.LargestObjectFilter(),
+			message.NextObjectFilter(),
 			message.SubscriberPriorityParam(catalogPriority),
+			// StartGroup=1 is the current group: the group before the Next
+			// Group, which is where the Next Object filter above picks up.
+			// Adjacent and disjoint, so the catalog arrives exactly once.
+			message.FillParametersParam(message.Parameters{
+				message.RelativeStartFilter(1),
+			}),
 		},
 	}
 	sub, err := r.room.sess.Subscribe(r.ctx, subMsg)
@@ -408,44 +433,36 @@ func (r *remote) subscribeCatalog() error {
 	r.log.Info("subscribed to catalog", "alias", sub.TrackAlias())
 
 	r.room.router.HandleSubgroups(sub.TrackAlias(), nil, r.readCatalogStream)
+	// §5.1.3: the fill arrives on a fetch stream whose FETCH_HEADER carries the
+	// Request ID of the message that asked for it — the SUBSCRIBE's, not a
+	// FETCH's. The router parks a stream that beats this registration, which is
+	// a hop-wide window the relay can easily win.
+	r.room.router.HandleFetch(subMsg.RequestID, r.readCatalogFetch)
 	go r.watchLiveness(sub)
-
-	fetchMsg := &message.Fetch{
-		FetchType: message.FetchTypeRelativeJoining,
-		Joining: &message.JoiningFetch{
-			JoiningRequestID: subMsg.RequestID,
-			JoiningStart:     0,
-		},
-	}
-	fetch, err := r.room.sess.Fetch(r.ctx, fetchMsg)
-	if err != nil {
-		// Not fatal — the subscription above is live, so anything they publish
-		// from here is seen. But "from here" is the problem: a participant who
-		// has settled does not republish, since a catalog goes out only when
-		// track availability changes. Without the backfill they sit in the
-		// roster with no nickname and no media for as long as they stay
-		// unchanged, which for someone already in the call is the whole of it.
-		//
-		// So it is worth another go before accepting that. Left to the
-		// caller's goroutine rather than the request path, which has a
-		// subscription to finish setting up.
-		r.log.Warn("catalog joining FETCH failed", "err", err)
-		go r.retryCatalogFetch(fetchMsg)
-		return nil
-	}
-	r.mu.Lock()
-	r.catalogFetch = fetch
-	r.mu.Unlock()
-	r.room.router.HandleFetch(fetchMsg.RequestID, r.readCatalogFetch)
 	return nil
 }
 
-// retryCatalogFetch asks again for the backfill this remote did not get.
+// retryCatalogFill asks again for a backfill that did not arrive, by
+// subscribing again.
 //
-// Stops as soon as a catalog has arrived by any route: the subscription may
-// deliver one first if the participant happens to republish, and a second
-// backfill would only be the same object again.
-func (r *remote) retryCatalogFetch(fetchMsg *message.Fetch) {
+// A fill has no failure signal a subscriber can read. §5.1.3.1 gives the
+// publisher exactly two ways to decline — open the stream and reset it, or
+// open nothing at all — and the second is also what "there was nothing cached
+// to fill" looks like, so from here the two are indistinguishable. Nor is
+// there a FETCH left to retry: the fill is a parameter on the SUBSCRIBE, so
+// asking again means subscribing again.
+//
+// That makes the trigger a timeout rather than an error, and it is one worth
+// spending. A participant who has settled does not republish — a catalog goes
+// out only when track availability changes — so a missed backfill leaves them
+// in the roster with no nickname and no media for as long as they stay
+// unchanged, which for someone already in the call is the whole of it.
+//
+// Started once per remote, and it drives every attempt itself, so the bound
+// below really is the bound: subscribeCatalog does not spawn another of these,
+// and a participant who announces a namespace but never publishes a catalog
+// costs trackRetryLimit subscriptions rather than an endless churn of them.
+func (r *remote) retryCatalogFill() {
 	delay := trackRetryDelay
 	for attempt := 1; attempt <= trackRetryLimit; attempt++ {
 		select {
@@ -453,7 +470,11 @@ func (r *remote) retryCatalogFetch(fetchMsg *message.Fetch) {
 			return
 		case <-time.After(delay):
 		}
+		delay = min(delay*2, trackRetryMax)
 
+		// Stops as soon as a catalog has arrived by any route: the subscription
+		// delivers one if the participant republishes, and a second fill would
+		// only be the same object again.
 		r.mu.Lock()
 		closed, have := r.closed, r.hasCatalog
 		r.mu.Unlock()
@@ -461,19 +482,15 @@ func (r *remote) retryCatalogFetch(fetchMsg *message.Fetch) {
 			return
 		}
 
-		fetch, err := r.room.sess.Fetch(r.ctx, fetchMsg)
-		if err != nil {
-			r.log.Warn("catalog joining FETCH failed again", "attempt", attempt, "err", err)
-			delay = min(delay*2, trackRetryMax)
+		// The fresh subscription supersedes the one being watched, so the
+		// watchLiveness behind it stands down rather than resubscribing on top
+		// of this — see the generation check there.
+		if err := r.subscribeCatalog(); err != nil {
+			r.log.Warn("catalog re-subscribe for a missing backfill failed",
+				"attempt", attempt, "err", err)
 			continue
 		}
-
-		r.mu.Lock()
-		r.catalogFetch = fetch
-		r.mu.Unlock()
-		r.room.router.HandleFetch(fetchMsg.RequestID, r.readCatalogFetch)
-		r.log.Info("catalog backfill recovered", "attempt", attempt)
-		return
+		r.log.Info("re-subscribed for a catalog that never arrived", "attempt", attempt)
 	}
 	r.log.Warn("giving up on a participant's catalog backfill; " +
 		"they will appear only if they republish")
@@ -504,6 +521,18 @@ func (r *remote) watchLiveness(sub *session.Subscription) {
 				r.log.Debug("catalog subscription ended with the session")
 				return
 			default:
+			}
+			// A subscription that has already been replaced — retryCatalogFill
+			// resubscribing because no backfill arrived — ends exactly like one
+			// that failed, because closing it is how it was replaced. Rebuilding
+			// it again would put two catalog subscriptions and two watchers on
+			// one participant, so the older watch stands down instead.
+			r.mu.Lock()
+			superseded := r.catalogSub != sub
+			r.mu.Unlock()
+			if superseded {
+				r.log.Debug("catalog subscription superseded; standing down")
+				return
 			}
 			// The session is alive, so this is one request stream that ended —
 			// a reset, or something unparseable — and the participant may be
@@ -576,17 +605,31 @@ func (r *remote) readCatalogStream(s *session.IncomingSubgroupStream) {
 	}
 }
 
+// readCatalogFetch drains the catalog's fill fetch stream (§5.1.3).
 func (r *remote) readCatalogFetch(s *session.IncomingFetchStream) {
+	// Recorded so close can stop it. A fill is not a request this client holds
+	// a handle to, so the incoming stream is the only thing there is to cancel.
+	r.mu.Lock()
+	closed := r.closed
+	if !closed {
+		r.catalogFill = s
+	}
+	r.mu.Unlock()
+	if closed {
+		s.Cancel(moqt.StreamResetCancelled)
+		return
+	}
+
 	for {
 		obj, err := s.ReadDecoded()
 		if err != nil {
 			if !errors.Is(err, io.EOF) && r.ctx.Err() == nil {
-				r.log.Warn("catalog fetch read failed", "err", err)
+				r.log.Warn("catalog fill read failed", "err", err)
 			}
 			return
 		}
-		// §11.4.4.2 absence markers carry no payload.
-		if obj.EndOfNonExistentRange || obj.EndOfUnknownRange {
+		// §11.4.4.2 end-of-range markers carry no payload.
+		if obj.IsEndOfRange() {
 			continue
 		}
 		r.onCatalog(obj.GroupID, obj.Payload)
@@ -887,13 +930,40 @@ func (r *remote) subscribeTrack(
 	if kind == bridge.KindAudio {
 		priority = audioPriority
 	}
+	params := message.Parameters{
+		message.NextObjectFilter(),
+		message.SubscriberPriorityParam(priority),
+	}
+	if kind == bridge.KindVideo {
+		// The backfill of the group already in progress, asked for on the
+		// SUBSCRIBE itself because draft-20 gives a fill nowhere else to live.
+		// See awaitBackfill for what it is worth and why it is video only.
+		//
+		// Only the overrides go in here: §10.2.15 says a parameter left out of
+		// FILL_PARAMETERS keeps the value it has for the subscription, so the
+		// fill is already level with live video on priority — which is what it
+		// should be, being the same pictures and needed first.
+		params = append(params, message.FillParametersParam(message.Parameters{
+			// The current group: the one before the Next Group, which is where
+			// the filter above picks up. Adjacent and disjoint, so no object
+			// arrives twice and none is skipped.
+			message.RelativeStartFilter(1),
+			// The base layer alone, which is what makes the backfill
+			// affordable — see awaitBackfill. One contiguous range, well inside
+			// any sane MAX_FILTER_RANGES; a relay advertising zero prohibits
+			// Range Filters outright, and having no way to say so about a fill
+			// (§5.1.3.1) it resets the stream, which reads here as a backfill
+			// that never finished.
+			message.RangeFilterParam(&message.RangeFilter{
+				Type:   message.ParamSubgroupFilter,
+				Ranges: []message.Range{{Start: baseSubgroup, End: baseSubgroup}},
+			}),
+		}))
+	}
 	subMsg := &message.Subscribe{
-		Namespace: r.ns,
-		Name:      []byte(name),
-		Parameters: message.Parameters{
-			message.LargestObjectFilter(),
-			message.SubscriberPriorityParam(priority),
-		},
+		Namespace:  r.ns,
+		Name:       []byte(name),
+		Parameters: params,
 	}
 	sub, err := r.room.sess.Subscribe(r.ctx, subMsg)
 	if err != nil {
@@ -911,7 +981,7 @@ func (r *remote) subscribeTrack(
 		label:  label,
 	}
 	track.order = newGroupOrderer()
-	// §10.2.16: the publisher MUST send LARGEST_OBJECT in SUBSCRIBE_OK once
+	// §10.2.17: the publisher MUST send LARGEST_OBJECT in SUBSCRIBE_OK once
 	// anything has been published on the track. Its absence therefore means an
 	// empty track — the subscription starts at the beginning, there is no group
 	// in progress, and there is nothing to backfill.
@@ -981,23 +1051,19 @@ func (r *remote) subscribeTrack(
 		"track", name, "alias", sub.TrackAlias(), "handle", handle, "codec", cfg.Codec)
 
 	if kind == bridge.KindVideo && track.hasBackfill {
-		// Claimed here, before the FETCH is even sent, so the mark starts at the
+		// Claimed here, before the fill can arrive, so the mark starts at the
 		// group being backfilled rather than at the first group live delivers.
 		// groupOrderer.Open normally runs off the accept loop where the arrival
 		// order still exists; there is no stream to hang it on here, and the
 		// order is not in doubt — the backfilled group precedes every group the
-		// subscription can carry. Released by backfillGroup, however it ends.
+		// subscription can carry. Released by awaitBackfill, however it ends.
 		track.order.Open(track.backfilled)
 
-		// On its own goroutine: it is a FETCH round trip, and nothing here needs
-		// its result — the objects it brings are forwarded from the handler it
-		// registers. Done inline it sat in front of everything behind this
-		// subscribe, holding `applying` across the trip: the participant's audio
-		// waited for it, so did any catalog arriving meanwhile, and against a
-		// track with nothing published yet the wait was long enough to time
-		// tests out. A congested link is exactly where that trip is slowest and
-		// where audio can least afford to queue behind a picture.
-		go r.backfillGroup(subMsg.RequestID, track, counter)
+		// Inline, and cheap enough to be: the fill was asked for in the
+		// SUBSCRIBE that has already been answered, so there is no round trip
+		// left to make here — only a handler to register before the stream it
+		// routes can arrive.
+		r.awaitBackfill(subMsg.RequestID, track, counter)
 	}
 	if kind == bridge.KindVideo {
 		// Independent of the backfill and useful even when there was nothing to
@@ -1009,7 +1075,7 @@ func (r *remote) subscribeTrack(
 	return nil
 }
 
-// backfillGate coordinates the two sources of one backfilled group: the FETCH
+// backfillGate coordinates the two sources of one backfilled group: the fill
 // replaying what the publisher wrote before the subscribe, and the live stream
 // carrying what it wrote after. It answers two questions, and they are not the
 // same one.
@@ -1017,7 +1083,7 @@ func (r *remote) subscribeTrack(
 // **Which goes first.** Both carry the base layer of one group, and to the
 // reassembler a base object is one to emit on arrival — so live going first
 // would advance the mark past the whole backfill and drop it as late. Wait
-// holds the live stream until the FETCH is done. Nothing else can arrange this:
+// holds the live stream until the fill is done. Nothing else can arrange this:
 // the group orderer works a group at a time, and this is inside one.
 //
 // **When the group's turn ends**, which is what lets the next group through.
@@ -1035,7 +1101,7 @@ func (r *remote) subscribeTrack(
 // had already written — is not absent, and cutting it off to end the turn on
 // schedule discards the frames it was carrying and strands the group short.
 type backfillGate struct {
-	// done closes when the FETCH has finished with the group, however it
+	// done closes when the fill has finished with the group, however it
 	// finished. Read by wait, closed once by release.
 	done        chan struct{}
 	releaseOnce sync.Once
@@ -1082,13 +1148,13 @@ func (g *backfillGate) announce(group, backfilled uint64) {
 }
 
 // finishDueLocked reports whether nothing more is coming for the backfilled
-// group: the FETCH is done, the publisher has moved past it, and no live stream
+// group: the fill is done, the publisher has moved past it, and no live stream
 // ever turned up to carry the rest. The caller holds mu.
 func (g *backfillGate) finishDueLocked() bool {
 	return g.released && g.movedOn && !g.claimed && !g.finished
 }
 
-// wait blocks until the FETCH has finished with the group, reporting false if
+// wait blocks until the fill has finished with the group, reporting false if
 // the remote went away first.
 func (g *backfillGate) wait(ctx context.Context) bool {
 	select {
@@ -1121,7 +1187,7 @@ func (g *backfillGate) finish() {
 	g.end()
 }
 
-// release records that the FETCH is done with the group, letting through the
+// release records that the fill is done with the group, letting through the
 // live stream that continues it — and ending the turn here if the publisher has
 // already moved on and no such stream exists.
 func (g *backfillGate) release() {
@@ -1137,21 +1203,27 @@ func (g *backfillGate) release() {
 	})
 }
 
-// backfillGroup replays the group already in progress, so a fresh video
-// subscription has a picture now rather than at the publisher's next keyframe.
+// awaitBackfill takes delivery of the group already in progress, so a fresh
+// video subscription has a picture now rather than at the publisher's next
+// keyframe.
 //
-// A SUBSCRIBE with the largest-object filter starts at the first object *after*
+// A SUBSCRIBE with the Next Object filter starts at the first object *after*
 // whatever exists, which for video is the middle of a GOP — undecodable, since
 // playback discards inbound frames until it sees a keyframe. So a new
 // subscription showed nothing at all until the next keyframe, up to the whole
 // keyframe interval away. Every layer change, every demotion, every lag resync
 // and every tile scrolled back into view paid it.
 //
-// The Relative Joining FETCH (§10.12.2) with JoiningStart=0 resolves to
-// {largest.Group, 0} through {largest.Group, largest.Object + 1} — the current
-// group from its keyframe up to exactly where the subscription begins. The two
-// ranges are adjacent: no object arrives twice and none is skipped. It is the
-// same pairing the catalog subscription has always used.
+// The fill asked for in subscribeTrack — FILL_PARAMETERS with a one-group
+// relative filter (§5.1.3) — resolves to {largest.Group, 0} through
+// {largest.Group, largest.Object}: the current group from its keyframe up to
+// exactly where the subscription begins. The two ranges are adjacent: no object
+// arrives twice and none is skipped. It is the same pairing the catalog
+// subscription has always used.
+//
+// draft-20 replaced draft-19's Relative Joining FETCH with this. What it costs
+// here is the ability to tell a refusal from a fill still in flight — see the
+// timer below.
 //
 // # Why this one can win where the last one could not
 //
@@ -1172,13 +1244,13 @@ func (g *backfillGate) release() {
 //
 // # Why it is affordable
 //
-// SUBGROUP_FILTER (§5.1.3) narrows it to the base layer. That is the reference
+// SUBGROUP_FILTER (§5.1.4) narrows it to the base layer. That is the reference
 // chain and nothing else: every base frame back to the keyframe is needed to
 // decode the next one, and no enhancement frame in the past is referenced by
 // anything at all. Roughly halves the bytes, and every byte left is load-bearing.
 //
-// It is also what lets the response stream. A FETCH answers in ascending Object
-// ID, and the layers own disjoint ID ranges (see layerObjectStride), so an
+// It is also what lets the response stream. A fetch stream answers in ascending
+// Object ID, and the layers own disjoint ID ranges (see layerObjectStride), so an
 // unfiltered backfill arrives as the whole base layer followed by the whole
 // enhancement layer — decode order for neither, so it has to be buffered whole
 // and sorted before any of it can go out. Filtered to one subgroup, ascending
@@ -1188,72 +1260,49 @@ func (g *backfillGate) release() {
 // Video only. The same backfill on audio would deliver up to half a second of
 // sound that has already been and gone, into a player whose whole job is
 // staying near the live edge.
-func (r *remote) backfillGroup(
+func (r *remote) awaitBackfill(
 	subscribeID uint64,
 	track *remoteTrack,
 	counter *telemetry.TrackCounter,
 ) {
-	// The group's turn is claimed before the FETCH is sent and has to be handed
-	// on however this ends — refused, reset, drained, or timed out. Left
-	// unreleased, the live stream continuing this group never starts and every
-	// later group sits behind one nothing more is coming for, until the
+	// The group's turn was claimed before the SUBSCRIBE was answered and has to
+	// be handed on however this ends — declined, reset, drained, or timed out.
+	// Left unreleased, the live stream continuing this group never starts and
+	// every later group sits behind one nothing more is coming for, until the
 	// cross-group backlog gives up on it: seconds of video held for nothing.
 	finish := track.backfill.release
-	// The FETCH itself has no deadline, and the objects arrive on a stream that
-	// can simply stall. This is the ceiling on how long live video waits for a
-	// picture that would have been nicer to have first.
+	// The timer carries the whole of that duty now. A fill has no response to
+	// wait on and no error to raise (§5.1.3.1): a publisher that will not serve
+	// one opens nothing, which is indistinguishable from a stream still on its
+	// way, so "it is not coming" can only ever be a deadline. The stream can
+	// So this is the ceiling on how long live video waits for a picture that
+	// would have been nicer to have first.
 	timer := time.AfterFunc(videoBackfillTimeout, func() {
 		r.log.Debug("video backfill timed out", "handle", track.handle,
 			"group", track.backfilled)
 		finish()
 	})
-	defer timer.Stop()
 
-	fetchMsg := &message.Fetch{
-		FetchType: message.FetchTypeRelativeJoining,
-		Joining: &message.JoiningFetch{
-			JoiningRequestID: subscribeID,
-			JoiningStart:     0,
-		},
-		Parameters: message.Parameters{
-			// Level with live video: it is the same pictures and they are needed
-			// first. See the priority constants for how much that is worth on
-			// either transport available here.
-			message.SubscriberPriorityParam(videoPriority),
-			// The base layer alone — see the doc comment. One contiguous range,
-			// well inside any sane MAX_FILTER_RANGES; a relay advertising zero
-			// prohibits Range Filters outright and refuses the FETCH, which is
-			// handled below as any other refusal.
-			message.RangeFilterParam(&message.RangeFilter{
-				Type:   message.ParamSubgroupFilter,
-				Ranges: []message.Range{{Start: baseSubgroup, End: baseSubgroup}},
-			}),
-		},
-	}
-	fetch, err := r.room.sess.Fetch(r.ctx, fetchMsg)
-	if err != nil {
-		// Degraded, not fatal: without it the tile stays blank until the next
-		// keyframe, which is what it did before this existed.
-		r.log.Debug("video backfill FETCH refused", "handle", track.handle, "err", err)
-		finish()
-		return
-	}
-
-	// Both sides under the lock, because a track dropped while its backfill was
-	// still being set up would otherwise leave the FETCH open, still delivering
-	// a whole group to a handle the frontend has been told to retire.
-	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		fetch.Close()
-		finish()
-		return
-	}
-	track.fetch = fetch
-	r.mu.Unlock()
-
-	r.room.router.HandleFetch(fetchMsg.RequestID, func(s *session.IncomingFetchStream) {
+	r.room.router.HandleFetch(subscribeID, func(s *session.IncomingFetchStream) {
 		defer finish()
+		// The deadline covered the wait for the stream, not the reading of it:
+		// once objects are arriving, cutting the group off part-way would hand
+		// the decoder a truncated reference chain, which is worse than the wait.
+		timer.Stop()
+
+		// Recorded under the lock, because a track dropped while its backfill
+		// was still arriving would otherwise keep delivering a whole group to a
+		// handle the frontend has been told to retire.
+		r.mu.Lock()
+		gone := r.closed || track.dropped
+		if !gone {
+			track.fill = s
+		}
+		r.mu.Unlock()
+		if gone {
+			s.Cancel(moqt.StreamResetCancelled)
+			return
+		}
 		r.readMediaFetch(s, track, counter)
 	})
 }
@@ -1262,7 +1311,7 @@ func (r *remote) backfillGroup(
 // path does — through the group's reassembler and the track's group orderer, so
 // there is one ordering to reason about and not two.
 //
-// The reassembler is a pass-through here and that is by construction: the FETCH
+// The reassembler is a pass-through here and that is by construction: the fill
 // is filtered to the base layer, a base-layer object is emitted on arrival, and
 // nothing ever waits. See reorder.go.
 func (r *remote) readMediaFetch(
@@ -1282,8 +1331,8 @@ func (r *remote) readMediaFetch(
 			}
 			return
 		}
-		// §11.4.4.2 absence markers carry no payload.
-		if obj.EndOfNonExistentRange || obj.EndOfUnknownRange {
+		// §11.4.4.2 end-of-range markers carry no payload.
+		if obj.IsEndOfRange() {
 			continue
 		}
 
@@ -1324,7 +1373,7 @@ func (r *remote) readMediaFetch(
 // becomes a bitrate-and-loss trade decided on its own merits rather than the
 // thing a blank tile is measured in.
 //
-// §10.2.13 NEW_GROUP_REQUEST, carried on a REQUEST_UPDATE rather than on the
+// §10.2.19 NEW_GROUP_REQUEST, carried on a REQUEST_UPDATE rather than on the
 // SUBSCRIBE itself. A relay only forwards the SUBSCRIBE-borne form upstream
 // when the SUBSCRIBE makes it open a *new* upstream subscription, and in this
 // topology it never does: every participant PUBLISHes to the relay, so the
@@ -1342,7 +1391,7 @@ func (r *remote) readMediaFetch(
 // remain. That is exactly the behaviour before this existed.
 func (r *remote) requestNewGroup(track *remoteTrack) {
 	// The value is the group being asked for: one past the largest known, or
-	// zero for "no group information", which §10.2.13 defines as always
+	// zero for "no group information", which §10.2.19 defines as always
 	// forwardable. Asking for a group that already exists is not forwarded, so
 	// the +1 is what makes the request mean anything.
 	var want uint64
@@ -1368,10 +1417,13 @@ func (r *remote) dropTrack(slot **remoteTrack) {
 	r.mu.Lock()
 	track := *slot
 	*slot = nil
-	var fetch *session.FetchRequest
+	var fill *session.IncomingFetchStream
 	if track != nil {
-		fetch = track.fetch
-		track.fetch = nil
+		// Marked before the lock is dropped, so a fill still on its way finds
+		// the track retired and cancels itself rather than recording on it.
+		track.dropped = true
+		fill = track.fill
+		track.fill = nil
 	}
 	r.mu.Unlock()
 	if track == nil {
@@ -1386,8 +1438,8 @@ func (r *remote) dropTrack(slot **remoteTrack) {
 	// Ahead of the subscription, because a backfill still draining would
 	// otherwise keep delivering a whole group to a handle the frontend has just
 	// been told to retire.
-	if fetch != nil {
-		fetch.Close()
+	if fill != nil {
+		fill.Cancel(moqt.StreamResetCancelled)
 	}
 	track.sub.Close()
 	r.room.counters.Forget(track.label)
@@ -1869,10 +1921,10 @@ func (r *remote) close() {
 	// replacing catalogSub concurrently, and Close is not something to hold a
 	// mutex across.
 	r.mu.Lock()
-	fetch, sub := r.catalogFetch, r.catalogSub
+	fill, sub := r.catalogFill, r.catalogSub
 	r.mu.Unlock()
-	if fetch != nil {
-		fetch.Close()
+	if fill != nil {
+		fill.Cancel(moqt.StreamResetCancelled)
 	}
 	if sub != nil {
 		sub.Close()

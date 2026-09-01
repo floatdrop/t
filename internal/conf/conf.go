@@ -34,9 +34,9 @@
 // the emission index each object carries. See reorder.go.
 //
 // A subscriber joining mid-group does not wait for the next keyframe. It
-// backfills the group in progress with a Joining FETCH narrowed to the
+// backfills the group in progress with a fill fetch stream narrowed to the
 // base layer, and asks the publisher for a fresh group besides — see
-// backfillGroup and requestNewGroup in remote.go. The keyframe interval
+// awaitBackfill and requestNewGroup in remote.go. The keyframe interval
 // is therefore not the join latency, which is what it used to be.
 //
 // Audio has no keyframes, so it uses a fixed cadence instead — a new
@@ -150,7 +150,7 @@ type Config struct {
 	// See [LookupCongestionController].
 	Congestion CongestionController
 	// OnKeyFrameRequest, when non-nil, is called when a subscriber asks this
-	// participant to start a new group (§10.2.13 NEW_GROUP_REQUEST) on the
+	// participant to start a new group (§10.2.19 NEW_GROUP_REQUEST) on the
 	// video track — which for video means a keyframe, since a group opens on
 	// one. It is how a joining peer stops waiting out the local encoder's own
 	// keyframe schedule.

@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 A Wails v3 desktop teleconference client. Media travels over Media over QUIC
-(moq-go, draft-19) with no signalling server and no SFU: peers find each other
+(moq-go, draft-20) with no signalling server and no SFU: peers find each other
 through MOQT namespace discovery on a relay and each publishes its own media.
 `docs/README.md` is unusually complete — it explains the *why* behind most
 design decisions here (presentation, clock tracking, reconnection, invite links,
@@ -51,7 +51,7 @@ cd frontend && npm test                                      # vitest, policy mo
 ```
 
 A relay is needed to run anything end to end:
-`go run github.com/floatdrop/moq-go/cmd/relay@draft-19` (self-signed cert on
+`go run github.com/floatdrop/moq-go/cmd/relay@draft-20` (self-signed cert on
 `:4433`). Launch flags prefill the welcome form, which is
 how two instances get started against it without clicking through twice:
 

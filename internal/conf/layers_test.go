@@ -430,7 +430,7 @@ func TestABottleneckCostsTheEnhancementLayerFirst(t *testing.T) {
 // depends on, and the one that is invisible until it is wrong.
 //
 // A Location is ordered by (Group, Object), so the Largest Object of a group is
-// whichever layer holds the top object-ID range — and §5.1.2's largest-object
+// whichever layer holds the top object-ID range — and §5.1.2's Next Object
 // filter starts a subscription *after* the Largest Object. Put the base layer
 // at the bottom, as this used to, and the filter withholds every base object of
 // the group in progress while forwarding the enhancement objects above them:
@@ -452,7 +452,7 @@ func TestTheBaseLayerOwnsTheHighestObjectIDs(t *testing.T) {
 			if enhancement >= base {
 				t.Fatalf("layer %d object %d has ID %d, at or above the base layer's %d: "+
 					"the largest object in a group would then be an enhancement one, and a "+
-					"largest-object subscription would withhold the whole base layer",
+					"Next Object subscription would withhold the whole base layer",
 					layer, n, enhancement, base)
 			}
 		}

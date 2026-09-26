@@ -6,8 +6,8 @@ github.com/dunglas/httpsfv v1.1.1 h1:HoSs101zIE9I23DlqlmljJ/OIi7ILwrH347pXhRZdxI
 github.com/dunglas/httpsfv v1.1.1/go.mod h1:zID2mqw9mFsnt7YC3vYQ9/cjq30q41W+1AnDwH8TiMg=
 github.com/floatdrop/moq-go v0.0.0-20260926115350-dbe571e78950 h1:xu1nekQxWEjzWMN4gSktzWCjNS7VBUqZ0qddPazaqzU=
 github.com/floatdrop/moq-go v0.0.0-20260926115350-dbe571e78950/go.mod h1:mG1SNh//xlEB2Uiw1S3/d5AAoicYVeK+pyEyxsmpfk8=
-github.com/floatdrop/quic-go v0.0.0-20260831103541-20793e596225 h1:AcxY4UI7RsqaNBfSRR1qU4PBxYwtZ1xHvS5xj8lBSLs=
-github.com/floatdrop/quic-go v0.0.0-20260831103541-20793e596225/go.mod h1:RAro2j2yN9a9EiPACLHT9IB2NXCvGQmmo/alT0yYI0w=
+github.com/floatdrop/quic-go v0.0.0-20260926120704-1a1dca264af0 h1:wDWt52JsZxsu4lbZABPMTxEYnEGXZ96SYtrpsGNd7zc=
+github.com/floatdrop/quic-go v0.0.0-20260926120704-1a1dca264af0/go.mod h1:RAro2j2yN9a9EiPACLHT9IB2NXCvGQmmo/alT0yYI0w=
 github.com/go-json-experiment/json v0.0.0-20251027170946-4849db3c2f7e h1:Lf/gRkoycfOBPa42vU2bbgPurFong6zXeFtPoxholzU=
 github.com/go-json-experiment/json v0.0.0-20251027170946-4849db3c2f7e/go.mod h1:uNVvRXArCGbZ508SxYYTC5v1JWoz2voff5pm25jU1Ok=
 github.com/go-ole/go-ole v1.3.0 h1:Dt6ye7+vXGIKZ7Xtk4s6/xVdGDQynvom7xCFEdWr6uE=

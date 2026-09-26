@@ -20,7 +20,7 @@ import "log/slog"
 // page a camera or microphone, and denies capture outright when the
 // delegate does not implement the request method. Wails answers that
 // request on Linux (WebKitGTK) and, by a different route, on Windows
-// (WebView2); its macOS delegate is silent, still as of v3.0.0-beta.16, so
+// (WebView2); its macOS delegate is silent, still as of v3.0.0-beta.26, so
 // without this every getUserMedia call in the app fails with
 // NotAllowedError before macOS is ever consulted. The window's
 // application.Permissions option does not reach macOS either, for the same

@@ -6,7 +6,7 @@ require (
 	github.com/coder/websocket v1.8.15
 	github.com/floatdrop/moq-go v0.0.0-20260926115350-dbe571e78950
 	github.com/lmittmann/tint v1.2.0
-	github.com/quic-go/quic-go v0.62.0
+	github.com/quic-go/quic-go v0.63.0
 	github.com/quic-go/webtransport-go v0.13.0
 	github.com/wailsapp/wails/v3 v3.0.0-beta.26
 )
@@ -26,4 +26,4 @@ require (
 	golang.org/x/text v0.40.0 // indirect
 )
 
-replace github.com/quic-go/quic-go => github.com/floatdrop/quic-go v0.0.0-20260831103541-20793e596225
+replace github.com/quic-go/quic-go => github.com/floatdrop/quic-go v0.0.0-20260926120704-1a1dca264af0

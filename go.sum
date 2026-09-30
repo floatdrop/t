@@ -4,8 +4,8 @@ github.com/coder/websocket v1.8.15 h1:6B2JPeOGlpff2Uz6vOEH1Vzpi0iUz20A+lPVhPHtNU
 github.com/coder/websocket v1.8.15/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
 github.com/dunglas/httpsfv v1.1.1 h1:HoSs101zIE9I23DlqlmljJ/OIi7ILwrH347pXhRZdxI=
 github.com/dunglas/httpsfv v1.1.1/go.mod h1:zID2mqw9mFsnt7YC3vYQ9/cjq30q41W+1AnDwH8TiMg=
-github.com/floatdrop/moq-go v0.0.0-20260926115350-dbe571e78950 h1:xu1nekQxWEjzWMN4gSktzWCjNS7VBUqZ0qddPazaqzU=
-github.com/floatdrop/moq-go v0.0.0-20260926115350-dbe571e78950/go.mod h1:mG1SNh//xlEB2Uiw1S3/d5AAoicYVeK+pyEyxsmpfk8=
+github.com/floatdrop/moq-go v0.0.0-20260929143613-9fc59f9c82fc h1:KgTat2BN8kp9anJUtrNA/tFtHG26mJVdIT6siYYok04=
+github.com/floatdrop/moq-go v0.0.0-20260929143613-9fc59f9c82fc/go.mod h1:RSmDXykKI1mZgAOSq7Wlr5aJlT8p3P1B5L9apWVkhuI=
 github.com/floatdrop/quic-go v0.0.0-20260926120704-1a1dca264af0 h1:wDWt52JsZxsu4lbZABPMTxEYnEGXZ96SYtrpsGNd7zc=
 github.com/floatdrop/quic-go v0.0.0-20260926120704-1a1dca264af0/go.mod h1:RAro2j2yN9a9EiPACLHT9IB2NXCvGQmmo/alT0yYI0w=
 github.com/go-json-experiment/json v0.0.0-20251027170946-4849db3c2f7e h1:Lf/gRkoycfOBPa42vU2bbgPurFong6zXeFtPoxholzU=

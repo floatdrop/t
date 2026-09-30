@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	github.com/coder/websocket v1.8.15
-	github.com/floatdrop/moq-go v0.0.0-20260926115350-dbe571e78950
+	github.com/floatdrop/moq-go v0.0.0-20260929143613-9fc59f9c82fc
 	github.com/lmittmann/tint v1.2.0
 	github.com/quic-go/quic-go v0.63.0
 	github.com/quic-go/webtransport-go v0.13.0

@@ -311,6 +311,9 @@ export interface Endpoint {
   version?: string;
   /** The operating system it runs on, for our own row in the roster. */
   os?: string;
+  /** Overrides the built-in keyframe interval when set — a measurement
+   * instrument, from the -keyframe-interval launch flag. */
+  keyFrameIntervalSec?: number;
 }
 
 /**

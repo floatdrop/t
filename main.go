@@ -75,7 +75,19 @@ func main() {
 	congestionFlag := flag.String("congestion", "",
 		"QUIC congestion controller: "+strings.Join(conf.CongestionControllerNames(), ", ")+
 			" (default: the transport's, which is bbr)")
+	// Measurement instruments for choosing the keyframe interval: record every
+	// local video frame, and override the interval without a rebuild.
+	frameLogFlag := flag.String("framelog", "", "write one CSV row per locally encoded video frame to this file")
+	keyFrameIntervalFlag := flag.Duration("keyframe-interval", 0,
+		"seconds between scheduled keyframes, overriding the built-in interval (e.g. 60s)")
 	flag.Parse()
+
+	// Under a frame or negative would put a keyframe on every frame, and the
+	// run would measure something else without saying so.
+	if *keyFrameIntervalFlag != 0 && *keyFrameIntervalFlag < 100*time.Millisecond {
+		log.Fatalf("-keyframe-interval %s: want at least 100ms, or 0 for the built-in interval",
+			*keyFrameIntervalFlag)
+	}
 
 	// Resolved before anything is dialled, so a typo fails at startup rather
 	// than on the first join.
@@ -104,6 +116,15 @@ func main() {
 
 	backend := app.New(logger, sink, appVersion)
 	backend.SetCongestion(congestion)
+	if *frameLogFlag != "" {
+		f, err := os.Create(*frameLogFlag)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer f.Close()
+		backend.SetFrameLog(f)
+		logger.Info("recording local video frames", "path", *frameLogFlag)
+	}
 	server, err := bridge.NewServer(logger, backend)
 	if err != nil {
 		log.Fatal(err)
@@ -129,6 +150,7 @@ func main() {
 	// earliest place the welcome screen can learn what build it is part of.
 	endpoint.Version = appVersion
 	endpoint.OS = conf.PlatformName()
+	endpoint.KeyFrameIntervalSec = keyFrameIntervalFlag.Seconds()
 	logger.Info("bridge listening", "url", endpoint.URL)
 
 	// grantWebViewMediaCapture must run before any window exists: it

@@ -1046,7 +1046,8 @@ export class Capture {
     this.#declare({ type: 'track', track: this.#videoDeclared });
 
 
-    const keyEvery = Math.max(1, Math.round(framerate * KEYFRAME_INTERVAL_SEC));
+    const keyEvery = Math.max(1, Math.round(
+      framerate * (bridge.keyFrameIntervalSec || KEYFRAME_INTERVAL_SEC)));
 
     /** Least time between encoded frames — see FRAME_GAP_TOLERANCE. */
     const minFrameGapMs = (1000 / framerate) * FRAME_GAP_TOLERANCE;

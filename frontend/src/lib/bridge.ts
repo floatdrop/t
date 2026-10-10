@@ -47,6 +47,8 @@ export class Bridge {
    */
   version = '';
   os = '';
+  /** Keyframe interval override from the endpoint descriptor; 0 for none. */
+  keyFrameIntervalSec = 0;
 
   /** Opens the connection and keeps it open until close(). */
   async start(): Promise<void> {
@@ -125,6 +127,7 @@ export class Bridge {
         // a room.
         this.version = this.#endpoint.version ?? '';
         this.os = this.#endpoint.os ?? '';
+        this.keyFrameIntervalSec = this.#endpoint.keyFrameIntervalSec ?? 0;
       }
       const url = `${this.#endpoint.url}?token=${encodeURIComponent(this.#endpoint.token)}`;
       const ws = new WebSocket(url);

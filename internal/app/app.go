@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -80,6 +81,9 @@ type App struct {
 	// with the room they belong to; nil when there is none.
 	videoPump *publishPump
 	audioPump *publishPump
+	// frames records local video frames when -framelog asks for it; nil
+	// otherwise, and every method on it is a no-op on nil.
+	frames *frameLog
 }
 
 // How many frames may wait to be published before the oldest is discarded.
@@ -143,6 +147,18 @@ func New(log *slog.Logger, sink *telemetry.LogSink, version string) *App {
 		counters: telemetry.NewRegistry(),
 		declared: map[string]*bridge.TrackConfig{},
 	}
+}
+
+// SetFrameLog starts recording every locally encoded video frame to w, one CSV
+// row each — see frameLog. For measurement runs only; call before the frontend
+// connects.
+func (a *App) SetFrameLog(w io.Writer) {
+	a.frames = newFrameLog(w)
+	go func() {
+		for range time.Tick(time.Second) {
+			a.frames.flush()
+		}
+	}()
 }
 
 // SetOpenURL supplies the means of opening a link outside the WebView.
@@ -221,6 +237,7 @@ func (a *App) HandleControl(ctx context.Context, msg *bridge.ClientMessage) erro
 // the caller is the bridge's read goroutine, and stalling it stops every kind
 // being read, not just this one.
 func (a *App) HandleMedia(_ context.Context, f *bridge.MediaFrame) error {
+	a.frames.frame(f)
 	a.mu.Lock()
 	pump := a.videoPump
 	if f.Kind == bridge.KindAudio {
@@ -406,6 +423,7 @@ func (a *App) requestKeyFrame() {
 	a.lastKeyFrameAsk = time.Now()
 	a.mu.Unlock()
 
+	a.frames.keyFrameRequest()
 	a.log.Debug("asking for a keyframe to reopen the video group")
 	a.server.SendControl(&bridge.ServerMessage{Type: bridge.MsgRequestKeyFrame})
 }
@@ -939,6 +957,8 @@ func (a *App) declareTrack(cfg *bridge.TrackConfig) error {
 		}
 	}
 
+	a.frames.declare(cfg)
+
 	a.mu.Lock()
 	room := a.room
 	if room != nil {
@@ -1116,4 +1136,5 @@ func (a *App) openLink(url string) error {
 func (a *App) Shutdown() {
 	a.sink.SetEmit(nil)
 	a.leave()
+	a.frames.flush()
 }

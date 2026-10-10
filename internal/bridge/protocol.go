@@ -421,6 +421,10 @@ type Endpoint struct {
 	// table where the one machine we know for certain is the blank row would
 	// be a strange thing to ship.
 	OS string `json:"os,omitempty"`
+	// KeyFrameIntervalSec overrides the frontend's built-in keyframe interval
+	// when non-zero. Set by the -keyframe-interval launch flag, for measuring
+	// what the interval costs without rebuilding the frontend.
+	KeyFrameIntervalSec float64 `json:"keyFrameIntervalSec,omitempty"`
 }
 
 func (e Endpoint) JSON() []byte {

@@ -51,6 +51,19 @@ const LIMITER = {
 const DECODER_REBUILD_INTERVAL_MS = 1000;
 
 /**
+ * Least time between asking a remote track's publisher for a keyframe while
+ * this decoder discards deltas waiting for one.
+ *
+ * Asking is what keeps a rebuilt decoder from waiting out the publisher's
+ * keyframe interval: the backend turns it into a NEW_GROUP_REQUEST (§10.2.19).
+ * Every request costs every subscriber of that publisher a keyframe, so it is
+ * paced — and once a second is also the retry, should a request have gone
+ * nowhere. A new sink counts as having just asked, because subscribing already
+ * did; a rebuilt one asks on its first delta.
+ */
+const KEYFRAME_ASK_INTERVAL_MS = 1000;
+
+/**
  * Hard cap on the presentation queue, as a backstop rather than a working
  * limit: the sync arithmetic keeps it a handful of frames deep. It matters when
  * the render loop is not running at all — requestAnimationFrame stops while the
@@ -193,6 +206,9 @@ interface VideoSink {
   pending: VideoFrame | null;
   /** H.264 cannot start on a delta frame; gate until the first keyframe. */
   sawKeyFrame: boolean;
+  /** When the publisher was last asked for a keyframe on this sink's behalf —
+   * see KEYFRAME_ASK_INTERVAL_MS. */
+  keyAskedMs: number;
   decoded: number;
   dropped: number;
   /** When the canvas was last resized, and how often — see the interval. */
@@ -361,6 +377,10 @@ export class Playback {
       err: String(err),
     });
 
+    // The decoder that replaces it starts on a keyframe, so ask for one on
+    // the first delta it turns away rather than a pacing interval later.
+    sink.keyAskedMs = Number.NEGATIVE_INFINITY;
+
     // Queued frames belong to the decoder that just died.
     for (const frame of sink.queue) frame.close();
     sink.queue.length = 0;
@@ -387,6 +407,7 @@ export class Playback {
       painter: null,
       pending: null,
       sawKeyFrame: false,
+      keyAskedMs: performance.now(),
       decoded: 0,
       dropped: 0,
       lastResizeMs: 0,
@@ -677,6 +698,20 @@ export class Playback {
     }
   }
 
+  /**
+   * Asks the publisher for a keyframe for a sink that is discarding deltas
+   * until one arrives, at most once per KEYFRAME_ASK_INTERVAL_MS.
+   */
+  #askForKeyFrame(sink: VideoSink): void {
+    const now = performance.now();
+    if (now - sink.keyAskedMs < KEYFRAME_ASK_INTERVAL_MS) return;
+    sink.keyAskedMs = now;
+    bridge.send({
+      type: 'keyFrameNeeded',
+      keyFrameNeeded: { handle: sink.track.handle, participant: sink.track.participant },
+    });
+  }
+
   /** Feeds one inbound frame to its decoder. */
   push(frame: MediaFrame): void {
     const sink = this.#sinks.get(frame.handle);
@@ -687,6 +722,7 @@ export class Playback {
       if (!video.sawKeyFrame) {
         if (!frame.keyFrame) {
           video.dropped++;
+          this.#askForKeyFrame(video);
           return;
         }
         video.sawKeyFrame = true;

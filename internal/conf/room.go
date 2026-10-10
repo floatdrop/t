@@ -310,6 +310,35 @@ func (r *Room) WriteFrame(f *bridge.MediaFrame) error {
 	return r.pub.writeFrame(f)
 }
 
+// RequestKeyFrame asks the publisher of the remote video track behind handle
+// to start a new group (§10.2.19), which for video is a keyframe. For a
+// receiver that has lost the reference chain somewhere this package cannot
+// see — the frontend's decoder, or the bridge on the way to it — and would
+// otherwise wait for the publisher's next scheduled keyframe. Never blocks;
+// an unknown or retired handle is ignored.
+func (r *Room) RequestKeyFrame(handle uint32, reason string) {
+	r.mu.Lock()
+	remotes := make([]*remote, 0, len(r.remotes))
+	for _, rem := range r.remotes {
+		if rem != nil {
+			remotes = append(remotes, rem)
+		}
+	}
+	r.mu.Unlock()
+	for _, rem := range remotes {
+		if rem.requestKeyFrame(handle, reason) {
+			return
+		}
+	}
+}
+
+// Reasons a caller outside this package asks for a keyframe, as RequestKeyFrame
+// logs them.
+const (
+	KeyFrameForDecoder    = newGroupForDecoder
+	KeyFrameForBridgeDrop = newGroupForBridgeDrop
+)
+
 // SetVideoInterest records which participants' video is worth receiving and
 // brings every subscription in line with it.
 //

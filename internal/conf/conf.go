@@ -37,7 +37,11 @@
 // backfills the group in progress with a fill fetch stream narrowed to the
 // base layer, and asks the publisher for a fresh group besides — see
 // awaitBackfill and requestNewGroup in remote.go. The keyframe interval
-// is therefore not the join latency, which is what it used to be.
+// is therefore not the join latency, which is what it used to be. Nor is it
+// how long a loss lasts: a receiver whose reference chain breaks later —
+// the base layer cut short by the relay, a decoder rebuilt, frames dropped
+// on the way to the WebView — asks for a new group the same way (see
+// reportMediaEnd and Room.RequestKeyFrame).
 //
 // Audio has no keyframes, so it uses a fixed cadence instead — a new
 // group every audioGroupObjects frames. Each group's first object carries

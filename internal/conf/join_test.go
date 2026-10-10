@@ -138,3 +138,91 @@ func TestSubscribingAsksThePublisherForAKeyFrame(t *testing.T) {
 			"the keyframe interval is the join latency again")
 	}
 }
+
+// TestAReceiverCanAskForAKeyFrameLater covers the request made after joining:
+// a receiver that lost its reference chain somewhere this package cannot see —
+// the frontend's decoder, the bridge on the way to it — asks the publisher for
+// a new group by the track's handle.
+//
+// What it pins is the value. §10.2.19 forwards a request only above the
+// relay's largest group, and only when no equal-or-greater one is outstanding,
+// so asking with the value the subscription asked with when it joined would
+// stop at the relay. The request has to be one past the newest group the
+// receiver has actually seen.
+func TestAReceiverCanAskForAKeyFrameLater(t *testing.T) {
+	relayServer := startRelay(t)
+	addr := relayServer.Addr()
+
+	asked := make(chan struct{}, 4)
+	alice, _ := joinRoomWithKeyFrameHook(t, addr, "newgroup-later", "alice", func() {
+		asked <- struct{}{}
+	})
+	declareBothTracks(t, alice)
+	if err := alice.WriteFrame(videoFrame(0, true, 900)); err != nil {
+		t.Fatalf("write the keyframe: %v", err)
+	}
+
+	bob, bobRec := joinRoom(t, addr, "newgroup-later", "bob")
+	var handle uint32
+	waitFor(t, "bob to subscribe to alice's video", subscribeWait, func() bool {
+		_, tracks, _, _ := bobRec.snapshot()
+		for _, tr := range tracks {
+			if tr.Config.Kind == "video" {
+				handle = tr.Handle
+				return true
+			}
+		}
+		return false
+	})
+
+	// The subscribe asks once; answer it the way a publisher does, with a new
+	// group, which is also what clears the relay's outstanding request.
+	select {
+	case <-asked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("subscribing did not ask the publisher for a new group")
+	}
+	if err := alice.WriteFrame(videoFrame(40_000, true, 900)); err != nil {
+		t.Fatalf("write the answering keyframe: %v", err)
+	}
+	waitFor(t, "bob to receive the answering keyframe", subscribeWait, func() bool {
+		for _, f := range videoFrames(bobRec) {
+			if f.KeyFrame && f.Timestamp == 40_000 {
+				return true
+			}
+		}
+		return false
+	})
+
+	bob.RequestKeyFrame(handle, KeyFrameForDecoder)
+	select {
+	case <-asked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a receiver's later request never reached the publisher — a " +
+			"rebuilt decoder waits for the publisher's next scheduled keyframe")
+	}
+}
+
+// TestNextGroupIsOnePastTheNewest pins the arithmetic the request values come
+// from, including group zero, which is a real group and must not read as
+// "nothing seen yet".
+func TestNextGroupIsOnePastTheNewest(t *testing.T) {
+	var tr remoteTrack
+	if got := tr.nextGroup(); got != 0 {
+		t.Errorf("nothing seen: nextGroup = %d, want 0 (no group information)", got)
+	}
+	tr.noteGroup(0)
+	if got := tr.nextGroup(); got != 1 {
+		t.Errorf("group 0 seen: nextGroup = %d, want 1", got)
+	}
+	tr.noteGroup(5)
+	tr.noteGroup(3) // a straggler from an older group does not lower it
+	if got := tr.nextGroup(); got != 6 {
+		t.Errorf("groups 0, 5, 3 seen: nextGroup = %d, want 6", got)
+	}
+
+	backfilled := remoteTrack{backfilled: 9, hasBackfill: true}
+	if got := backfilled.nextGroup(); got != 10 {
+		t.Errorf("backfilling group 9: nextGroup = %d, want 10", got)
+	}
+}

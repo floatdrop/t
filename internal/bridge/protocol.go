@@ -122,6 +122,9 @@ type ClientMessage struct {
 	OpenURL string `json:"openUrl,omitempty"`
 	// Interest is which remote video is worth receiving. See MsgInterest.
 	Interest *Interest `json:"interest,omitempty"`
+	// KeyFrameNeeded names the remote track whose decoder is waiting for a
+	// keyframe. See MsgKeyFrameNeeded.
+	KeyFrameNeeded *RemoteTrackID `json:"keyFrameNeeded,omitempty"`
 }
 
 // Interest is the frontend's account of which remote participants' video it
@@ -159,6 +162,13 @@ const (
 	// MsgInterest carries which remote participants' video is worth
 	// receiving — the tiles on screen, plus a margin for scrolling.
 	MsgInterest = "interest"
+
+	// MsgKeyFrameNeeded says a remote video track's decoder is discarding
+	// delta frames while it waits for a keyframe — after a decoder rebuild,
+	// most often. The backend asks that track's publisher for a new group
+	// (§10.2.19) rather than leaving the tile frozen until the publisher's
+	// next scheduled keyframe. Carries the track in KeyFrameNeeded.
+	MsgKeyFrameNeeded = "keyFrameNeeded"
 )
 
 // ClientReport is something the frontend wants in the shared log: a

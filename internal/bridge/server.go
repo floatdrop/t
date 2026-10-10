@@ -45,18 +45,12 @@ const maxFrameBytes = 4 << 20
 // a frame this old is not worth sending, because the frontend paints the newest
 // of what it is given and throws the rest away.
 const (
-	// Two keyframe intervals, so what survives contains a keyframe and a
-	// frontend coming back from a stall resumes on one instead of decoding
-	// deltas against references it never received.
-	//
-	// Only where the slot backstop below is not the thing that decides, which is
-	// the part worth knowing: the slots are shared across every participant, so
-	// at four people at 30 fps each gets about 128 of the 512 — four seconds,
-	// which is under one five-second GOP, and the keyframe can be evicted after
-	// all. The guarantee holds to three participants and degrades from there
-	// into "recover at the next keyframe", which is what it was before any of
-	// this existed. Raising the depth is the fix if it ever matters; it costs
-	// memory in the calls that never stall, so it has not been paid yet.
+	// Two keyframe intervals, chosen when this was what made a frontend coming
+	// back from a stall resume on a keyframe: what survived the bound contained
+	// one. It no longer has to — a track that loses any frame here is held back
+	// until a keyframe, and its publisher is asked for one (see
+	// conn.discarded) — so the number now only bounds how stale a frame may be
+	// and still be sent. Lowering it is a separate decision from that fix.
 	videoMaxAge = 10 * time.Second
 	// Under the player's own 250 ms ceiling, so the bridge gives up on stale
 	// sound before the ring buffer has to trim it. Both are audible; this one
@@ -116,6 +110,20 @@ type Server struct {
 
 	mu   sync.Mutex
 	conn *conn
+	// onVideoGap is told when this side starts discarding a remote video
+	// track's frames — see conn.discarded. Nil until SetOnVideoGap.
+	onVideoGap func(handle uint32)
+}
+
+// SetOnVideoGap supplies what to do when the bridge has had to discard frames
+// of a remote video track: ask that track's publisher for a keyframe, so the
+// gap ends on the next group rather than the next scheduled one. Called with
+// no lock held, from whichever goroutine discarded the frame; it must not
+// block. Takes effect from the next frontend connection.
+func (s *Server) SetOnVideoGap(fn func(handle uint32)) {
+	s.mu.Lock()
+	s.onVideoGap = fn
+	s.mu.Unlock()
 }
 
 type conn struct {
@@ -132,13 +140,40 @@ type conn struct {
 
 	droppedVideo atomic.Uint64
 	droppedAudio atomic.Uint64
+
+	// gapsMu guards gaps: the remote video handles whose base layer this
+	// connection has had to discard, and which therefore send nothing more
+	// until a keyframe. See discarded.
+	gapsMu     sync.Mutex
+	gaps       map[uint32]gapState
+	onVideoGap func(handle uint32)
 }
+
+// gapState is where a remote video track stands after losing a base-layer frame
+// in this connection's queue. A track with no entry has no gap.
+type gapState uint8
+
+const (
+	// gapHeld: frames of the track are refused on the way in, so they take no
+	// queue slot from tracks that are still healthy, until a keyframe comes.
+	gapHeld gapState = iota + 1
+	// gapKeyQueued: a keyframe is in the queue. Frames after it are queued
+	// again, and the writer still discards the frames ahead of it.
+	gapKeyQueued
+)
 
 // outbound is one queued frame plus the WebSocket opcode to send it
 // under, so the write loop never has to guess from the payload bytes.
 type outbound struct {
 	typ  websocket.MessageType
 	data []byte
+	// video, handle, key and layer describe a video frame, so a discarded one
+	// can be traced to its track, judged by whether anything references it, and
+	// the gap it leaves can end on a keyframe.
+	video  bool
+	handle uint32
+	key    bool
+	layer  uint8
 	// queued is when this went into a media queue, so the write loop can tell
 	// a frame worth sending from one the frontend would only throw away. Zero
 	// for control messages, which are never discarded for age or anything else.
@@ -220,6 +255,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
+	c.onVideoGap = s.onVideoGap
 	if old := s.conn; old != nil {
 		old.cancel()
 	}
@@ -279,6 +315,9 @@ func (s *Server) readLoop(ctx context.Context, c *conn) {
 
 func (c *conn) writeLoop(log *slog.Logger) {
 	write := func(msg outbound) bool {
+		if msg.video && !c.admitVideo(msg) {
+			return true
+		}
 		ctx, cancel := context.WithTimeout(c.ctx, writeTimeout)
 		err := c.ws.Write(ctx, msg.typ, msg.data)
 		cancel()
@@ -337,10 +376,10 @@ func (c *conn) nextReady(now time.Time) (outbound, bool) {
 		return msg, true
 	default:
 	}
-	if msg, ok := takeFresh(c.audio, &c.droppedAudio, audioMaxAge, now); ok {
+	if msg, ok := c.takeFresh(c.audio, &c.droppedAudio, audioMaxAge, now); ok {
 		return msg, true
 	}
-	if msg, ok := takeFresh(c.video, &c.droppedVideo, videoMaxAge, now); ok {
+	if msg, ok := c.takeFresh(c.video, &c.droppedVideo, videoMaxAge, now); ok {
 		return msg, true
 	}
 	return outbound{}, false
@@ -351,7 +390,7 @@ func (c *conn) nextReady(now time.Time) (outbound, bool) {
 // deliberate: how long a frame waited is only known once something is ready to
 // send it, and a queue that was filling while the frontend was not reading is
 // exactly the case this exists for.
-func takeFresh(
+func (c *conn) takeFresh(
 	q chan outbound,
 	dropped *atomic.Uint64,
 	maxAge time.Duration,
@@ -364,6 +403,7 @@ func takeFresh(
 				return msg, true
 			}
 			dropped.Add(1)
+			c.discarded(msg)
 		default:
 			return outbound{}, false
 		}
@@ -400,9 +440,9 @@ func (s *Server) SendError(detail string) {
 // after the resize had finished.
 //
 // Keeping the newest instead means the queue always holds the live edge. What
-// guarantees something decodable in it is the age bound rather than the depth:
-// video is discarded past two keyframe intervals, so whatever survives contains
-// a keyframe however many participants are sharing the queue.
+// keeps it decodable is that a track which lost a frame here sends nothing more
+// until its next keyframe, which its publisher is asked for — see
+// conn.discarded.
 //
 // Which queue is decided here, by kind, and it is the whole reason there are
 // two: a frame is only ever interchangeable with another of its own medium.
@@ -412,6 +452,10 @@ func (s *Server) SendMedia(f *MediaFrame) {
 		typ:    websocket.MessageBinary,
 		data:   AppendFrame(buf, f),
 		queued: time.Now(),
+		video:  f.Kind == KindVideo,
+		handle: f.Handle,
+		key:    f.KeyFrame,
+		layer:  f.TemporalLayer,
 	}
 
 	c := s.current()
@@ -420,6 +464,10 @@ func (s *Server) SendMedia(f *MediaFrame) {
 	}
 	if f.Kind == KindAudio {
 		enqueueMedia(c, c.audio, &c.droppedAudio, msg)
+		return
+	}
+	if !c.enterVideo(msg) {
+		c.droppedVideo.Add(1)
 		return
 	}
 	enqueueMedia(c, c.video, &c.droppedVideo, msg)
@@ -472,11 +520,97 @@ func enqueueMedia(c *conn, q chan outbound, dropped *atomic.Uint64, msg outbound
 		// another producer may have refilled the slot in between, which is why
 		// this loops rather than assuming one drop is enough.
 		select {
-		case <-q:
+		case old := <-q:
 			dropped.Add(1)
+			c.discarded(old)
 		default:
 		}
 	}
+}
+
+// discarded records that a frame was thrown away rather than sent.
+//
+// For a base-layer video frame that is not the end of it. Every frame after it
+// references it, directly or down the chain, and H.264 does not report a
+// missing reference: it decodes against whatever it has and draws the
+// difference as smeared macroblocks, until the next keyframe. Dropping the
+// oldest keeps the queue at the live edge, which is right, but on its own it
+// sent the frontend a run of frames it could only render wrongly.
+//
+// So the track is held: enterVideo and admitVideo keep its frames back until a
+// keyframe, which the publisher is asked for now rather than at its next
+// scheduled one. A cut and then a clean picture, against a smear — the same
+// choice the publish pump makes in the other direction (internal/app), and
+// reassembly on the receive side.
+//
+// An enhancement-layer frame is let go and nothing else: no frame references
+// one, which is what makes that layer the disposable one. Holding the track
+// for it would freeze a picture that decodes perfectly and cost every
+// subscriber of the publisher a keyframe, for one frame of frame rate.
+func (c *conn) discarded(msg outbound) {
+	if !msg.video || msg.layer != 0 {
+		return
+	}
+	c.gapsMu.Lock()
+	if c.gaps == nil {
+		c.gaps = map[uint32]gapState{}
+	}
+	ask := false
+	switch c.gaps[msg.handle] {
+	case 0:
+		// A new gap.
+		c.gaps[msg.handle] = gapHeld
+		ask = true
+	case gapKeyQueued:
+		// A frame from ahead of the queued keyframe needs nothing: the writer
+		// was going to discard it. Losing the keyframe itself is a new gap —
+		// the stall that opened the first one is still on — and nothing else
+		// would ask again: the frontend's decoder has seen a keyframe, so its
+		// own retry is not running.
+		if msg.key {
+			c.gaps[msg.handle] = gapHeld
+			ask = true
+		}
+	}
+	c.gapsMu.Unlock()
+	if ask && c.onVideoGap != nil {
+		c.onVideoGap(msg.handle)
+	}
+}
+
+// enterVideo reports whether a video frame may be queued at all. A held track's
+// frames are refused here, before they can take a slot — in a queue shared by
+// every remote track, a held track's deltas would otherwise push out the oldest
+// frames of tracks that were fine, opening gaps on them too. Its keyframe is
+// let in, and the frames behind it with it.
+func (c *conn) enterVideo(msg outbound) bool {
+	c.gapsMu.Lock()
+	defer c.gapsMu.Unlock()
+	if c.gaps[msg.handle] != gapHeld {
+		return true
+	}
+	if msg.key {
+		c.gaps[msg.handle] = gapKeyQueued
+		return true
+	}
+	return false
+}
+
+// admitVideo reports whether a queued video frame may be written, ending its
+// track's gap on the keyframe and discarding (and counting) anything ahead of
+// it — the frames queued between the one that was lost and the keyframe.
+func (c *conn) admitVideo(msg outbound) bool {
+	c.gapsMu.Lock()
+	defer c.gapsMu.Unlock()
+	if c.gaps[msg.handle] == 0 {
+		return true
+	}
+	if msg.key {
+		delete(c.gaps, msg.handle)
+		return true
+	}
+	c.droppedVideo.Add(1)
+	return false
 }
 
 func (s *Server) current() *conn {

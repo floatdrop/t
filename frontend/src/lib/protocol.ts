@@ -160,6 +160,9 @@ export type ClientMessage =
   // never gated on being visible, since someone speaking off-screen has to be
   // heard, and hearing them is what makes anyone scroll to them.
   | { type: 'interest'; interest: { video: string[] } }
+  // A remote video decoder is discarding deltas while it waits for a keyframe;
+  // the backend asks that track's publisher for a new group.
+  | { type: 'keyFrameNeeded'; keyFrameNeeded: RemoteTrackID }
   | { type: 'report'; report: ClientReport };
 
 /**

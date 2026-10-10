@@ -274,6 +274,28 @@ equal-or-greater request is outstanding, so a room joining at once costs the
 publisher one keyframe rather than one each. It needs the publisher to still be
 there and encoding.
 
+**Joining is not the only time to ask.** Anything that breaks the reference
+chain after the picture is up leaves the tile frozen or smeared until the next
+group, and without a request that is the publisher's next *scheduled* keyframe.
+Three places that notice a loss ask, with the same `REQUEST_UPDATE`:
+
+- **The relay cutting the base layer short.** A reset of the base-layer stream
+  of the group in progress — the commonest being the §8 delivery timeout, after
+  which moq-go sends that subscriber nothing more of the subgroup — for any
+  code but the overload verdicts, which rebuild the subscription and ask by
+  subscribing, and the session-level ones, which reconnect.
+- **The frontend's decoder.** A sink discarding deltas while it waits for a
+  keyframe — a decoder rebuilt after an error, most often — sends
+  `keyFrameNeeded`, at most once a second, which is also its retry.
+- **The bridge.** A video frame discarded on the way to the WebView holds that
+  track back until its next keyframe, rather than sending frames that can only
+  decode as smear, and asks for that keyframe as the gap opens.
+
+The value asked for is one past the newest group the receiver has seen. It has
+to be: the relay forwards only a request above its own largest group, so asking
+with what the subscription asked when it joined stops at the relay once a group
+has gone by.
+
 There was a backfill here once and it was removed, because it *raced* live video
 and lost by construction: every backfilled frame is older than every live one,
 so the first live object made the whole replay stale after a round trip and a
@@ -941,6 +963,13 @@ keyframe. Two other things reach the same request now — a write that finds no
 open group, and a remote subscriber's `NEW_GROUP_REQUEST` — so it is rate
 limited, and one place asks the encoder for all three.
 
+Rate limited by postponing, not by dropping. A relay forwards one
+`NEW_GROUP_REQUEST` and treats it as outstanding until the track's largest
+group advances, refusing every request at or below it meanwhile — so a request
+the publisher discarded for arriving inside the interval silenced every
+subscriber behind it until the scheduled keyframe. A request inside the interval
+now schedules one keyframe at its end, and the rest of a burst rides on it.
+
 `internal/conf` covers all of it — graceful loss, silent loss, a deliberate
 leave *not* looking like loss, GOAWAY surfacing while the session is still
 usable (rather than only when it closes), GOAWAY *not* firing for a relay that
@@ -1216,8 +1245,9 @@ path from a `MediaStreamTrack` to WebCodecs, so video frames are pulled off a
   honour and macOS ignores), but neither has been exercised in a real call.
 - A subscriber discards inbound video until the first keyframe. Joining mid-GOP
   no longer waits out the five-second interval for one — the group in progress
-  is backfilled and the publisher is asked for a fresh keyframe — but the frames
-  ahead of it are still discarded, and show up as `dropped` in the decoders
-  table. That is expected. What neither answer covers is a publisher that has
-  gone quiet and a relay whose cache has aged the group out: nothing can produce
-  a keyframe then, and the tile stays blank until the publisher sends one.
+  is backfilled and the publisher is asked for a fresh keyframe — and neither
+  does a decoder rebuilt mid-call, which asks again; but the frames ahead of the
+  keyframe are still discarded, and show up as `dropped` in the decoders table.
+  That is expected. What none of this covers is a publisher that has gone quiet
+  and a relay whose cache has aged the group out: nothing can produce a keyframe
+  then, and the tile stays blank until the publisher sends one.

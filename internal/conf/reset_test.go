@@ -124,3 +124,23 @@ func TestResetNameFallsBackToTheNumber(t *testing.T) {
 		t.Errorf("resetName = %q, want the numeric fallback", got)
 	}
 }
+
+// TestBaseLossResetsAreTheOnesAKeyFrameRepairs pins which resets of a video
+// base layer ask the publisher for a new group: those that leave the
+// subscription standing with the rest of its group lost. The overload verdicts
+// rebuild the subscription instead, and the session-level codes reconnect.
+func TestBaseLossResetsAreTheOnesAKeyFrameRepairs(t *testing.T) {
+	for code, want := range map[moqt.StreamResetCode]bool{
+		moqt.StreamResetDeliveryTimeout: true,
+		moqt.StreamResetInternalError:   true,
+		moqt.StreamResetCancelled:       true,
+		moqt.StreamResetTooFarBehind:    false,
+		moqt.StreamResetExcessiveLoad:   false,
+		moqt.StreamResetSessionClosed:   false,
+		moqt.StreamResetGoingAway:       false,
+	} {
+		if got := baseLossReset(code); got != want {
+			t.Errorf("baseLossReset(%s) = %v, want %v", resetName(code), got, want)
+		}
+	}
+}

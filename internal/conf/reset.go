@@ -68,6 +68,21 @@ func overloadReset(code moqt.StreamResetCode) bool {
 	return code == moqt.StreamResetTooFarBehind || code == moqt.StreamResetExcessiveLoad
 }
 
+// baseLossReset reports whether a reset of a video base-layer stream leaves the
+// subscription in place with the rest of its group lost — the case a request
+// for a new group repairs. The codes left out are the ones where the
+// subscription or the session is ending anyway, and a keyframe would go
+// nowhere: the overload verdicts, which rebuild the subscription (and ask for
+// a new group by subscribing), and the session-level ones, which reconnect.
+func baseLossReset(code moqt.StreamResetCode) bool {
+	switch code {
+	case moqt.StreamResetSessionClosed, moqt.StreamResetGoingAway,
+		moqt.StreamResetExpiredAuthToken, moqt.StreamResetMalformedTrack:
+		return false
+	}
+	return !overloadReset(code)
+}
+
 // resetName renders a §3.3.4 reset code for a log line. Codes this client has
 // no reading of are rendered numerically rather than guessed at.
 func resetName(code moqt.StreamResetCode) string {

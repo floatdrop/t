@@ -56,10 +56,15 @@ func audioFrame(ts uint64) *MediaFrame {
 func TestMediaQueueKeepsTheNewest(t *testing.T) {
 	s, c := stalledConn(t)
 
-	// One frame more than the queue can hold.
+	// One frame more than the queue can hold. Keyframes, because what this
+	// covers is the queue's policy: a discarded delta also holds its track back
+	// until a keyframe (see TestDiscardedVideoHoldsTheTrackUntilAKeyFrame), and
+	// a keyframe is what is let through that.
 	const overflow = 10
 	for i := range videoQueueDepth + overflow {
-		s.SendMedia(videoFrame(uint64(i)))
+		f := videoFrame(uint64(i))
+		f.KeyFrame = true
+		s.SendMedia(f)
 	}
 
 	if got, _ := s.DroppedFrames(); got != overflow {
@@ -321,5 +326,152 @@ func TestFreshMediaSurvives(t *testing.T) {
 	if video, audio := s.DroppedFrames(); video != 0 || audio != 0 {
 		t.Errorf("dropped video=%d audio=%d from a fresh queue, want none",
 			video, audio)
+	}
+}
+
+// TestDiscardedVideoHoldsTheTrackUntilAKeyFrame covers what a discarded video
+// frame leaves behind. Every later frame of that track references it down the
+// chain, so sending them hands the decoder a run it can only render as smear.
+// The track is held back until a keyframe instead, its publisher is asked for
+// one exactly once, and other tracks sharing the queue are not touched.
+func TestDiscardedVideoHoldsTheTrackUntilAKeyFrame(t *testing.T) {
+	s, c := stalledConn(t)
+	var asked []uint32
+	c.onVideoGap = func(handle uint32) { asked = append(asked, handle) }
+
+	const other = HandleRemoteBase + 7
+	otherFrame := func(ts uint64) *MediaFrame {
+		f := videoFrame(ts)
+		f.Handle = other
+		return f
+	}
+
+	// Fill the queue with the first track, then overflow it with more of the
+	// same: the oldest are discarded, which opens the gap.
+	for i := range videoQueueDepth + 3 {
+		s.SendMedia(videoFrame(uint64(i)))
+	}
+	// After the gap: deltas of the gapped track, the other track's frames,
+	// then the keyframe that ends the gap and a delta after it. Room is made
+	// by discarding more of the first track's oldest, which is the same gap.
+	s.SendMedia(otherFrame(1000))
+	key := videoFrame(2000)
+	key.KeyFrame = true
+	s.SendMedia(key)
+	s.SendMedia(videoFrame(2001))
+
+	if len(asked) != 1 || asked[0] != HandleRemoteBase {
+		t.Fatalf("asked for keyframes on %v, want once on %d", asked, HandleRemoteBase)
+	}
+
+	var sent []uint64
+	for len(c.video) > 0 {
+		msg := <-c.video
+		if !c.admitVideo(msg) {
+			continue
+		}
+		f, err := ParseFrame(msg.data)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		sent = append(sent, f.Timestamp)
+	}
+	want := []uint64{1000, 2000, 2001}
+	if len(sent) != len(want) {
+		t.Fatalf("sent %v, want %v — frames of a track that lost one reached "+
+			"the decoder before its keyframe", sent, want)
+	}
+	for i := range want {
+		if sent[i] != want[i] {
+			t.Fatalf("sent %v, want %v", sent, want)
+		}
+	}
+}
+
+// TestADiscardedEnhancementFrameIsJustThat covers the disposable layer. Nothing
+// references an enhancement frame, so losing one in the queue costs that frame
+// and nothing more: the track is not held back, and nobody is asked for a
+// keyframe — which would freeze a picture that decodes perfectly and cost every
+// subscriber of the publisher a keyframe.
+func TestADiscardedEnhancementFrameIsJustThat(t *testing.T) {
+	s, c := stalledConn(t)
+	var asked []uint32
+	c.onVideoGap = func(handle uint32) { asked = append(asked, handle) }
+
+	// The oldest frame is an enhancement frame, and it is the one discarded.
+	for i := range videoQueueDepth + 1 {
+		f := videoFrame(uint64(i))
+		f.TemporalLayer = uint8(1 - i%2)
+		s.SendMedia(f)
+	}
+
+	if len(asked) != 0 {
+		t.Errorf("asked for a keyframe on %v after losing enhancement frames only", asked)
+	}
+	passed := 0
+	for len(c.video) > 0 {
+		if c.admitVideo(<-c.video) {
+			passed++
+		}
+	}
+	if passed != videoQueueDepth {
+		t.Errorf("%d of %d queued frames written — the track was held back for a "+
+			"frame nothing references", passed, videoQueueDepth)
+	}
+}
+
+// TestALostKeyFrameIsAskedForAgain covers a stall that outlasts the first
+// request: the keyframe that would have ended the gap is discarded in turn.
+// Nothing else asks again — the frontend's decoder has seen a keyframe, so its
+// own retry is not running — and without a second request the track stays held
+// until the publisher's next scheduled keyframe.
+func TestALostKeyFrameIsAskedForAgain(t *testing.T) {
+	s, c := stalledConn(t)
+	var asked []uint32
+	c.onVideoGap = func(handle uint32) { asked = append(asked, handle) }
+
+	const other = HandleRemoteBase + 7
+	otherFrame := func(ts uint64) *MediaFrame {
+		f := videoFrame(ts)
+		f.Handle = other
+		// Enhancement frames: losing them holds nothing back, so the other
+		// track is healthy throughout and only the first track's requests count.
+		f.TemporalLayer = 1
+		return f
+	}
+
+	// A delta of the first track is the oldest, and the overflow discards it.
+	s.SendMedia(videoFrame(0))
+	for i := range videoQueueDepth {
+		s.SendMedia(otherFrame(uint64(100 + i)))
+	}
+	if len(asked) != 1 {
+		t.Fatalf("asked %d times after losing a base frame, want 1", len(asked))
+	}
+
+	// Held: its deltas are refused before they take a slot from the other track.
+	before := len(c.video)
+	s.SendMedia(videoFrame(1))
+	if len(c.video) != before {
+		t.Fatal("a held track's delta was queued, taking a slot from healthy tracks")
+	}
+
+	// Its keyframe is let in, then pushed out by the other track's frames.
+	key := videoFrame(2)
+	key.KeyFrame = true
+	s.SendMedia(key)
+	for i := range videoQueueDepth {
+		s.SendMedia(otherFrame(uint64(1000 + i)))
+	}
+	if len(asked) != 2 || asked[1] != HandleRemoteBase {
+		t.Fatalf("asked for keyframes on %v, want a second request after the "+
+			"keyframe itself was discarded", asked)
+	}
+
+	// Held again, so a delta after the lost keyframe is refused too.
+	before = len(c.video)
+	s.SendMedia(videoFrame(3))
+	if len(c.video) != before {
+		t.Fatal("a delta queued after its keyframe was lost")
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/floatdrop/moq-go/pkg/moqt"
@@ -293,6 +294,12 @@ type remoteTrack struct {
 	// order holds this track's groups in the order the publisher wrote them,
 	// which a per-group reassembler cannot: see grouporder.go.
 	order *groupOrderer
+
+	// largestGroup is one past the highest group any live stream of this track
+	// has opened, zero until one has. One past so the zero value means "none
+	// yet" — group 0 is a real group. It is what a NEW_GROUP_REQUEST is
+	// computed from: see nextGroup.
+	largestGroup atomic.Uint64
 
 	// onDrop, when non-nil, reports an object the reassembler gave up on. Held
 	// on the track rather than assigned to each reassembler after the fact:
@@ -1070,7 +1077,7 @@ func (r *remote) subscribeTrack(
 		// backfill: ask the publisher to cut a new group, which for video is a
 		// keyframe. Also on its own goroutine — it is a REQUEST_UPDATE round
 		// trip through the relay.
-		go r.requestNewGroup(track)
+		go r.requestNewGroup(track, newGroupForSubscribe)
 	}
 	return nil
 }
@@ -1389,26 +1396,88 @@ func (r *remote) readMediaFetch(
 // (§12.6) — an older build, or a track that cannot honour it — makes the relay
 // decline silently, and the backfill and the next scheduled keyframe are what
 // remain. That is exactly the behaviour before this existed.
-func (r *remote) requestNewGroup(track *remoteTrack) {
-	// The value is the group being asked for: one past the largest known, or
-	// zero for "no group information", which §10.2.19 defines as always
-	// forwardable. Asking for a group that already exists is not forwarded, so
-	// the +1 is what makes the request mean anything.
-	var want uint64
-	if track.hasBackfill {
-		want = track.backfilled + 1
+//
+// Subscribing is not the only reason to ask. Anything that leaves the decoder
+// without a reference chain — the relay cutting the base layer short, a
+// decoder rebuilt after an error, the bridge discarding frames on the way to
+// the WebView — would otherwise leave the tile frozen or smeared until the
+// publisher's next scheduled keyframe, a whole interval away. reason says
+// which, for the log.
+func (r *remote) requestNewGroup(track *remoteTrack, reason string) {
+	// A track being retired takes its subscription with it, and the relay
+	// resets that subscription's streams as it goes — which reads as a loss.
+	r.mu.Lock()
+	dropped := track.dropped
+	r.mu.Unlock()
+	if dropped {
+		return
 	}
+	want := track.nextGroup()
 	if _, err := track.sub.Update(r.ctx, message.Parameters{
 		message.NewGroupRequestParam(want),
 	}); err != nil {
 		if r.ctx.Err() == nil {
 			r.log.Debug("new-group request declined",
-				"handle", track.handle, "group", want, "err", err)
+				"handle", track.handle, "group", want, "reason", reason, "err", err)
 		}
 		return
 	}
-	r.log.Debug("asked the publisher for a new group",
-		"handle", track.handle, "group", want)
+	// A loss the relay or the bridge reported is asked about once per loss and
+	// is worth seeing without turning Debug on. Joining asks every time and is
+	// routine, and a waiting decoder asks once a second for as long as it
+	// waits — against a publisher too old to answer, that is a line a second.
+	level := slog.LevelDebug
+	if reason == newGroupForBaseLoss || reason == newGroupForBridgeDrop {
+		level = slog.LevelInfo
+	}
+	r.log.Log(r.ctx, level, "asked the publisher for a new group",
+		"handle", track.handle, "group", want, "reason", reason)
+}
+
+// requestKeyFrame asks the publisher of this remote's video for a new group if
+// handle is that track, reporting whether it was.
+func (r *remote) requestKeyFrame(handle uint32, reason string) bool {
+	r.mu.Lock()
+	track := r.video
+	r.mu.Unlock()
+	if track == nil || track.handle != handle {
+		return false
+	}
+	go r.requestNewGroup(track, reason)
+	return true
+}
+
+// Reasons requestNewGroup is called, as they appear in the log.
+const (
+	newGroupForSubscribe  = "subscribed"
+	newGroupForBaseLoss   = "base layer cut short"
+	newGroupForDecoder    = "decoder waiting for a keyframe"
+	newGroupForBridgeDrop = "frames dropped on the way to the frontend"
+)
+
+// noteGroup records that a live stream of group has opened.
+func (t *remoteTrack) noteGroup(group uint64) {
+	for {
+		cur := t.largestGroup.Load()
+		if group+1 <= cur || t.largestGroup.CompareAndSwap(cur, group+1) {
+			return
+		}
+	}
+}
+
+// nextGroup is the value a NEW_GROUP_REQUEST carries: one past the largest
+// group known on this track, or zero for "no group information", which
+// §10.2.19 defines as always forwardable. Asking for a group that already
+// exists is not forwarded, so the +1 is what makes the request mean anything.
+//
+// The backfilled group counts as known: at subscribe time it is the only group
+// there is any information about, and no live stream has opened yet.
+func (t *remoteTrack) nextGroup() uint64 {
+	next := t.largestGroup.Load() // already one past the largest, or zero
+	if t.hasBackfill && t.backfilled+1 > next {
+		next = t.backfilled + 1
+	}
+	return next
 }
 
 // dropTrack closes one media subscription and tells the frontend to
@@ -1517,6 +1586,9 @@ func (r *remote) readMedia(
 	}
 
 	reassembler := track.reassemblerFor(group)
+	if !backfilledGroup {
+		track.noteGroup(group)
+	}
 
 	// Counted once per group, by the stream that opens it. Every layer of a
 	// group is the same group, so counting per stream would report a group
@@ -1527,7 +1599,7 @@ func (r *remote) readMedia(
 	for {
 		obj, err := s.ReadDecoded()
 		if err != nil {
-			r.reportMediaEnd(track, err)
+			r.reportMediaEnd(track, group, subgroup, err)
 			return
 		}
 
@@ -1651,7 +1723,14 @@ func (r *remote) checkLagForStream(track *remoteTrack, counter *telemetry.TrackC
 // this client gives up on the participant's video and comes back to it later.
 // There is no smaller encoding to step down onto — the publisher sends one, and
 // what degrades under pressure is the relay shedding its enhancement layer.
-func (r *remote) reportMediaEnd(track *remoteTrack, err error) {
+//
+// Any other reset of the base layer is a loss of its own, and the commonest is
+// the relay's §8 delivery timeout. moq-go gives up on that subscriber's copy
+// of the subgroup for the rest of the group, and the enhancement layer is
+// dropped behind it (grouporder.go ends the group's turn with its base
+// stream), so the tile freezes until the next group opens — the publisher's
+// next scheduled keyframe, unless someone asks for one sooner. So ask.
+func (r *remote) reportMediaEnd(track *remoteTrack, group, subgroup uint64, err error) {
 	if r.ctx.Err() != nil {
 		return // we tore this down ourselves
 	}
@@ -1663,7 +1742,16 @@ func (r *remote) reportMediaEnd(track *remoteTrack, err error) {
 			return
 		}
 		r.log.Info("media stream reset by the peer",
-			"handle", track.handle, "code", resetName(code))
+			"handle", track.handle, "group", group, "subgroup", subgroup,
+			"code", resetName(code))
+		if track.kind == bridge.KindVideo && subgroup == baseSubgroup &&
+			baseLossReset(code) && track.nextGroup() == group+1 {
+			// Only for the group in progress: a newer group has already
+			// opened on a keyframe if this one is behind, and asking would
+			// cost every subscriber another for nothing. Off this goroutine
+			// for the same reason as demote.
+			go r.requestNewGroup(track, newGroupForBaseLoss)
+		}
 		return
 	}
 	if !errors.Is(err, io.EOF) {

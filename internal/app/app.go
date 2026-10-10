@@ -72,8 +72,10 @@ type App struct {
 	// application; nil in tests, where nothing should be opening anything.
 	openURL func(string) error
 	// lastKeyFrameAsk rate limits requestKeyFrame, whose trigger arrives at
-	// the frame rate.
+	// the frame rate, and keyFrameDue is the one request postponed to the end
+	// of the current interval, if any — see requestKeyFrame.
 	lastKeyFrameAsk time.Time
+	keyFrameDue     *time.Timer
 	// reattach leaves the room if no frontend comes back. See HandleDisconnect.
 	reattach *time.Timer
 	// videoPump and audioPump carry frames from the bridge's read goroutine to
@@ -174,7 +176,12 @@ func (a *App) Version() string { return a.version }
 
 // SetServer attaches the bridge the App reports through. Called once,
 // before Serve, because Server and Handler are mutually referential.
-func (a *App) SetServer(s *bridge.Server) { a.server = s }
+func (a *App) SetServer(s *bridge.Server) {
+	a.server = s
+	s.SetOnVideoGap(func(handle uint32) {
+		a.requestRemoteKeyFrame(handle, conf.KeyFrameForBridgeDrop)
+	})
+}
 
 // ---- bridge.Handler ---------------------------------------------------
 
@@ -221,6 +228,13 @@ func (a *App) HandleControl(ctx context.Context, msg *bridge.ClientMessage) erro
 		a.setInterest(msg.Interest)
 		return nil
 
+	case bridge.MsgKeyFrameNeeded:
+		if msg.KeyFrameNeeded == nil {
+			return errors.New("app: keyFrameNeeded message has no payload")
+		}
+		a.requestRemoteKeyFrame(msg.KeyFrameNeeded.Handle, conf.KeyFrameForDecoder)
+		return nil
+
 	case bridge.MsgReport:
 		if msg.Report == nil {
 			return errors.New("app: report message has no payload")
@@ -239,6 +253,11 @@ func (a *App) HandleControl(ctx context.Context, msg *bridge.ClientMessage) erro
 func (a *App) HandleMedia(_ context.Context, f *bridge.MediaFrame) error {
 	a.frames.frame(f)
 	a.mu.Lock()
+	if f.Kind == bridge.KindVideo && f.KeyFrame {
+		// Whatever was waiting for a keyframe has one: it opens a group newer
+		// than any request still postponed knew about.
+		a.cancelKeyFrameDueLocked()
+	}
 	pump := a.videoPump
 	if f.Kind == bridge.KindAudio {
 		pump = a.audioPump
@@ -414,9 +433,42 @@ func (a *App) runPublishPump(ctx context.Context, room *conf.Room, p *publishPum
 // Rate limited because the trigger repeats at the frame rate: without it a
 // stalled publisher would ask thirty times a second for something that takes
 // one encode to deliver.
+//
+// Postponed rather than dropped, though, and that matters because of who else
+// is counting. A relay forwards one NEW_GROUP_REQUEST and then treats the
+// track as having one outstanding until its largest group advances (§10.2.19);
+// every later request at or below that value stops at the relay. A request
+// this side discarded for arriving inside the interval therefore did not merely
+// cost itself — it silenced every subscriber's request behind it until the
+// scheduled keyframe came round, which is a whole interval of frozen tile for
+// whoever was asking. So a request inside the interval schedules one keyframe
+// at its end, and any more that arrive meanwhile ride on that one.
+//
+// And it is cancelled by any keyframe the encoder produces first. The commonest
+// trigger repeats at the frame rate until a keyframe arrives — every frame a
+// group-less publisher turns away asks again — so without that a stall the
+// first request had already answered would cost a second keyframe half a
+// second later, on the uplink that just stalled.
 func (a *App) requestKeyFrame() {
 	a.mu.Lock()
-	if time.Since(a.lastKeyFrameAsk) < keyFrameAskInterval {
+	if a.keyFrameDue != nil {
+		a.mu.Unlock()
+		return
+	}
+	if wait := keyFrameAskInterval - time.Since(a.lastKeyFrameAsk); wait > 0 {
+		var due *time.Timer
+		due = time.AfterFunc(wait, func() {
+			a.mu.Lock()
+			if a.keyFrameDue != due {
+				// Cancelled after it had already fired.
+				a.mu.Unlock()
+				return
+			}
+			a.keyFrameDue = nil
+			a.mu.Unlock()
+			a.requestKeyFrame()
+		})
+		a.keyFrameDue = due
 		a.mu.Unlock()
 		return
 	}
@@ -426,6 +478,26 @@ func (a *App) requestKeyFrame() {
 	a.frames.keyFrameRequest()
 	a.log.Debug("asking for a keyframe to reopen the video group")
 	a.server.SendControl(&bridge.ServerMessage{Type: bridge.MsgRequestKeyFrame})
+}
+
+// cancelKeyFrameDueLocked drops a postponed keyframe request. a.mu must be held.
+func (a *App) cancelKeyFrameDueLocked() {
+	if a.keyFrameDue != nil {
+		a.keyFrameDue.Stop()
+		a.keyFrameDue = nil
+	}
+}
+
+// requestRemoteKeyFrame asks the publisher of a remote video track for a new
+// group, on behalf of a receiver that lost frames this side of the relay: the
+// frontend's decoder, or the bridge on the way to it.
+func (a *App) requestRemoteKeyFrame(handle uint32, reason string) {
+	a.mu.Lock()
+	room := a.room
+	a.mu.Unlock()
+	if room != nil {
+		room.RequestKeyFrame(handle, reason)
+	}
 }
 
 // HandleConnect starts streaming backend logs to the freshly connected
@@ -923,6 +995,8 @@ func (a *App) leave() {
 		a.reattach.Stop()
 		a.reattach = nil
 	}
+	// A request postponed for this room is not one the next room made.
+	a.cancelKeyFrameDueLocked()
 	room, stopMet, stopSession := a.room, a.stopMet, a.stopSession
 	a.room, a.stopMet, a.stopSession = nil, nil, nil
 	a.joined = nil
